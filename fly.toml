@@ -1,0 +1,14 @@
+# https://fly.io/docs/reference/configuration/
+
+app = "telegram-translator-bot"
+primary_region = "iad"
+
+[build]
+
+[processes]
+  bot = "python bot.py"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

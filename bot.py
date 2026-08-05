@@ -1007,13 +1007,32 @@ def main() -> None:
     # Register text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start polling
-    logger.info("Bot is starting polling...")
-    print("\n" + "─" * 45)
-    print("  🤖  Translation Bot is now running!")
-    print("  Press Ctrl+C to stop.")
-    print("─" * 45 + "\n")
-    application.run_polling(bootstrap_retries=-1)
+    # Detect deployment environment
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    port = int(os.getenv("PORT", "8443"))
+
+    if render_url:
+        # ─── Render.com: Use webhook mode ───
+        webhook_url = f"{render_url}/{TELEGRAM_BOT_TOKEN}"
+        logger.info(f"Running in webhook mode on Render (port {port})")
+        print("\n" + "─" * 45)
+        print("  🤖  Translation Bot (Webhook Mode)")
+        print(f"  Listening on port {port}")
+        print("─" * 45 + "\n")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=TELEGRAM_BOT_TOKEN,
+            webhook_url=webhook_url,
+        )
+    else:
+        # ─── Local / other: Use polling mode ───
+        logger.info("Bot is starting polling...")
+        print("\n" + "─" * 45)
+        print("  🤖  Translation Bot is now running!")
+        print("  Press Ctrl+C to stop.")
+        print("─" * 45 + "\n")
+        application.run_polling(bootstrap_retries=-1)
 
 
 if __name__ == "__main__":

@@ -131,42 +131,22 @@ def detect_language_code(text: str) -> str:
 # ─── Message Formatting Helpers ───────────────────────────────────────────────
 
 def fmt_card(title: str, body: str, footer: str = "") -> str:
-    """Build a styled card using Unicode box-drawing and HTML formatting."""
-    top = f"┌─── {title} ───"
-    sep = "│"
-    bot_line = "└" + "─" * 30
-    lines = [f"<b>{top}</b>", "│"]
-    for line in body.strip().split("\n"):
-        lines.append(f"│  {line}")
-    lines.append("│")
+    """Clean message formatting without box drawing lines."""
+    lines = [f"<b>{title}</b>\n", body.strip()]
     if footer:
-        lines.append(f"│  <i>{footer}</i>")
-        lines.append("│")
-    lines.append(f"<b>{bot_line}</b>")
+        lines.append(f"\n<i>{footer}</i>")
     return "\n".join(lines)
 
 
 def fmt_translation(src_lang: str, target_lang: str, translated_text: str, fallback: bool = False) -> str:
-    """Format a translation result as a clean card."""
-    src_flag = get_flag(src_lang)
-    tgt_flag = get_flag(target_lang)
-    src_label = src_lang.upper() if src_lang != "auto" else "??"
-    tgt_label = target_lang.upper()
+    """Format translation clean and simple matching Phoenix style."""
+    src_label = src_lang.lower() if src_lang != "auto" else "??"
+    target_label = target_lang.lower()
 
-    header = "🌐 Translation"
-    body_lines = [
-        f"{src_flag} <b>{src_label}</b>  ➜  {tgt_flag} <b>{tgt_label}</b>",
-        "",
-        "─" * 26,
-        "",
-        translated_text,
-    ]
-
+    msg = f"Translated from {src_label} to {target_label}:\n{translated_text}"
     if fallback:
-        body_lines.append("")
-        body_lines.append("⚠️ <i>AI unavailable — used free engine</i>")
-
-    return fmt_card(header, "\n".join(body_lines))
+        msg += "\n\n⚠️ (Fell back to free engine)"
+    return msg
 
 
 def fmt_success(text: str) -> str:
@@ -880,14 +860,10 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     response_msg = fmt_translation(src_lang, target_lang, translated_text, fallback=fallback)
 
-    reply_to_message_id = update.message.message_id
-    if update.message.reply_to_message:
-        reply_to_message_id = update.message.reply_to_message.message_id
-
     await update.message.reply_text(
         response_msg,
         parse_mode="HTML",
-        reply_to_message_id=reply_to_message_id
+        reply_to_message_id=update.message.message_id
     )
 
 

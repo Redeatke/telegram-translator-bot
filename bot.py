@@ -930,6 +930,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'extractor_retries': 5,
         'nocheckcertificate': True,
         'check_formats': False,
+        'js_runtimes': {'node': {}},
         'extractor_args': {
             'youtube': {
                 'player_client': ['default', 'web'],

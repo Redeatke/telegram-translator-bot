@@ -1,6 +1,9 @@
 import os
 import logging
 import asyncio
+import re
+import tempfile
+import uuid
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -15,6 +18,7 @@ from telegram.request import HTTPXRequest
 from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
+import yt_dlp
 
 # Load environment variables
 load_dotenv(override=True)
@@ -90,6 +94,22 @@ LANG_FLAGS = {
     "ro": "🇷🇴", "hu": "🇭🇺", "cs": "🇨🇿", "sk": "🇸🇰", "bg": "🇧🇬",
     "hr": "🇭🇷", "sr": "🇷🇸", "ca": "🇪🇸", "fa": "🇮🇷", "ur": "🇵🇰",
 }
+
+# ─── YouTube URL Pattern ──────────────────────────────────────────────────────
+
+YOUTUBE_URL_PATTERN = re.compile(
+    r'(?:https?://)?'
+    r'(?:www\.|m\.)?'
+    r'(?:'
+    r'youtube\.com/(?:shorts/|watch\?v=|embed/|v/)'
+    r'|youtu\.be/'
+    r')'
+    r'[\w\-]{11}',
+    re.IGNORECASE
+)
+
+# Maximum video duration in seconds (10 minutes)
+MAX_VIDEO_DURATION = 600
 
 
 def get_flag(lang_code: str) -> str:
@@ -867,6 +887,126 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+# ─── YouTube Auto-Download ────────────────────────────────────────────────────
+
+async def download_youtube_video(url: str, output_dir: str) -> dict:
+    """Download a YouTube video using yt-dlp. Returns dict with filepath, title, duration."""
+    filename = f"{uuid.uuid4().hex}"
+    output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
+
+    ydl_opts = {
+        'format': 'best[height<=720][filesize<50M]/best[height<=720]/best[filesize<50M]/best',
+        'outtmpl': output_template,
+        'quiet': True,
+        'no_warnings': True,
+        'merge_output_format': 'mp4',
+        'socket_timeout': 30,
+        'retries': 3,
+    }
+
+    loop = asyncio.get_event_loop()
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            # yt-dlp may change extension after merge
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for ext in ['.mp4', '.webm', '.mkv']:
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+            return {
+                'filepath': filepath,
+                'title': info.get('title', 'Video'),
+                'duration': info.get('duration', 0),
+            }
+
+    return await loop.run_in_executor(None, _download)
+
+
+async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect YouTube links in messages and send the video."""
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+    match = YOUTUBE_URL_PATTERN.search(text)
+    if not match:
+        return  # Not a YouTube link — silently ignore, let other handlers run
+
+    yt_url = match.group(0)
+    # Make sure it has a scheme
+    if not yt_url.startswith('http'):
+        yt_url = 'https://' + yt_url
+
+    # Send downloading status
+    status_msg = await update.message.reply_text("⏳ Downloading video...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Download the video
+            result = await download_youtube_video(yt_url, tmp_dir)
+            filepath = result['filepath']
+            title = result['title']
+            duration = result.get('duration', 0)
+
+            # Check duration
+            if duration and duration > MAX_VIDEO_DURATION:
+                await status_msg.edit_text(
+                    fmt_warning(f"Video is too long ({duration // 60}m {duration % 60}s). Max is {MAX_VIDEO_DURATION // 60} minutes.")
+                )
+                return
+
+            # Check file size (Telegram limit: 50 MB for bots)
+            file_size = os.path.getsize(filepath)
+            if file_size > 50 * 1024 * 1024:
+                await status_msg.edit_text(
+                    fmt_warning("Video file is too large for Telegram (>50 MB).")
+                )
+                return
+
+            # Update status
+            await status_msg.edit_text("📤 Uploading to Telegram...")
+
+            # Send the video
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action="upload_video"
+            )
+
+            with open(filepath, 'rb') as video_file:
+                await update.message.reply_video(
+                    video=video_file,
+                    caption=f"📹 {title}",
+                    supports_streaming=True,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+
+            # Delete the status message after successful upload
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    except yt_dlp.utils.DownloadError as e:
+        error_str = str(e).lower()
+        if 'private' in error_str or 'unavailable' in error_str:
+            await status_msg.edit_text(fmt_error("This video is private or unavailable."))
+        elif 'age' in error_str:
+            await status_msg.edit_text(fmt_error("This video is age-restricted and can't be downloaded."))
+        else:
+            logger.error(f"YouTube download error: {e}")
+            await status_msg.edit_text(fmt_error("Couldn't download this video."))
+    except Exception as e:
+        logger.error(f"YouTube download failed: {e}")
+        try:
+            await status_msg.edit_text(fmt_error("Something went wrong downloading this video."))
+        except Exception:
+            pass
+
+
 # ─── Auto-Translate in Private Chat ──────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -979,6 +1119,12 @@ def main() -> None:
     application.add_handler(CommandHandler("promote", promote_command))
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
+
+    # Register YouTube auto-download handler (before general text handler so it takes priority)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_URL_PATTERN),
+        handle_youtube_message
+    ))
 
     # Register text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -72,11 +72,18 @@ if _cookies_b64:
         with os.fdopen(_cookies_fd, 'wb') as f:
             f.write(cookies_data)
         logger.info(f"YouTube cookies loaded from env var ({len(cookies_data)} bytes).")
+        # Verify cookie file content
+        with open(YOUTUBE_COOKIES_FILE, 'r') as f:
+            first_lines = [f.readline().strip() for _ in range(5)]
+            logger.info(f"Cookie file starts with: {first_lines}")
     except Exception as e:
         logger.error(f"Failed to decode YOUTUBE_COOKIES env var: {e}")
         YOUTUBE_COOKIES_FILE = None
 else:
     logger.info("YOUTUBE_COOKIES not set. YouTube downloads may be blocked on cloud servers.")
+
+# Log yt-dlp version
+logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
 
 # ─── User State ───────────────────────────────────────────────────────────────
 
@@ -922,6 +929,12 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'retries': 5,
         'extractor_retries': 5,
         'nocheckcertificate': True,
+        'check_formats': False,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['default', 'web'],
+            }
+        },
     }
 
     # Use cookies if available (required for cloud server IPs)
@@ -934,17 +947,20 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     loop = asyncio.get_event_loop()
 
     def _download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # First, list available formats for debugging
-            try:
-                info_check = ydl.extract_info(url, download=False)
-                formats = info_check.get('formats', [])
-                logger.info(f"Available formats for {url}: {len(formats)} formats found")
-                for f in formats[:10]:  # Log first 10
-                    logger.info(f"  Format: {f.get('format_id')} - {f.get('ext')} - {f.get('height', '?')}p - {f.get('filesize', 'unknown')} bytes")
-            except Exception as e:
-                logger.error(f"Format listing failed: {e}")
+        # First pass: extract info only to debug format availability
+        try:
+            with yt_dlp.YoutubeDL({**ydl_opts, 'format': None}) as ydl_info:
+                info_check = ydl_info.extract_info(url, download=False, process=False)
+                logger.info(f"Video info extracted: title={info_check.get('title')}, id={info_check.get('id')}")
+                if 'formats' in info_check:
+                    logger.info(f"Formats in raw info: {len(info_check['formats'])}")
+                else:
+                    logger.warning("No 'formats' key in extracted info — YouTube may be blocking")
+        except Exception as e:
+            logger.error(f"Info extraction debug failed: {e}")
 
+        # Second pass: actual download
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
             # yt-dlp may change extension after merge

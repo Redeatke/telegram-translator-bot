@@ -4,4 +4,6 @@ deep-translator>=1.11.0
 openai>=1.0.0
 langdetect>=1.0.9
 yt-dlp>=2024.0.0
+yt-dlp-get-pot
+bgutil-ytdlp-pot-provider
 pytubefix>=10.0.0

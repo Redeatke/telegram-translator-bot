@@ -922,13 +922,45 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using pytubefix / yt-dlp. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using yt-dlp with PO Token plugin, or pytubefix fallback. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     loop = asyncio.get_event_loop()
 
-    # Engine 1: pytubefix with multi-client rotation (bypasses cloud IP blocks)
+    # Engine 1: yt-dlp with PO-Token generator plugin (bgutil-ytdlp-pot-provider)
+    ydl_opts = {
+        'outtmpl': output_template,
+        'merge_output_format': 'mp4',
+        'socket_timeout': 30,
+        'retries': 5,
+        'extractor_retries': 5,
+    }
+
+    def _download_ytdlp():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for ext in ['.mp4', '.webm', '.mkv']:
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+            return {
+                'filepath': filepath,
+                'title': info.get('title', 'Video'),
+                'duration': info.get('duration', 0),
+            }
+
+    try:
+        res = await loop.run_in_executor(None, _download_ytdlp)
+        if res:
+            return res
+    except Exception as e:
+        logger.warning(f"yt-dlp engine failed: {e}. Trying pytubefix fallback...")
+
+    # Engine 2: pytubefix with multi-client rotation
     if has_pytubefix:
         def _download_pytubefix():
             for client_type in ['MWEB', 'WEB', 'ANDROID', 'IOS']:
@@ -947,47 +979,11 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
                     logger.warning(f"pytubefix with client '{client_type}' failed: {pe}")
             return None
 
-        try:
-            res = await loop.run_in_executor(None, _download_pytubefix)
-            if res:
-                return res
-        except Exception as e:
-            logger.warning(f"pytubefix engine failed: {e}. Trying yt-dlp fallback...")
+        res_pt = await loop.run_in_executor(None, _download_pytubefix)
+        if res_pt:
+            return res_pt
 
-    # Engine 2: yt-dlp fallback
-    ydl_opts = {
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'socket_timeout': 30,
-        'retries': 5,
-        'extractor_retries': 5,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android_vr', 'mweb', 'web_creator'],
-            }
-        },
-    }
-
-    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-        ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
-
-    def _download_ytdlp():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if not os.path.exists(filepath):
-                base = os.path.splitext(filepath)[0]
-                for ext in ['.mp4', '.webm', '.mkv']:
-                    if os.path.exists(base + ext):
-                        filepath = base + ext
-                        break
-            return {
-                'filepath': filepath,
-                'title': info.get('title', 'Video'),
-                'duration': info.get('duration', 0),
-            }
-
-    return await loop.run_in_executor(None, _download_ytdlp)
+    raise Exception("All download engines failed to download video.")
 
 
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

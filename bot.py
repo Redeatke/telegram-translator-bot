@@ -5,6 +5,7 @@ import re
 import tempfile
 import uuid
 import base64
+import traceback
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -916,14 +917,14 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     ydl_opts = {
         'format': 'best[height<=720][filesize<50M]/best[height<=720]/best[filesize<50M]/best',
         'outtmpl': output_template,
-        'quiet': True,
-        'no_warnings': True,
+        'verbose': True,
         'merge_output_format': 'mp4',
         'socket_timeout': 30,
-        'retries': 3,
+        'retries': 5,
+        'extractor_retries': 5,
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'web'],
+                'player_client': ['web'],
             }
         },
         'http_headers': {
@@ -936,6 +937,9 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     # Use cookies if available (required for cloud server IPs)
     if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
         ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+        logger.info(f"Using cookies file: {YOUTUBE_COOKIES_FILE}")
+    else:
+        logger.warning("No cookies file available for YouTube download")
 
     loop = asyncio.get_event_loop()
 
@@ -1030,6 +1034,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     except yt_dlp.utils.DownloadError as e:
         error_str = str(e)
         logger.error(f"YouTube DownloadError for {yt_url}: {error_str}")
+        logger.error(traceback.format_exc())
         error_lower = error_str.lower()
         if 'private' in error_lower or 'unavailable' in error_lower:
             await status_msg.edit_text(fmt_error("This video is private or unavailable."))
@@ -1041,6 +1046,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
             await status_msg.edit_text(fmt_error("Couldn't download this video."))
     except Exception as e:
         logger.error(f"YouTube download failed for {yt_url}: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
         try:
             await status_msg.edit_text(fmt_error("Something went wrong downloading this video."))
         except Exception:

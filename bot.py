@@ -42,6 +42,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "https://yt-proxy.benjamindavidson2468.workers.dev/")
 
 # Toggle to allow all users to use the AI engine (for testing or public deployment)
 ALLOW_ALL_TO_USE_AI = os.getenv("ALLOW_ALL_TO_USE_AI", "True").lower() == "true"
@@ -922,57 +923,51 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using pytubefix / yt-dlp. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using Cloudflare Worker proxy and yt-dlp. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     loop = asyncio.get_event_loop()
 
-    # Engine 1: pytubefix with client rotation & rate-limit delay
-    if has_pytubefix:
-        def _download_pytubefix():
-            import time
-            clients = ['MWEB', 'WEB', 'IOS', 'ANDROID']
-            for i, client_type in enumerate(clients):
-                if i > 0:
-                    time.sleep(1.5)  # Pause to prevent HTTP 429 rate-limiting
-                try:
-                    yt = PytubeFixYouTube(url, client=client_type)
-                    stream = yt.streams.get_highest_resolution()
-                    if stream:
-                        filepath = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
-                        logger.info(f"pytubefix download successful with client '{client_type}': {filepath}")
-                        return {
-                            'filepath': filepath,
-                            'title': yt.title or "Video",
-                            'duration': yt.length or 0,
-                        }
-                except Exception as pe:
-                    logger.warning(f"pytubefix client '{client_type}' failed: {pe}")
-            return None
+    # Determine Cloudflare Worker proxy target URL
+    target_url = url
+    if CLOUDFLARE_WORKER_URL:
+        base_worker = CLOUDFLARE_WORKER_URL.rstrip('/')
+        if not url.startswith(base_worker):
+            target_url = f"{base_worker}/?url={url}"
 
-        try:
-            res = await loop.run_in_executor(None, _download_pytubefix)
-            if res:
-                return res
-        except Exception as e:
-            logger.warning(f"pytubefix engine failed: {e}. Trying yt-dlp fallback...")
-
-    # Engine 2: yt-dlp fallback
     ydl_opts = {
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android_vr', 'mweb', 'web_creator'],
-            }
-        },
     }
 
-    def _download_ytdlp():
+    def _download():
+        # Engine 1: Cloudflare Worker proxied download via yt-dlp
+        if target_url != url:
+            try:
+                logger.info(f"Attempting download via Cloudflare Worker proxy: {target_url[:80]}...")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(target_url, download=True)
+                    filepath = ydl.prepare_filename(info)
+                    if not os.path.exists(filepath):
+                        base = os.path.splitext(filepath)[0]
+                        for ext in ['.mp4', '.webm', '.mkv']:
+                            if os.path.exists(base + ext):
+                                filepath = base + ext
+                                break
+                    logger.info(f"Cloudflare Worker download successful: {filepath}")
+                    return {
+                        'filepath': filepath,
+                        'title': info.get('title', 'Video'),
+                        'duration': info.get('duration', 0),
+                    }
+            except Exception as e:
+                logger.warning(f"Cloudflare Worker download failed: {e}. Trying direct yt-dlp fallback...")
+
+        # Engine 2: Direct yt-dlp fallback
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
@@ -988,7 +983,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
                 'duration': info.get('duration', 0),
             }
 
-    return await loop.run_in_executor(None, _download_ytdlp)
+    return await loop.run_in_executor(None, _download)
 
 
 YOUTUBE_URL_PATTERN = re.compile(

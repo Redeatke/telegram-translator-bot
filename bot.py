@@ -922,19 +922,54 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using yt-dlp with PO Token plugin, or pytubefix fallback. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using pytubefix / yt-dlp. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     loop = asyncio.get_event_loop()
 
-    # Engine 1: yt-dlp with PO-Token generator plugin (bgutil-ytdlp-pot-provider)
+    # Engine 1: pytubefix with client rotation & rate-limit delay
+    if has_pytubefix:
+        def _download_pytubefix():
+            import time
+            clients = ['MWEB', 'WEB', 'IOS', 'ANDROID']
+            for i, client_type in enumerate(clients):
+                if i > 0:
+                    time.sleep(1.5)  # Pause to prevent HTTP 429 rate-limiting
+                try:
+                    yt = PytubeFixYouTube(url, client=client_type)
+                    stream = yt.streams.get_highest_resolution()
+                    if stream:
+                        filepath = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
+                        logger.info(f"pytubefix download successful with client '{client_type}': {filepath}")
+                        return {
+                            'filepath': filepath,
+                            'title': yt.title or "Video",
+                            'duration': yt.length or 0,
+                        }
+                except Exception as pe:
+                    logger.warning(f"pytubefix client '{client_type}' failed: {pe}")
+            return None
+
+        try:
+            res = await loop.run_in_executor(None, _download_pytubefix)
+            if res:
+                return res
+        except Exception as e:
+            logger.warning(f"pytubefix engine failed: {e}. Trying yt-dlp fallback...")
+
+    # Engine 2: yt-dlp fallback
     ydl_opts = {
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android_vr', 'mweb', 'web_creator'],
+            }
+        },
     }
 
     def _download_ytdlp():
@@ -953,37 +988,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
                 'duration': info.get('duration', 0),
             }
 
-    try:
-        res = await loop.run_in_executor(None, _download_ytdlp)
-        if res:
-            return res
-    except Exception as e:
-        logger.warning(f"yt-dlp engine failed: {e}. Trying pytubefix fallback...")
-
-    # Engine 2: pytubefix with multi-client rotation
-    if has_pytubefix:
-        def _download_pytubefix():
-            for client_type in ['MWEB', 'WEB', 'ANDROID', 'IOS']:
-                try:
-                    yt = PytubeFixYouTube(url, client=client_type)
-                    stream = yt.streams.get_highest_resolution()
-                    if stream:
-                        filepath = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
-                        logger.info(f"pytubefix download successful with client '{client_type}': {filepath}")
-                        return {
-                            'filepath': filepath,
-                            'title': yt.title or "Video",
-                            'duration': yt.length or 0,
-                        }
-                except Exception as pe:
-                    logger.warning(f"pytubefix with client '{client_type}' failed: {pe}")
-            return None
-
-        res_pt = await loop.run_in_executor(None, _download_pytubefix)
-        if res_pt:
-            return res_pt
-
-    raise Exception("All download engines failed to download video.")
+    return await loop.run_in_executor(None, _download_ytdlp)
 
 
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -992,19 +997,20 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     text = update.message.text.strip()
-    match = YOUTUBE_URL_PATTERN.search(text)
+
+    # Extract YouTube URL using regex
+    match = YT_URL_REGEX.search(text)
     if not match:
-        return  # Not a YouTube link — silently ignore, let other handlers run
+        return
 
     yt_url = match.group(0)
-    # Make sure it has a scheme
-    if not yt_url.startswith('http'):
-        yt_url = 'https://' + yt_url
-
     logger.info(f"YouTube URL detected: {yt_url}")
 
-    # Send downloading status
-    status_msg = await update.message.reply_text("⏳ Downloading video...")
+    # Send initial status message
+    status_msg = await update.message.reply_text(
+        "⏳ Downloading YouTube video...",
+        reply_to_message_id=update.message.message_id
+    )
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1059,7 +1065,9 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"YouTube DownloadError for {yt_url}: {error_str}")
         logger.error(traceback.format_exc())
         error_lower = error_str.lower()
-        if 'private' in error_lower or 'unavailable' in error_lower:
+        if '429' in error_lower or 'too many requests' in error_lower:
+            await status_msg.edit_text(fmt_warning("YouTube is temporarily rate-limiting requests. Please wait a minute and try again."))
+        elif 'private' in error_lower or 'unavailable' in error_lower:
             await status_msg.edit_text(fmt_error("This video is private or unavailable."))
         elif 'age' in error_lower:
             await status_msg.edit_text(fmt_error("This video is age-restricted and can't be downloaded."))

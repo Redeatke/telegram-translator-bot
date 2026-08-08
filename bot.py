@@ -21,6 +21,11 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
+try:
+    from pytubefix import YouTube as PytubeFixYouTube
+    has_pytubefix = True
+except ImportError:
+    has_pytubefix = False
 
 # Load environment variables
 load_dotenv(override=True)
@@ -917,7 +922,7 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using yt-dlp. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using yt-dlp or pytubefix fallback. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
@@ -927,31 +932,51 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android_vr', 'android_creator'],
-            }
-        },
     }
 
     loop = asyncio.get_event_loop()
 
     def _download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            # yt-dlp may change extension after merge
-            if not os.path.exists(filepath):
-                base = os.path.splitext(filepath)[0]
-                for ext in ['.mp4', '.webm', '.mkv']:
-                    if os.path.exists(base + ext):
-                        filepath = base + ext
-                        break
-            return {
-                'filepath': filepath,
-                'title': info.get('title', 'Video'),
-                'duration': info.get('duration', 0),
-            }
+        # Engine 1: yt-dlp
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                if not os.path.exists(filepath):
+                    base = os.path.splitext(filepath)[0]
+                    for ext in ['.mp4', '.webm', '.mkv']:
+                        if os.path.exists(base + ext):
+                            filepath = base + ext
+                            break
+                return {
+                    'filepath': filepath,
+                    'title': info.get('title', 'Video'),
+                    'duration': info.get('duration', 0),
+                }
+        except Exception as e:
+            logger.warning(f"yt-dlp download failed: {e}. Trying pytubefix fallback...")
+
+        # Engine 2: pytubefix fallback
+        if has_pytubefix:
+            try:
+                yt = PytubeFixYouTube(url)
+                title = yt.title or "Video"
+                duration = yt.length or 0
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
+                if not stream:
+                    stream = yt.streams.get_highest_resolution()
+                filepath = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
+                logger.info(f"pytubefix download successful: {filepath}")
+                return {
+                    'filepath': filepath,
+                    'title': title,
+                    'duration': duration,
+                }
+            except Exception as pe:
+                logger.error(f"pytubefix download also failed: {pe}")
+                raise pe
+        else:
+            raise Exception("All download engines failed.")
 
     return await loop.run_in_executor(None, _download)
 

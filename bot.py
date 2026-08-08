@@ -6,6 +6,8 @@ import tempfile
 import uuid
 import base64
 import traceback
+import urllib.request
+import urllib.parse
 from dotenv import load_dotenv
 
 from telegram import Update

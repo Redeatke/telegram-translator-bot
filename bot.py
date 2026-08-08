@@ -902,6 +902,16 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'merge_output_format': 'mp4',
         'socket_timeout': 30,
         'retries': 3,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'web'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        'nocheckcertificate': True,
     }
 
     loop = asyncio.get_event_loop()
@@ -940,6 +950,8 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     # Make sure it has a scheme
     if not yt_url.startswith('http'):
         yt_url = 'https://' + yt_url
+
+    logger.info(f"YouTube URL detected: {yt_url}")
 
     # Send downloading status
     status_msg = await update.message.reply_text("⏳ Downloading video...")
@@ -990,17 +1002,22 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
             except Exception:
                 pass
 
+            logger.info(f"YouTube video sent successfully: {title}")
+
     except yt_dlp.utils.DownloadError as e:
-        error_str = str(e).lower()
-        if 'private' in error_str or 'unavailable' in error_str:
+        error_str = str(e)
+        logger.error(f"YouTube DownloadError for {yt_url}: {error_str}")
+        error_lower = error_str.lower()
+        if 'private' in error_lower or 'unavailable' in error_lower:
             await status_msg.edit_text(fmt_error("This video is private or unavailable."))
-        elif 'age' in error_str:
+        elif 'age' in error_lower:
             await status_msg.edit_text(fmt_error("This video is age-restricted and can't be downloaded."))
+        elif 'sign in' in error_lower or 'bot' in error_lower:
+            await status_msg.edit_text(fmt_error("YouTube is blocking this download. Try again later."))
         else:
-            logger.error(f"YouTube download error: {e}")
             await status_msg.edit_text(fmt_error("Couldn't download this video."))
     except Exception as e:
-        logger.error(f"YouTube download failed: {e}")
+        logger.error(f"YouTube download failed for {yt_url}: {type(e).__name__}: {e}")
         try:
             await status_msg.edit_text(fmt_error("Something went wrong downloading this video."))
         except Exception:

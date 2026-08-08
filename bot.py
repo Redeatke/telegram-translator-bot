@@ -923,42 +923,24 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
 
     ydl_opts = {
         'outtmpl': output_template,
-        'verbose': True,
         'merge_output_format': 'mp4',
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
-        'check_formats': False,
         'extractor_args': {
             'youtube': {
-                'player_client': ['default', 'web'],
+                'player_client': ['tv_embedded', 'android_vr'],
             }
         },
     }
 
-    # Use cookies if available (required for cloud server IPs)
+    # Use cookies if available as additional fallback
     if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
         ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
-        logger.info(f"Using cookies file: {YOUTUBE_COOKIES_FILE}")
-    else:
-        logger.warning("No cookies file available for YouTube download")
 
     loop = asyncio.get_event_loop()
 
     def _download():
-        # First pass: extract info only to debug format availability
-        try:
-            with yt_dlp.YoutubeDL({**ydl_opts, 'format': None}) as ydl_info:
-                info_check = ydl_info.extract_info(url, download=False, process=False)
-                logger.info(f"Video info extracted: title={info_check.get('title')}, id={info_check.get('id')}")
-                if 'formats' in info_check:
-                    logger.info(f"Formats in raw info: {len(info_check['formats'])}")
-                else:
-                    logger.warning("No 'formats' key in extracted info — YouTube may be blocking")
-        except Exception as e:
-            logger.error(f"Info extraction debug failed: {e}")
-
-        # Second pass: actual download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)

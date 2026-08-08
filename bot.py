@@ -922,10 +922,39 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using yt-dlp or pytubefix fallback. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using pytubefix / yt-dlp. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
+    loop = asyncio.get_event_loop()
+
+    # Engine 1: pytubefix with multi-client rotation (bypasses cloud IP blocks)
+    if has_pytubefix:
+        def _download_pytubefix():
+            for client_type in ['MWEB', 'WEB', 'ANDROID', 'IOS']:
+                try:
+                    yt = PytubeFixYouTube(url, client=client_type)
+                    stream = yt.streams.get_highest_resolution()
+                    if stream:
+                        filepath = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
+                        logger.info(f"pytubefix download successful with client '{client_type}': {filepath}")
+                        return {
+                            'filepath': filepath,
+                            'title': yt.title or "Video",
+                            'duration': yt.length or 0,
+                        }
+                except Exception as pe:
+                    logger.warning(f"pytubefix with client '{client_type}' failed: {pe}")
+            return None
+
+        try:
+            res = await loop.run_in_executor(None, _download_pytubefix)
+            if res:
+                return res
+        except Exception as e:
+            logger.warning(f"pytubefix engine failed: {e}. Trying yt-dlp fallback...")
+
+    # Engine 2: yt-dlp fallback
     ydl_opts = {
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
@@ -934,51 +963,23 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'extractor_retries': 5,
     }
 
-    loop = asyncio.get_event_loop()
+    def _download_ytdlp():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for ext in ['.mp4', '.webm', '.mkv']:
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+            return {
+                'filepath': filepath,
+                'title': info.get('title', 'Video'),
+                'duration': info.get('duration', 0),
+            }
 
-    def _download():
-        # Engine 1: yt-dlp
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filepath = ydl.prepare_filename(info)
-                if not os.path.exists(filepath):
-                    base = os.path.splitext(filepath)[0]
-                    for ext in ['.mp4', '.webm', '.mkv']:
-                        if os.path.exists(base + ext):
-                            filepath = base + ext
-                            break
-                return {
-                    'filepath': filepath,
-                    'title': info.get('title', 'Video'),
-                    'duration': info.get('duration', 0),
-                }
-        except Exception as e:
-            logger.warning(f"yt-dlp download failed: {e}. Trying pytubefix fallback...")
-
-        # Engine 2: pytubefix fallback
-        if has_pytubefix:
-            try:
-                yt = PytubeFixYouTube(url)
-                title = yt.title or "Video"
-                duration = yt.length or 0
-                stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
-                if not stream:
-                    stream = yt.streams.get_highest_resolution()
-                filepath = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
-                logger.info(f"pytubefix download successful: {filepath}")
-                return {
-                    'filepath': filepath,
-                    'title': title,
-                    'duration': duration,
-                }
-            except Exception as pe:
-                logger.error(f"pytubefix download also failed: {pe}")
-                raise pe
-        else:
-            raise Exception("All download engines failed.")
-
-    return await loop.run_in_executor(None, _download)
+    return await loop.run_in_executor(None, _download_ytdlp)
 
 
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

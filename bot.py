@@ -991,6 +991,11 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     return await loop.run_in_executor(None, _download_ytdlp)
 
 
+YOUTUBE_URL_PATTERN = re.compile(
+    r'(https?://)?(www\.)?(youtube\.com/(shorts/|watch\?v=|embed/)|youtu\.be/)[a-zA-Z0-9_-]+'
+)
+
+
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect YouTube links in messages and send the video."""
     if not update.message or not update.message.text:
@@ -999,7 +1004,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
 
     # Extract YouTube URL using regex
-    match = YT_URL_REGEX.search(text)
+    match = YOUTUBE_URL_PATTERN.search(text)
     if not match:
         return
 

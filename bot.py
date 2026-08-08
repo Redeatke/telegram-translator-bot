@@ -961,7 +961,15 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android_vr', 'mweb', 'web_creator'],
+            }
+        },
     }
+
+    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+        ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
 
     def _download_ytdlp():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

@@ -915,22 +915,12 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     ydl_opts = {
-        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
         'outtmpl': output_template,
         'verbose': True,
         'merge_output_format': 'mp4',
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['web'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-        },
         'nocheckcertificate': True,
     }
 
@@ -945,6 +935,16 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
 
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # First, list available formats for debugging
+            try:
+                info_check = ydl.extract_info(url, download=False)
+                formats = info_check.get('formats', [])
+                logger.info(f"Available formats for {url}: {len(formats)} formats found")
+                for f in formats[:10]:  # Log first 10
+                    logger.info(f"  Format: {f.get('format_id')} - {f.get('ext')} - {f.get('height', '?')}p - {f.get('filesize', 'unknown')} bytes")
+            except Exception as e:
+                logger.error(f"Format listing failed: {e}")
+
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
             # yt-dlp may change extension after merge

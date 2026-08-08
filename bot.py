@@ -915,7 +915,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     ydl_opts = {
-        'format': 'best[height<=720][filesize<50M]/best[height<=720]/best[filesize<50M]/best',
+        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
         'outtmpl': output_template,
         'verbose': True,
         'merge_output_format': 'mp4',

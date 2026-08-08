@@ -929,14 +929,10 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'extractor_retries': 5,
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv_embedded', 'android_vr'],
+                'player_client': ['android_vr', 'android_creator'],
             }
         },
     }
-
-    # Use cookies if available as additional fallback
-    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-        ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
 
     loop = asyncio.get_event_loop()
 

@@ -4,6 +4,7 @@ import asyncio
 import re
 import tempfile
 import uuid
+import base64
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -57,6 +58,24 @@ if OPENROUTER_API_KEY:
         logger.error(f"Error configuring OpenRouter: {e}")
 else:
     logger.warning("OPENROUTER_API_KEY not found. AI engine will be unavailable.")
+
+# ─── YouTube Cookies Setup ────────────────────────────────────────────────────
+
+YOUTUBE_COOKIES_FILE = None
+_cookies_b64 = os.getenv("YOUTUBE_COOKIES")
+if _cookies_b64:
+    try:
+        cookies_data = base64.b64decode(_cookies_b64)
+        # Write cookies to a persistent temp file
+        _cookies_fd, YOUTUBE_COOKIES_FILE = tempfile.mkstemp(suffix=".txt", prefix="yt_cookies_")
+        with os.fdopen(_cookies_fd, 'wb') as f:
+            f.write(cookies_data)
+        logger.info(f"YouTube cookies loaded from env var ({len(cookies_data)} bytes).")
+    except Exception as e:
+        logger.error(f"Failed to decode YOUTUBE_COOKIES env var: {e}")
+        YOUTUBE_COOKIES_FILE = None
+else:
+    logger.info("YOUTUBE_COOKIES not set. YouTube downloads may be blocked on cloud servers.")
 
 # ─── User State ───────────────────────────────────────────────────────────────
 
@@ -913,6 +932,10 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         },
         'nocheckcertificate': True,
     }
+
+    # Use cookies if available (required for cloud server IPs)
+    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+        ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
 
     loop = asyncio.get_event_loop()
 

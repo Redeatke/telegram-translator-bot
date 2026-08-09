@@ -23,6 +23,7 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
+from yt_dlp.networking._urllib import UrllibRH
 try:
     from pytubefix import YouTube as PytubeFixYouTube
     has_pytubefix = True
@@ -924,19 +925,25 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
+class CFWorkerRH(UrllibRH):
+    """Custom yt-dlp RequestHandler to route all outgoing requests transparently through Cloudflare Worker."""
+    RH_KEY = 'CFWorker'
+
+    def _send(self, request):
+        if CLOUDFLARE_WORKER_URL:
+            worker_base = CLOUDFLARE_WORKER_URL.rstrip('/') + '/?url='
+            if not request.url.startswith(worker_base):
+                proxied_url = worker_base + urllib.parse.quote(request.url, safe='')
+                request = request.copy(url=proxied_url)
+        return super()._send(request)
+
+
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using Cloudflare Worker proxy and yt-dlp. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using Cloudflare Worker RequestHandler and yt-dlp. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     loop = asyncio.get_event_loop()
-
-    # Prepend Cloudflare Worker proxy URL if configured
-    target_url = url
-    if CLOUDFLARE_WORKER_URL:
-        base_worker = CLOUDFLARE_WORKER_URL.rstrip('/')
-        if not url.startswith(base_worker):
-            target_url = f"{base_worker}/?url={url}"
 
     ydl_opts = {
         'outtmpl': output_template,
@@ -944,12 +951,13 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
+        'request_handlers': [CFWorkerRH],
     }
 
     def _download():
-        logger.info(f"Downloading YouTube video via target URL: {target_url[:80]}...")
+        logger.info(f"Downloading YouTube video via CFWorkerRH: {url}...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_url, download=True)
+            info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
             if not os.path.exists(filepath):
                 base = os.path.splitext(filepath)[0]

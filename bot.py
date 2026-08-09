@@ -908,21 +908,8 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
-class CFWorkerRH(UrllibRH):
-    """Custom yt-dlp RequestHandler to route all outgoing requests transparently through Cloudflare Worker."""
-    RH_KEY = 'CFWorker'
-
-    def _send(self, request):
-        if CLOUDFLARE_WORKER_URL:
-            worker_base = CLOUDFLARE_WORKER_URL.rstrip('/') + '/?url='
-            if not request.url.startswith(worker_base):
-                proxied_url = worker_base + urllib.parse.quote(request.url, safe='')
-                request = request.copy(url=proxied_url)
-        return super()._send(request)
-
-
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using Cloudflare Worker RequestHandler and yt-dlp. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using Cloudflare Worker proxy and yt-dlp. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
@@ -934,12 +921,23 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         'socket_timeout': 30,
         'retries': 5,
         'extractor_retries': 5,
-        'request_handlers': [CFWorkerRH],
     }
 
     def _download():
-        logger.info(f"Downloading YouTube video via CFWorkerRH: {url}...")
+        logger.info(f"Downloading YouTube video via CFWorker proxy: {url}...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Dynamically route all Urllib HTTP/HTTPS requests through Cloudflare Worker
+            if CLOUDFLARE_WORKER_URL and 'Urllib' in ydl._request_director.handlers:
+                worker_base = CLOUDFLARE_WORKER_URL.rstrip('/') + '/?url='
+                urllib_rh = ydl._request_director.handlers['Urllib']
+                orig_send = urllib_rh._send
+                def proxied_send(request):
+                    if not request.url.startswith(worker_base):
+                        proxied_url = worker_base + urllib.parse.quote(request.url, safe='')
+                        request = request.copy(url=proxied_url)
+                    return orig_send(request)
+                urllib_rh._send = proxied_send
+
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
             if not os.path.exists(filepath):

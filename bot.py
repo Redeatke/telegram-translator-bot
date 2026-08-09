@@ -924,21 +924,6 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
-class CloudflareWorkerOpener(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
-    """Custom urllib handler to route all outgoing requests transparently through Cloudflare Worker."""
-    def __init__(self, worker_base: str):
-        super().__init__()
-        self.worker_base = worker_base.rstrip('/') + '/?url='
-
-    def https_open(self, req):
-        full_url = req.full_url
-        if not full_url.startswith(self.worker_base):
-            new_url = self.worker_base + urllib.parse.quote(full_url, safe='')
-            new_req = urllib.request.Request(new_url, headers=req.headers, method=req.get_method())
-            return urllib.request.urlopen(new_req)
-        return super().https_open(req)
-
-
 async def download_youtube_video(url: str, output_dir: str) -> dict:
     """Download a YouTube video using Cloudflare Worker proxy and yt-dlp. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
@@ -946,14 +931,12 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
 
     loop = asyncio.get_event_loop()
 
-    # Install Cloudflare Worker opener if configured
+    # Prepend Cloudflare Worker proxy URL if configured
+    target_url = url
     if CLOUDFLARE_WORKER_URL:
-        try:
-            worker_opener = urllib.request.build_opener(CloudflareWorkerOpener(CLOUDFLARE_WORKER_URL))
-            urllib.request.install_opener(worker_opener)
-            logger.info(f"Installed Cloudflare Worker urllib opener for: {CLOUDFLARE_WORKER_URL}")
-        except Exception as e:
-            logger.warning(f"Failed to install Cloudflare Worker opener: {e}")
+        base_worker = CLOUDFLARE_WORKER_URL.rstrip('/')
+        if not url.startswith(base_worker):
+            target_url = f"{base_worker}/?url={url}"
 
     ydl_opts = {
         'outtmpl': output_template,
@@ -964,8 +947,9 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     }
 
     def _download():
+        logger.info(f"Downloading YouTube video via target URL: {target_url[:80]}...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(target_url, download=True)
             filepath = ydl.prepare_filename(info)
             if not os.path.exists(filepath):
                 base = os.path.splitext(filepath)[0]

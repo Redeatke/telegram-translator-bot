@@ -71,25 +71,8 @@ else:
 
 # ─── YouTube Cookies Setup ────────────────────────────────────────────────────
 
+# Ignore legacy browser cookies (expired cookies cause YouTube to demand sign-in)
 YOUTUBE_COOKIES_FILE = None
-_cookies_b64 = os.getenv("YOUTUBE_COOKIES")
-if _cookies_b64:
-    try:
-        cookies_data = base64.b64decode(_cookies_b64)
-        # Write cookies to a persistent temp file
-        _cookies_fd, YOUTUBE_COOKIES_FILE = tempfile.mkstemp(suffix=".txt", prefix="yt_cookies_")
-        with os.fdopen(_cookies_fd, 'wb') as f:
-            f.write(cookies_data)
-        logger.info(f"YouTube cookies loaded from env var ({len(cookies_data)} bytes).")
-        # Verify cookie file content
-        with open(YOUTUBE_COOKIES_FILE, 'r') as f:
-            first_lines = [f.readline().strip() for _ in range(5)]
-            logger.info(f"Cookie file starts with: {first_lines}")
-    except Exception as e:
-        logger.error(f"Failed to decode YOUTUBE_COOKIES env var: {e}")
-        YOUTUBE_COOKIES_FILE = None
-else:
-    logger.info("YOUTUBE_COOKIES not set. YouTube downloads may be blocked on cloud servers.")
 
 # Log yt-dlp version
 logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")

@@ -10,11 +10,12 @@ import urllib.request
 import urllib.parse
 from dotenv import load_dotenv
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -138,15 +139,15 @@ YOUTUBE_URL_PATTERN = re.compile(
     r'(?:https?://)?'
     r'(?:www\.|m\.)?'
     r'(?:'
-    r'youtube\.com/(?:shorts/|watch\?v=|embed/|v/)'
+    r'youtube\.com/(?:shorts/|watch\?v=|embed/|live/|v/)'
     r'|youtu\.be/'
     r')'
-    r'[\w\-]{11}',
+    r'[\w\-]+',
     re.IGNORECASE
 )
 
-# Maximum video duration in seconds (10 minutes)
-MAX_VIDEO_DURATION = 600
+# Maximum video duration in seconds (30 minutes)
+MAX_VIDEO_DURATION = 1800
 
 
 def get_flag(lang_code: str) -> str:
@@ -939,11 +940,12 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     def _download():
         logger.info(f"Downloading YouTube video: {url}...")
 
-        # Multi-client strategy to bypass YouTube bot detection & PO token blocks
+        # Multi-client strategy to bypass YouTube bot detection & PO token blocks (capped at 720p for fast download & 50MB limit)
         ydl_opts_list = [
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
+                'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best',
                 'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'mweb']}},
                 'socket_timeout': 30,
                 'retries': 3,
@@ -952,6 +954,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
                 'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
                 'socket_timeout': 30,
                 'retries': 3,
@@ -1013,8 +1016,84 @@ YOUTUBE_URL_PATTERN = re.compile(
 )
 
 
+async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+    """Execute download and upload for YouTube video."""
+    if not status_msg:
+        status_msg = await target_message.reply_text("⏳ Downloading YouTube video (720p)...")
+    else:
+        await status_msg.edit_text("⏳ Downloading YouTube video (720p)...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = await download_youtube_video(yt_url, tmp_dir)
+            filepath = result['filepath']
+            title = result['title']
+            duration = result.get('duration', 0)
+
+            # Check duration limit (30 mins = 1800s)
+            if duration and duration > MAX_VIDEO_DURATION:
+                mins = duration // 60
+                secs = duration % 60
+                await status_msg.edit_text(
+                    fmt_warning(f"Video is too long ({mins}m {secs}s). Max allowed duration is 30 minutes.")
+                )
+                return
+
+            # Check file size (Telegram limit: 50 MB for bots)
+            file_size = os.path.getsize(filepath)
+            if file_size > 50 * 1024 * 1024:
+                mb_size = file_size / (1024 * 1024)
+                await status_msg.edit_text(
+                    fmt_warning(f"Video file is too large for Telegram ({mb_size:.1f} MB). Max limit is 50 MB.")
+                )
+                return
+
+            await status_msg.edit_text("📤 Uploading to Telegram...")
+
+            await context.bot.send_chat_action(
+                chat_id=target_message.chat_id, action="upload_video"
+            )
+
+            with open(filepath, 'rb') as video_file:
+                await target_message.reply_video(
+                    video=video_file,
+                    caption=f"📹 {title}",
+                    supports_streaming=True,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            logger.info(f"YouTube video sent successfully: {title}")
+
+    except yt_dlp.utils.DownloadError as e:
+        error_str = str(e)
+        logger.error(f"YouTube DownloadError for {yt_url}: {error_str}")
+        error_lower = error_str.lower()
+        if 'is a live stream' in error_lower or 'live stream' in error_lower or 'is live' in error_lower:
+            await status_msg.edit_text(fmt_warning("This is an active live stream and cannot be downloaded until it ends."))
+        elif '429' in error_lower or 'too many requests' in error_lower:
+            await status_msg.edit_text(fmt_warning("YouTube is temporarily rate-limiting requests. Please try again in a moment."))
+        elif 'private' in error_lower or 'unavailable' in error_lower:
+            await status_msg.edit_text(fmt_error("This video is private or unavailable."))
+        elif 'age' in error_lower:
+            await status_msg.edit_text(fmt_error("This video is age-restricted and cannot be downloaded."))
+        else:
+            await status_msg.edit_text(fmt_error("Couldn't download this video."))
+    except Exception as e:
+        logger.error(f"YouTube download failed for {yt_url}: {type(e).__name__}: {e}")
+        try:
+            await status_msg.edit_text(fmt_error("Something went wrong downloading this video."))
+        except Exception:
+            pass
+
+
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-detect YouTube links in messages and send the video."""
+    """Auto-detect YouTube links in messages. Shorts auto-download; standard videos show a download button."""
     if not update.message or not update.message.text:
         return
 
@@ -1028,82 +1107,40 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     yt_url = match.group(0)
     logger.info(f"YouTube URL detected: {yt_url}")
 
-    # Send initial status message
-    status_msg = await update.message.reply_text(
-        "⏳ Downloading YouTube video...",
+    # If it's a Short, download directly without button
+    if "/shorts/" in yt_url.lower():
+        await execute_youtube_download(update.message, yt_url, context)
+        return
+
+    # For standard videos & live streams, show Inline Download Button
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬇️ Download Video (720p)", callback_data=f"ytdl:{yt_url}")]
+    ])
+
+    await update.message.reply_text(
+        f"📹 <b>YouTube Link Detected</b>\n"
+        f"🔗 <code>{yt_url}</code>\n\n"
+        f"<i>Click below to download (720p, max 30 min / 50MB):</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
         reply_to_message_id=update.message.message_id
     )
 
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            # Download the video
-            result = await download_youtube_video(yt_url, tmp_dir)
-            filepath = result['filepath']
-            title = result['title']
-            duration = result.get('duration', 0)
 
-            # Check duration
-            if duration and duration > MAX_VIDEO_DURATION:
-                await status_msg.edit_text(
-                    fmt_warning(f"Video is too long ({duration // 60}m {duration % 60}s). Max is {MAX_VIDEO_DURATION // 60} minutes.")
-                )
-                return
+async def handle_youtube_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Download Video' inline keyboard button presses."""
+    query = update.callback_query
+    await query.answer()
 
-            # Check file size (Telegram limit: 50 MB for bots)
-            file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:
-                await status_msg.edit_text(
-                    fmt_warning("Video file is too large for Telegram (>50 MB).")
-                )
-                return
+    data = query.data
+    if not data or not data.startswith("ytdl:"):
+        return
 
-            # Update status
-            await status_msg.edit_text("📤 Uploading to Telegram...")
+    yt_url = data[5:]
+    logger.info(f"User clicked YouTube download button for: {yt_url}")
 
-            # Send the video
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id, action="upload_video"
-            )
-
-            with open(filepath, 'rb') as video_file:
-                await update.message.reply_video(
-                    video=video_file,
-                    caption=f"📹 {title}",
-                    supports_streaming=True,
-                    read_timeout=120,
-                    write_timeout=120,
-                )
-
-            # Delete the status message after successful upload
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            logger.info(f"YouTube video sent successfully: {title}")
-
-    except yt_dlp.utils.DownloadError as e:
-        error_str = str(e)
-        logger.error(f"YouTube DownloadError for {yt_url}: {error_str}")
-        logger.error(traceback.format_exc())
-        error_lower = error_str.lower()
-        if '429' in error_lower or 'too many requests' in error_lower:
-            await status_msg.edit_text(fmt_warning("YouTube is temporarily rate-limiting requests. Please wait a minute and try again."))
-        elif 'private' in error_lower or 'unavailable' in error_lower:
-            await status_msg.edit_text(fmt_error("This video is private or unavailable."))
-        elif 'age' in error_lower:
-            await status_msg.edit_text(fmt_error("This video is age-restricted and can't be downloaded."))
-        elif 'sign in' in error_lower or 'bot' in error_lower:
-            await status_msg.edit_text(fmt_error("YouTube is blocking this download. Try again later."))
-        else:
-            await status_msg.edit_text(fmt_error("Couldn't download this video."))
-    except Exception as e:
-        logger.error(f"YouTube download failed for {yt_url}: {type(e).__name__}: {e}")
-        logger.error(traceback.format_exc())
-        try:
-            await status_msg.edit_text(fmt_error("Something went wrong downloading this video."))
-        except Exception:
-            pass
+    status_msg = await query.message.reply_text("⏳ Starting YouTube download...")
+    await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg)
 
 
 # ─── Auto-Translate in Private Chat ──────────────────────────────────────────
@@ -1250,6 +1287,9 @@ def main() -> None:
     application.add_handler(CommandHandler("promote", promote_command))
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
+
+    # Register YouTube button callback handler
+    application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:"))
 
     # Register YouTube auto-download handler (before general text handler so it takes priority)
     application.add_handler(MessageHandler(

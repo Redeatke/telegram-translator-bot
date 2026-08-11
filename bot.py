@@ -1159,18 +1159,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ─── Main Application Runner ─────────────────────────────────────────────────
 
 async def auto_pinger_loop(application: Application) -> None:
-    """Background task that pings Render URL or Telegram API every PING_INTERVAL seconds."""
-    target_url = PING_URL or os.getenv("RENDER_EXTERNAL_URL")
+    """Background task that pings Render webhook URL or Telegram API every PING_INTERVAL seconds."""
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    default_target = f"{render_url.rstrip('/')}/{TELEGRAM_BOT_TOKEN}" if (render_url and TELEGRAM_BOT_TOKEN) else render_url
+    target_url = PING_URL or default_target
     target_desc = target_url or "Telegram API (getMe)"
     logger.info(f"Auto-pinger active. Interval: {PING_INTERVAL}s | Target: {target_desc}")
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
-                render_or_ping_url = PING_URL or os.getenv("RENDER_EXTERNAL_URL")
-                if render_or_ping_url:
-                    response = await client.get(render_or_ping_url)
-                    logger.debug(f"[Auto-Pinger] Pinged {render_or_ping_url} - Status: {response.status_code}")
+                render_url = os.getenv("RENDER_EXTERNAL_URL")
+                default_target = f"{render_url.rstrip('/')}/{TELEGRAM_BOT_TOKEN}" if (render_url and TELEGRAM_BOT_TOKEN) else render_url
+                ping_target = PING_URL or default_target
+                if ping_target:
+                    response = await client.get(ping_target)
+                    logger.debug(f"[Auto-Pinger] Pinged {ping_target} - Status: {response.status_code}")
                 else:
                     await application.bot.get_me()
                     logger.debug("[Auto-Pinger] Telegram API ping successful")

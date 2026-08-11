@@ -19,6 +19,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
+import httpx
 from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
@@ -46,6 +47,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "https://yt-proxy.benjamindavidson2468.workers.dev/")
+
+# Auto Pinger configuration
+AUTO_PING_ENABLED = os.getenv("AUTO_PING_ENABLED", "True").lower() == "true"
+PING_INTERVAL = float(os.getenv("PING_INTERVAL", "5.0"))
+PING_URL = os.getenv("PING_URL", "")
 
 # Toggle to allow all users to use the AI engine (for testing or public deployment)
 ALLOW_ALL_TO_USE_AI = os.getenv("ALLOW_ALL_TO_USE_AI", "True").lower() == "true"
@@ -343,11 +349,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     premium_badge = "⭐ Yes" if is_premium else "No"
 
+    pinger_status = f"Active ({PING_INTERVAL:.1f}s)" if AUTO_PING_ENABLED else "Disabled"
+
     body = (
         f"  👤  User ID       <code>{user.id}</code>\n"
         f"  💎  Premium       {premium_badge}\n"
         f"  {target_flag}  Language     <b>{target_name}</b> (<code>{config['target']}</code>)\n"
         f"  ⚡  Engine        <b>{engine_name}</b>\n"
+        f"  🔔  Auto Pinger   <b>{pinger_status}</b>\n"
         f"\n"
         f"AI access: <i>{'open to all' if ALLOW_ALL_TO_USE_AI else 'Premium & Admins only'}</i>"
     )
@@ -909,48 +918,75 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
 async def download_youtube_video(url: str, output_dir: str) -> dict:
-    """Download a YouTube video using Cloudflare Worker proxy and yt-dlp. Returns dict with filepath, title, duration."""
+    """Download a YouTube video using optimized yt-dlp player clients with pytubefix fallback. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
     loop = asyncio.get_event_loop()
 
-    ydl_opts = {
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'socket_timeout': 30,
-        'retries': 5,
-        'extractor_retries': 5,
-    }
-
     def _download():
-        logger.info(f"Downloading YouTube video via CFWorker proxy: {url}...")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Dynamically route all Urllib HTTP/HTTPS requests through Cloudflare Worker
-            if CLOUDFLARE_WORKER_URL and 'Urllib' in ydl._request_director.handlers:
-                worker_base = CLOUDFLARE_WORKER_URL.rstrip('/') + '/?url='
-                urllib_rh = ydl._request_director.handlers['Urllib']
-                orig_send = urllib_rh._send
-                def proxied_send(request):
-                    if not request.url.startswith(worker_base):
-                        proxied_url = worker_base + urllib.parse.quote(request.url, safe='')
-                        request = request.copy(url=proxied_url)
-                    return orig_send(request)
-                urllib_rh._send = proxied_send
+        logger.info(f"Downloading YouTube video: {url}...")
 
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if not os.path.exists(filepath):
-                base = os.path.splitext(filepath)[0]
-                for ext in ['.mp4', '.webm', '.mkv']:
-                    if os.path.exists(base + ext):
-                        filepath = base + ext
-                        break
-            return {
-                'filepath': filepath,
-                'title': info.get('title', 'Video'),
-                'duration': info.get('duration', 0),
+        # Multi-client strategy to bypass YouTube bot detection & PO token blocks
+        ydl_opts_list = [
+            {
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'mweb']}},
+                'socket_timeout': 30,
+                'retries': 3,
+                'quiet': True,
+            },
+            {
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
+                'socket_timeout': 30,
+                'retries': 3,
+                'quiet': True,
             }
+        ]
+
+        for i, opts in enumerate(ydl_opts_list, 1):
+            try:
+                logger.info(f"Trying yt-dlp strategy {i} for {url}...")
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    filepath = ydl.prepare_filename(info)
+                    if not os.path.exists(filepath):
+                        base = os.path.splitext(filepath)[0]
+                        for ext in ['.mp4', '.webm', '.mkv']:
+                            if os.path.exists(base + ext):
+                                filepath = base + ext
+                                break
+                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                        return {
+                            'filepath': filepath,
+                            'title': info.get('title', 'Video'),
+                            'duration': info.get('duration', 0),
+                        }
+            except Exception as e:
+                logger.warning(f"yt-dlp strategy {i} failed for {url}: {e}")
+
+        # Fallback to pytubefix if available
+        if has_pytubefix:
+            try:
+                logger.info(f"Trying pytubefix fallback for {url}...")
+                yt = PytubeFixYouTube(url)
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution()
+                if not stream:
+                    stream = yt.streams.filter(file_extension='mp4').first()
+                if stream:
+                    fp = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
+                    return {
+                        'filepath': fp,
+                        'title': yt.title or 'Video',
+                        'duration': yt.length or 0,
+                    }
+            except Exception as e:
+                logger.warning(f"pytubefix fallback failed for {url}: {e}")
+
+        raise Exception("Failed to download YouTube video after trying all available engines.")
 
     return await loop.run_in_executor(None, _download)
 
@@ -1105,8 +1141,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ─── Main Application Runner ─────────────────────────────────────────────────
 
+async def auto_pinger_loop(application: Application) -> None:
+    """Background task that pings Render URL or Telegram API every PING_INTERVAL seconds."""
+    target_url = PING_URL or os.getenv("RENDER_EXTERNAL_URL")
+    target_desc = target_url or "Telegram API (getMe)"
+    logger.info(f"Auto-pinger active. Interval: {PING_INTERVAL}s | Target: {target_desc}")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                render_or_ping_url = PING_URL or os.getenv("RENDER_EXTERNAL_URL")
+                if render_or_ping_url:
+                    response = await client.get(render_or_ping_url)
+                    logger.debug(f"[Auto-Pinger] Pinged {render_or_ping_url} - Status: {response.status_code}")
+                else:
+                    await application.bot.get_me()
+                    logger.debug("[Auto-Pinger] Telegram API ping successful")
+            except asyncio.CancelledError:
+                logger.info("Auto-pinger task cancelled.")
+                break
+            except Exception as e:
+                logger.warning(f"[Auto-Pinger] Ping failed: {e}")
+
+            await asyncio.sleep(PING_INTERVAL)
+
+
 async def post_init(application: Application) -> None:
-    """Register bot commands in Telegram's menu button on startup."""
+    """Register bot commands in Telegram's menu button and start background tasks on startup."""
     await application.bot.set_my_commands([
         ("start", "Start the bot and see configuration"),
         ("tr", "Translate text (reply or inline)"),
@@ -1119,6 +1180,9 @@ async def post_init(application: Application) -> None:
         ("promote", "Promote user to Admin (Admins)"),
         ("demote", "Demote Admin (Admins)"),
     ])
+
+    if AUTO_PING_ENABLED:
+        asyncio.create_task(auto_pinger_loop(application))
 
 
 def main() -> None:

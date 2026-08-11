@@ -77,8 +77,20 @@ else:
 
 # ─── YouTube Cookies Setup ────────────────────────────────────────────────────
 
-# Ignore legacy browser cookies (expired cookies cause YouTube to demand sign-in)
 YOUTUBE_COOKIES_FILE = None
+cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("YOUTUBE_COOKIE")
+if cookies_env:
+    try:
+        tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        with open(tmp_cookie_path, "w", encoding="utf-8") as f:
+            f.write(cookies_env.strip())
+        YOUTUBE_COOKIES_FILE = tmp_cookie_path
+        logger.info("Loaded YouTube cookies from YOUTUBE_COOKIES environment variable.")
+    except Exception as e:
+        logger.error(f"Failed to write YOUTUBE_COOKIES to temp file: {e}")
+elif os.path.exists("cookies.txt"):
+    YOUTUBE_COOKIES_FILE = os.path.abspath("cookies.txt")
+    logger.info("Loaded YouTube cookies from local cookies.txt file.")
 
 # Log yt-dlp version
 logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
@@ -946,6 +958,11 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
                 'quiet': True,
             }
         ]
+
+        if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+            logger.info(f"Using cookies file: {YOUTUBE_COOKIES_FILE}")
+            for opts in ydl_opts_list:
+                opts['cookiefile'] = YOUTUBE_COOKIES_FILE
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:

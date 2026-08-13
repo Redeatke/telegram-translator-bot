@@ -863,9 +863,9 @@ async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     global YOUTUBE_COOKIES_FILE
     cookie_content = None
 
-    # Option 1: Reply to a document (cookies.txt file)
-    if update.message.reply_to_message and update.message.reply_to_message.document:
-        doc = update.message.reply_to_message.document
+    # Option 1: Direct document attached to the /setcookies command or reply to document
+    doc = update.message.document or (update.message.reply_to_message.document if update.message.reply_to_message else None)
+    if doc:
         try:
             file = await context.bot.get_file(doc.file_id)
             raw = await file.download_as_bytearray()
@@ -1377,6 +1377,7 @@ def main() -> None:
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("setcookies", setcookies_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, setcookies_command))
 
     # Register YouTube button callback handler
     application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:"))

@@ -6,6 +6,7 @@ import tempfile
 import uuid
 import base64
 import traceback
+import time
 import urllib.request
 import urllib.parse
 from dotenv import load_dotenv
@@ -40,6 +41,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# Suppress httpx INFO logs (auto-pinger generates excessive noise)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ─── API Configuration ───────────────────────────────────────────────────────
 
@@ -841,6 +844,85 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+# ─── /setcookies Command ─────────────────────────────────────────────────────
+
+async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Update YouTube cookies by sending a cookies.txt file or pasting content."""
+    user = update.effective_user
+    if not user:
+        return
+
+    # Only allow in private chat for security
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            fmt_error("This command can only be used in private chat for security."),
+            parse_mode="HTML"
+        )
+        return
+
+    global YOUTUBE_COOKIES_FILE
+    cookie_content = None
+
+    # Option 1: Reply to a document (cookies.txt file)
+    if update.message.reply_to_message and update.message.reply_to_message.document:
+        doc = update.message.reply_to_message.document
+        try:
+            file = await context.bot.get_file(doc.file_id)
+            raw = await file.download_as_bytearray()
+            cookie_content = raw.decode("utf-8")
+        except Exception as e:
+            await update.message.reply_text(
+                fmt_error(f"Failed to read file: {e}"),
+                parse_mode="HTML"
+            )
+            return
+
+    # Option 2: Text arguments (for small cookie sets)
+    elif context.args:
+        cookie_content = " ".join(context.args)
+
+    if not cookie_content:
+        await update.message.reply_text(
+            fmt_card("🍪 Update YouTube Cookies",
+                "Send your <code>cookies.txt</code> file to this chat,\n"
+                "then reply to it with /setcookies\n"
+                "\n"
+                "Or paste cookie content directly:\n"
+                "<code>/setcookies &lt;paste here&gt;</code>\n"
+                "\n"
+                "<i>Use the 'Get cookies.txt LOCALLY' browser\n"
+                "extension, or run refresh_cookies.py locally.</i>"
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+    # Save cookies to temp file
+    try:
+        tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        with open(tmp_cookie_path, "w", encoding="utf-8") as f:
+            f.write(cookie_content.strip())
+        YOUTUBE_COOKIES_FILE = tmp_cookie_path
+
+        cookie_lines = [l for l in cookie_content.strip().split('\n') if l.strip() and not l.startswith('#')]
+        cookie_count = len(cookie_lines)
+
+        await update.message.reply_text(
+            fmt_success(
+                f"YouTube cookies updated! ({cookie_count} cookies loaded)\n\n"
+                "These will be used for future YouTube downloads."
+            ),
+            parse_mode="HTML"
+        )
+        logger.info(f"YouTube cookies updated via /setcookies by user {user.id} ({cookie_count} cookies)")
+    except Exception as e:
+        logger.error(f"Failed to update cookies via /setcookies: {e}")
+        await update.message.reply_text(
+            fmt_error(f"Failed to save cookies: {e}"),
+            parse_mode="HTML"
+        )
+
+
 # ─── /tr Command ──────────────────────────────────────────────────────────────
 
 async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -940,13 +1022,16 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     def _download():
         logger.info(f"Downloading YouTube video: {url}...")
 
-        # Multi-client strategy to bypass YouTube bot detection & PO token blocks (capped at 720p for fast download & 50MB limit)
+        # Multi-client strategy optimized for PO Token server on 127.0.0.1:4416
+        # Strategy 1: mweb client — best with cookies + PO tokens from bgutil server
+        # Strategy 2: web client — alternative, works well with cookies
+        # Strategy 3: default auto-selection with relaxed format matching
         ydl_opts_list = [
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'mweb']}},
+                'extractor_args': {'youtube': {'player_client': ['mweb']}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
@@ -955,11 +1040,19 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
+                'extractor_args': {'youtube': {'player_client': ['web']}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
-            }
+            },
+            {
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'format': 'best[height<=720]/best',
+                'socket_timeout': 30,
+                'retries': 3,
+                'quiet': True,
+            },
         ]
 
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
@@ -987,6 +1080,8 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
                         }
             except Exception as e:
                 logger.warning(f"yt-dlp strategy {i} failed for {url}: {e}")
+                if i < len(ydl_opts_list):
+                    time.sleep(2)  # Brief delay between strategies to avoid rate limiting
 
         # Fallback to pytubefix if available
         if has_pytubefix:
@@ -1011,9 +1106,6 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     return await loop.run_in_executor(None, _download)
 
 
-YOUTUBE_URL_PATTERN = re.compile(
-    r'(https?://)?(www\.)?(youtube\.com/(shorts/|watch\?v=|embed/)|youtu\.be/)[a-zA-Z0-9_-]+'
-)
 
 
 async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
@@ -1196,30 +1288,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ─── Main Application Runner ─────────────────────────────────────────────────
 
 async def auto_pinger_loop(application: Application) -> None:
-    """Background task that pings Render webhook URL or Telegram API every PING_INTERVAL seconds."""
+    """Background task that pings Render root URL to prevent free-tier sleep."""
+    # Ping the root URL (not the webhook token path) to avoid 405 errors
     render_url = os.getenv("RENDER_EXTERNAL_URL")
-    default_target = f"{render_url.rstrip('/')}/{TELEGRAM_BOT_TOKEN}" if (render_url and TELEGRAM_BOT_TOKEN) else render_url
-    target_url = PING_URL or default_target
+    target_url = PING_URL or render_url
     target_desc = target_url or "Telegram API (getMe)"
     logger.info(f"Auto-pinger active. Interval: {PING_INTERVAL}s | Target: {target_desc}")
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
-                render_url = os.getenv("RENDER_EXTERNAL_URL")
-                default_target = f"{render_url.rstrip('/')}/{TELEGRAM_BOT_TOKEN}" if (render_url and TELEGRAM_BOT_TOKEN) else render_url
-                ping_target = PING_URL or default_target
+                ping_target = PING_URL or os.getenv("RENDER_EXTERNAL_URL")
                 if ping_target:
-                    response = await client.get(ping_target)
-                    logger.debug(f"[Auto-Pinger] Pinged {ping_target} - Status: {response.status_code}")
+                    await client.get(ping_target)
                 else:
                     await application.bot.get_me()
-                    logger.debug("[Auto-Pinger] Telegram API ping successful")
             except asyncio.CancelledError:
                 logger.info("Auto-pinger task cancelled.")
                 break
-            except Exception as e:
-                logger.warning(f"[Auto-Pinger] Ping failed: {e}")
+            except Exception:
+                pass  # Silently ignore ping failures
 
             await asyncio.sleep(PING_INTERVAL)
 
@@ -1234,6 +1322,7 @@ async def post_init(application: Application) -> None:
         ("status", "Show settings and status"),
         ("help", "Full help guide"),
         ("report", "Report a problem to admins"),
+        ("setcookies", "Update YouTube cookies (DM only)"),
         ("ban", "Ban user from group (Admins)"),
         ("promote", "Promote user to Admin (Admins)"),
         ("demote", "Demote Admin (Admins)"),
@@ -1287,6 +1376,7 @@ def main() -> None:
     application.add_handler(CommandHandler("promote", promote_command))
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("setcookies", setcookies_command))
 
     # Register YouTube button callback handler
     application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:"))

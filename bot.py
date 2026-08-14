@@ -2,13 +2,10 @@ import os
 import logging
 import asyncio
 import re
+import html
 import tempfile
 import uuid
-import base64
-import traceback
 import time
-import urllib.request
-import urllib.parse
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,7 +23,7 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
-from yt_dlp.networking._urllib import UrllibRH
+
 try:
     from pytubefix import YouTube as PytubeFixYouTube
     has_pytubefix = True
@@ -50,18 +47,21 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
-CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "https://yt-proxy.benjamindavidson2468.workers.dev/")
 
 # Auto Pinger configuration
 AUTO_PING_ENABLED = os.getenv("AUTO_PING_ENABLED", "True").lower() == "true"
-PING_INTERVAL = float(os.getenv("PING_INTERVAL", "5.0"))
+PING_INTERVAL = float(os.getenv("PING_INTERVAL", "60.0"))  # 60s default — sufficient to keep free-tier awake
 PING_URL = os.getenv("PING_URL", "")
 
 # Toggle to allow all users to use the AI engine (for testing or public deployment)
 ALLOW_ALL_TO_USE_AI = os.getenv("ALLOW_ALL_TO_USE_AI", "True").lower() == "true"
 
-# Whitelisted admin user IDs
-ADMIN_USER_IDS = []
+# Whitelisted admin user IDs — set ADMIN_USER_IDS=123456,789012 in .env
+ADMIN_USER_IDS = [
+    int(uid.strip())
+    for uid in os.getenv("ADMIN_USER_IDS", "").split(",")
+    if uid.strip().isdigit()
+]
 
 # Initialize OpenRouter client
 has_ai = False
@@ -229,7 +229,7 @@ def fmt_warning(text: str) -> str:
 
 async def translate_free(text: str, target_lang: str) -> str:
     """Translate text using deep-translator (Google Translate free backend)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         translated = await loop.run_in_executor(
             None,
@@ -255,7 +255,7 @@ async def translate_ai(text: str, target_lang: str) -> str:
     )
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
             lambda: ai_client.chat.completions.create(
@@ -807,7 +807,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    report_text = " ".join(context.args)
+    report_text = html.escape(" ".join(context.args))
 
     if not ADMIN_USER_IDS:
         await update.message.reply_text(
@@ -1023,7 +1023,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _download():
         logger.info(f"Downloading YouTube video: {url}...")
@@ -1120,7 +1120,13 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
 
         raise Exception("Failed to download YouTube video after trying all available engines.")
 
-    return await loop.run_in_executor(None, _download)
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=300  # 5 minute hard cap on any single download
+        )
+    except asyncio.TimeoutError:
+        raise Exception("YouTube download timed out after 5 minutes.")
 
 
 

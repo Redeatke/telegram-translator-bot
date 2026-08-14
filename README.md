@@ -29,6 +29,14 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 # OpenRouter (optional — enables AI engine)
 OPENROUTER_API_KEY=sk-or-v1-your_key_here
 OPENROUTER_MODEL=google/gemini-2.5-flash
+
+# Admin user IDs (comma-separated Telegram user IDs)
+# These users receive /report messages and can use admin commands
+ADMIN_USER_IDS=123456789,987654321
+
+# Auto-pinger (optional — keeps free-tier hosts awake)
+PING_URL=https://your-service-url.onrender.com
+PING_INTERVAL=60
 ```
 
 Get your OpenRouter key at [openrouter.ai](https://openrouter.ai).

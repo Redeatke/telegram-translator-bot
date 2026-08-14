@@ -1036,8 +1036,8 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['mweb']}},
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                'extractor_args': {'youtube': {'player_client': ['web'], 'js_provider': ['node']}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
@@ -1045,8 +1045,8 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['web']}},
+                'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best',
+                'extractor_args': {'youtube': {'player_client': ['mweb'], 'js_provider': ['node']}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,

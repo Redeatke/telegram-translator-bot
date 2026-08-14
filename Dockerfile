@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Limit Deno and Node.js memory to prevent OOM kills on free-tier hosts
-ENV DENO_V8_FLAGS="--max-old-space-size=128"
+ENV DENO_V8_FLAGS="--max-old-space-size=256"
 ENV NODE_OPTIONS="--max-old-space-size=128"
 
 WORKDIR /app

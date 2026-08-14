@@ -1377,7 +1377,10 @@ def main() -> None:
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("setcookies", setcookies_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, setcookies_command))
+    application.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.Document.FileName("cookies.txt"),
+        setcookies_command
+    ))
 
     # Register YouTube button callback handler
     application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:"))

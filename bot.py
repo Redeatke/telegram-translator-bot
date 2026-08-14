@@ -866,6 +866,12 @@ async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Option 1: Direct document attached to the /setcookies command or reply to document
     doc = update.message.document or (update.message.reply_to_message.document if update.message.reply_to_message else None)
     if doc:
+        # If user uploaded a document directly without /setcookies command/caption, ignore non-txt files
+        is_explicit_cmd = (update.message.text and update.message.text.startswith("/setcookies")) or \
+                           (update.message.caption and "/setcookies" in update.message.caption)
+        if not is_explicit_cmd and doc.file_name and not doc.file_name.lower().endswith(".txt"):
+            return
+
         try:
             file = await context.bot.get_file(doc.file_id)
             raw = await file.download_as_bytearray()
@@ -1378,7 +1384,7 @@ def main() -> None:
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("setcookies", setcookies_command))
     application.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.Document.FileName("cookies.txt"),
+        filters.ChatType.PRIVATE & filters.Document.ALL,
         setcookies_command
     ))
 

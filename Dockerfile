@@ -23,8 +23,9 @@ RUN pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
 # This provides Proof-of-Origin tokens at 127.0.0.1:4416 that YouTube requires
 RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/pot-provider && \
     cd /opt/pot-provider/server && \
-    npm install --production 2>&1 && \
-    npm run build 2>&1 || echo "WARNING: POT server build failed — bot will run without PO token generation"
+    npm install && \
+    npm run build && \
+    npm prune --production
 
 COPY . .
 RUN chmod +x start.sh

@@ -5,5 +5,6 @@ venv/
 .venv/
 deploy.sh
 cookies.txt
+oauth_data.txt
 run_cookie_refresher.bat
 setup_auto_refresh_task.bat

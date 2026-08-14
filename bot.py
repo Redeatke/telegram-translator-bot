@@ -3,6 +3,8 @@ import logging
 import asyncio
 import re
 import html
+import json
+import base64
 import tempfile
 import uuid
 import time
@@ -98,6 +100,25 @@ elif os.path.exists("cookies.txt"):
 
 # Log yt-dlp version
 logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+
+# ─── YouTube OAuth Token Restore ─────────────────────────────────────────────
+# On every startup, restore the OAuth token from the env var into yt-dlp's
+# internal cache. yt-dlp will then auto-refresh the access token via HTTP
+# whenever it expires — no browser or interactive prompt needed.
+
+YOUTUBE_OAUTH_ENABLED = False
+_oauth_env = os.getenv("YOUTUBE_OAUTH_DATA")
+if _oauth_env:
+    try:
+        _token_data = json.loads(base64.b64decode(_oauth_env))
+        with yt_dlp.YoutubeDL({"quiet": True}) as _ydl:
+            _ydl.cache.store("youtube", "oauth_access_token_info", _token_data)
+        YOUTUBE_OAUTH_ENABLED = True
+        logger.info("YouTube OAuth token restored from YOUTUBE_OAUTH_DATA env var.")
+    except Exception as _e:
+        logger.error(f"Failed to restore YouTube OAuth token: {_e}")
+else:
+    logger.info("YOUTUBE_OAUTH_DATA not set — YouTube downloads will run without OAuth.")
 
 # ─── User State ───────────────────────────────────────────────────────────────
 
@@ -1076,6 +1097,12 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             logger.info(f"Using cookies file: {YOUTUBE_COOKIES_FILE}")
             for opts in ydl_opts_list:
                 opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+
+        if YOUTUBE_OAUTH_ENABLED:
+            logger.info("Using YouTube OAuth for download.")
+            for opts in ydl_opts_list:
+                opts['username'] = 'oauth2'
+                opts['password'] = ''
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:

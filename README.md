@@ -34,6 +34,9 @@ OPENROUTER_MODEL=google/gemini-2.5-flash
 # These users receive /report messages and can use admin commands
 ADMIN_USER_IDS=123456789,987654321
 
+# YouTube OAuth (see step 3 below — recommended for reliable downloads)
+YOUTUBE_OAUTH_DATA=<base64 token from setup_oauth.py>
+
 # Auto-pinger (optional — keeps free-tier hosts awake)
 PING_URL=https://your-service-url.onrender.com
 PING_INTERVAL=60
@@ -41,11 +44,28 @@ PING_INTERVAL=60
 
 Get your OpenRouter key at [openrouter.ai](https://openrouter.ai).
 
-### 3. Run
+### 3. Set up YouTube OAuth (one-time, recommended)
+
+YouTube requires authentication for reliable video downloads. Run this locally once:
+
+```bash
+python setup_oauth.py
+```
+
+It opens YouTube's TV/device OAuth flow — no cookies, no headless browser.
+After you sign in, copy the printed `YOUTUBE_OAUTH_DATA` value and add it to
+your Render environment variables. yt-dlp will auto-refresh the token on every
+download, so you should not need to run this again for months.
+
+> ⚠️ Use a **dedicated Google account** for this — not your personal one.
+> Disable 2FA on that account before running the script.
+
+### 4. Run
 
 ```bash
 python bot.py
 ```
+
 
 ## Commands
 

@@ -1401,13 +1401,13 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Detect deployment environment
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    webhook_base = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("KOYEB_PUBLIC_URL") or os.getenv("WEBHOOK_URL")
     port = int(os.getenv("PORT", "8443"))
 
-    if render_url:
-        # ─── Render.com: Use webhook mode ───
-        webhook_url = f"{render_url}/{TELEGRAM_BOT_TOKEN}"
-        logger.info(f"Running in webhook mode on Render (port {port})")
+    if webhook_base:
+        # ─── Webhook mode (Render / Koyeb / Custom) ───
+        webhook_url = f"{webhook_base.rstrip('/')}/{TELEGRAM_BOT_TOKEN}"
+        logger.info(f"Running in webhook mode on {webhook_base} (port {port})")
         print("\n" + "─" * 45)
         print("  🤖  Translation Bot (Webhook Mode)")
         print(f"  Listening on port {port}")

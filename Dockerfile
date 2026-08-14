@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
 RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/pot-provider && \
     cd /opt/pot-provider/server && \
     npm install && \
-    npx tsc && \
+    NODE_OPTIONS="--max-old-space-size=2048" npx tsc && \
     npm prune --production
 
 COPY . .

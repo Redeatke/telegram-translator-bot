@@ -1,14 +1,11 @@
 FROM python:3.12-slim
 
-# Install system dependencies: ffmpeg, Node.js, npm, Deno, curl, git
+# Install system dependencies: ffmpeg, Node.js, npm, curl, git
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg nodejs npm curl unzip git && \
-    curl -fsSL https://deno.land/install.sh | sh && \
-    mv /root/.deno/bin/deno /usr/local/bin/deno && \
     rm -rf /var/lib/apt/lists/*
 
-# Limit Deno and Node.js memory to prevent OOM kills on free-tier hosts
-ENV DENO_V8_FLAGS="--max-old-space-size=256"
+# Limit Node.js memory to stay within free-tier host limits
 ENV NODE_OPTIONS="--max-old-space-size=128"
 
 WORKDIR /app

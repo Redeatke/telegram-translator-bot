@@ -9,3 +9,5 @@ oauth_data.txt
 _task_temp.xml
 run_cookie_refresher.bat
 setup_auto_refresh_task.bat
+.browser_profile/
+

@@ -24,7 +24,7 @@ if [ -f /opt/pot-provider/server/build/main.js ]; then
 
     # Wait for server to become available (max 15 seconds)
     for i in $(seq 1 15); do
-        if curl -sf http://127.0.0.1:4416/ping > /dev/null 2>&1; then
+        if curl -sf http://127.0.0.1:4416/ping > /dev/null 2>&1 || curl -sf http://localhost:4416/ping > /dev/null 2>&1; then
             echo "[start.sh] ✅ PO Token server is ready (PID: $POT_PID)"
             break
         fi

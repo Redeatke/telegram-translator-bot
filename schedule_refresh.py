@@ -14,6 +14,14 @@ import os
 import subprocess
 from pathlib import Path
 
+# Fix Windows console encoding for emoji support
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def main():
     print()
@@ -61,6 +69,7 @@ def main():
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
     <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>

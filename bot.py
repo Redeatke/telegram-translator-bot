@@ -1028,36 +1028,36 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
     def _download():
         logger.info(f"Downloading YouTube video: {url}...")
 
-        # Multi-client strategy optimized for PO Token server on 127.0.0.1:4416
-        # Strategy 1: mweb client — best with cookies + PO tokens from bgutil server
-        # Strategy 2: web client — alternative, works well with cookies
-        # Strategy 3: default auto-selection with relaxed format matching
+        # Multi-client strategy optimized for datacenter IPs and YouTube Shorts
+        # Strategy 1: tv_embedded, ios, android — most reliable on datacenter IPs without PO token blocks
+        # Strategy 2: mweb, android_vr — mobile web client with cookies
+        # Strategy 3: web — standard web client with node runtime
+        # Strategy 4: fallback auto-selection
         ydl_opts_list = [
+            {
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'ios', 'android']}},
+                'socket_timeout': 30,
+                'retries': 3,
+                'quiet': True,
+            },
+            {
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                'extractor_args': {'youtube': {'player_client': ['mweb', 'android_vr']}},
+                'socket_timeout': 30,
+                'retries': 3,
+                'quiet': True,
+            },
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
                 'extractor_args': {'youtube': {'player_client': ['web']}},
                 'js_runtimes': ['node'],
-                'socket_timeout': 30,
-                'retries': 3,
-                'quiet': True,
-            },
-            {
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['mweb']}},
-                'js_runtimes': ['node'],
-                'socket_timeout': 30,
-                'retries': 3,
-                'quiet': True,
-            },
-            {
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,

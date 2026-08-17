@@ -1029,25 +1029,27 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         logger.info(f"Downloading YouTube video: {url}...")
 
         # Multi-client strategy optimized for datacenter IPs and YouTube Shorts
-        # Strategy 1: tv_embedded, ios, android without cookies (ios/android skip if cookies are set)
-        # Strategy 2: web, mweb with cookies and Node.js JS challenge solver
-        # Strategy 3: default fallback auto-selection
+        # Strategy 1: web, mweb with cookies and JS challenge solvers (deno, node)
+        # Strategy 2: tv, android, ios fallback
+        # Strategy 3: default auto-selection fallback
         ydl_opts_list = [
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
-                'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'ios', 'android']}},
+                'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+                'js_runtimes': {'deno': {}, 'node': {}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
+                'nocheckcertificate': True,
             },
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
-                'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-                'js_runtimes': {'node': {}},
+                'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
+                'js_runtimes': {'deno': {}, 'node': {}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
@@ -1064,8 +1066,9 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
 
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
             logger.info(f"Using cookies file for web strategies: {YOUTUBE_COOKIES_FILE}")
-            # Only attach cookies to web/mweb strategy (index 1) as ios/android do not support cookies
-            ydl_opts_list[1]['cookiefile'] = YOUTUBE_COOKIES_FILE
+            # Attach cookies to strategy 1 (web/mweb) and strategy 3 (default)
+            ydl_opts_list[0]['cookiefile'] = YOUTUBE_COOKIES_FILE
+            ydl_opts_list[2]['cookiefile'] = YOUTUBE_COOKIES_FILE
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:

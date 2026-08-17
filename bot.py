@@ -1029,15 +1029,14 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         logger.info(f"Downloading YouTube video: {url}...")
 
         # Multi-client strategy optimized for datacenter IPs and YouTube Shorts
-        # Strategy 1: tv_embedded, ios, android — most reliable on datacenter IPs without PO token blocks
-        # Strategy 2: mweb, android_vr — mobile web client with cookies
-        # Strategy 3: web — standard web client with node runtime
-        # Strategy 4: fallback auto-selection
+        # Strategy 1: tv_embedded, ios, android without cookies (ios/android skip if cookies are set)
+        # Strategy 2: web, mweb with cookies and Node.js JS challenge solver
+        # Strategy 3: default fallback auto-selection
         ydl_opts_list = [
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
                 'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'ios', 'android']}},
                 'socket_timeout': 30,
                 'retries': 3,
@@ -1046,8 +1045,9 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['mweb', 'android_vr']}},
+                'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+                'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+                'js_runtimes': {'node': {}},
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
@@ -1055,17 +1055,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'extractor_args': {'youtube': {'player_client': ['web']}},
-                'js_runtimes': ['node'],
-                'socket_timeout': 30,
-                'retries': 3,
-                'quiet': True,
-            },
-            {
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'format': 'best[height<=720]/best',
+                'format': 'best',
                 'socket_timeout': 30,
                 'retries': 3,
                 'quiet': True,
@@ -1073,9 +1063,9 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         ]
 
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-            logger.info(f"Using cookies file: {YOUTUBE_COOKIES_FILE}")
-            for opts in ydl_opts_list:
-                opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+            logger.info(f"Using cookies file for web strategies: {YOUTUBE_COOKIES_FILE}")
+            # Only attach cookies to web/mweb strategy (index 1) as ios/android do not support cookies
+            ydl_opts_list[1]['cookiefile'] = YOUTUBE_COOKIES_FILE
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:

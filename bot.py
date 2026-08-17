@@ -1032,14 +1032,18 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         # Strategy 1: web, mweb with cookies and JS challenge solvers (deno, node)
         # Strategy 2: tv, android, ios fallback
         # Strategy 3: default auto-selection fallback
+        # Multi-client strategy optimized for ultra-fast speed on datacenter IPs
+        # Format string prioritizes 720p pre-merged MP4 streams (skips ffmpeg processing completely & shrinks upload size)
+        fast_format = 'best[ext=mp4][height<=720]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best[height<=1080]/best'
         ydl_opts_list = [
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+                'format': fast_format,
                 'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
                 'js_runtimes': {'deno': {}, 'node': {}},
-                'socket_timeout': 30,
+                'concurrent_fragment_downloads': 4,
+                'socket_timeout': 15,
                 'retries': 3,
                 'quiet': True,
                 'nocheckcertificate': True,
@@ -1047,18 +1051,19 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+                'format': fast_format,
                 'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
                 'js_runtimes': {'deno': {}, 'node': {}},
-                'socket_timeout': 30,
+                'concurrent_fragment_downloads': 4,
+                'socket_timeout': 15,
                 'retries': 3,
                 'quiet': True,
             },
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'best',
-                'socket_timeout': 30,
+                'format': 'best[height<=720]/best',
+                'socket_timeout': 15,
                 'retries': 3,
                 'quiet': True,
             },

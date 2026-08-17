@@ -23,6 +23,7 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
+import tweet_card
 
 try:
     from pytubefix import YouTube as PytubeFixYouTube
@@ -146,6 +147,13 @@ YOUTUBE_URL_PATTERN = re.compile(
     r'|youtu\.be/'
     r')'
     r'[\w\-]+',
+    re.IGNORECASE
+)
+
+# ─── Twitter / X URL Pattern ──────────────────────────────────────────────────
+
+TWITTER_URL_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)/status/(\d+)',
     re.IGNORECASE
 )
 
@@ -1256,6 +1264,134 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
     await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg)
 
 
+# ─── Twitter / X Text-Only Card Handler ──────────────────────────────────────
+
+async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detect Twitter/X links. If text-only, send a dark tweet card. If media is present, silently ignore."""
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+    match = TWITTER_URL_PATTERN.search(text)
+    if not match:
+        return
+
+    username, tweet_id = match.groups()
+    logger.info(f"Twitter/X link detected: @{username} status {tweet_id}")
+
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    except Exception:
+        pass
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    tweet_data = None
+    has_media = False
+
+    # 1. Query FxTwitter API
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"https://api.fxtwitter.com/{username}/status/{tweet_id}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_tweet = data.get("tweet")
+                if raw_tweet:
+                    media = raw_tweet.get("media") or {}
+                    if media.get("all") or media.get("videos") or media.get("photos"):
+                        has_media = True
+                    else:
+                        author = raw_tweet.get("author") or {}
+                        verification = author.get("verification") or {}
+                        tweet_data = {
+                            "author_name": author.get("name") or username,
+                            "author_screen_name": author.get("screen_name") or username,
+                            "author_avatar_url": author.get("avatar_url"),
+                            "verified": verification.get("verified", False),
+                            "text": raw_tweet.get("text", ""),
+                            "created_at": raw_tweet.get("created_at"),
+                            "created_timestamp": raw_tweet.get("created_timestamp"),
+                            "retweets": raw_tweet.get("retweets", 0),
+                            "likes": raw_tweet.get("likes", 0),
+                            "replies": raw_tweet.get("replies", 0),
+                            "url": raw_tweet.get("url") or f"https://x.com/{username}/status/{tweet_id}"
+                        }
+    except Exception as e:
+        logger.warning(f"FxTwitter check failed for @{username}/{tweet_id}: {e}")
+
+    # 2. Fallback to VxTwitter if FxTwitter did not resolve
+    if not tweet_data and not has_media:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"https://api.vxtwitter.com/{username}/status/{tweet_id}", headers=headers)
+                if resp.status_code == 200:
+                    raw_tweet = resp.json()
+                    if raw_tweet.get("hasMedia") or raw_tweet.get("mediaURLs"):
+                        has_media = True
+                    elif raw_tweet.get("text"):
+                        tweet_data = {
+                            "author_name": raw_tweet.get("user_name") or username,
+                            "author_screen_name": raw_tweet.get("user_screen_name") or username,
+                            "author_avatar_url": raw_tweet.get("user_profile_image_url"),
+                            "verified": False,
+                            "text": raw_tweet.get("text", ""),
+                            "created_at": raw_tweet.get("date"),
+                            "created_timestamp": raw_tweet.get("date_epoch"),
+                            "retweets": raw_tweet.get("retweets", 0),
+                            "likes": raw_tweet.get("likes", 0),
+                            "replies": raw_tweet.get("replies", 0),
+                            "url": raw_tweet.get("tweetURL") or f"https://x.com/{username}/status/{tweet_id}"
+                        }
+        except Exception as e:
+            logger.warning(f"VxTwitter fallback check failed for @{username}/{tweet_id}: {e}")
+
+    # If it contains media or failed to fetch: SILENTLY IGNORE (no error message)
+    if has_media or not tweet_data:
+        logger.info(f"Ignoring Twitter link (has_media={has_media}, found={bool(tweet_data)})")
+        return
+
+    # Fetch avatar bytes if available
+    avatar_bytes = None
+    if tweet_data.get("author_avatar_url"):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
+                if av_resp.status_code == 200:
+                    avatar_bytes = av_resp.content
+        except Exception as e:
+            logger.warning(f"Failed to fetch avatar for @{username}: {e}")
+
+    # Generate Twitter dark card image
+    try:
+        loop = asyncio.get_running_loop()
+        card_png = await loop.run_in_executor(
+            None,
+            lambda: tweet_card.generate_tweet_card(tweet_data, avatar_bytes)
+        )
+
+        await update.message.reply_photo(
+            photo=card_png,
+            reply_to_message_id=update.message.message_id
+        )
+        logger.info(f"Sent dark tweet card for @{username}/status/{tweet_id}")
+    except Exception as e:
+        logger.error(f"Failed to render/send tweet card: {e}")
+        card_text = (
+            f"𝕏 <b>{tweet_data.get('author_name')}</b> (<code>@{tweet_data.get('author_screen_name')}</code>)\n\n"
+            f"{tweet_data.get('text')}\n\n"
+            f"❤️ {tweet_data.get('likes', 0):,}  •  🔁 {tweet_data.get('retweets', 0):,}\n"
+            f"🔗 <a href='{tweet_data.get('url')}'>View on 𝕏</a>"
+        )
+        try:
+            await update.message.reply_text(
+                card_text,
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id,
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+
+
 # ─── Auto-Translate in Private Chat ──────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1410,6 +1546,12 @@ def main() -> None:
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_URL_PATTERN),
         handle_youtube_message
+    ))
+
+    # Register Twitter/X text-only card handler (before general text handler so it takes priority)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(TWITTER_URL_PATTERN),
+        handle_twitter_message
     ))
 
     # Register text message handler

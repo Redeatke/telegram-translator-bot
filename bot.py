@@ -1464,7 +1464,57 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     tweet_url = tweet_data.get("url") or f"https://x.com/{username}/status/{tweet_id}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("↗️ View on 𝕏", url=tweet_url)]])
 
-    # ─── CASE A: Video Media Present ─────────────────────────────────────────────
+    # ─── 1. Generate and Send Dark Tweet Card First ───────────────────────────
+    card_data = dict(tweet_data)
+    card_text = main_text
+    if quote:
+        q_author = quote.get("author", {}).get("name") or "Quoted"
+        q_screen = quote.get("author", {}).get("screen_name") or ""
+        q_text = (quote.get("text") or "").strip()
+        if q_text:
+            if card_text:
+                card_text += f"\n\n💬 {q_author} (@{q_screen}):\n{q_text}"
+            else:
+                card_text = f"💬 {q_author} (@{q_screen}):\n{q_text}"
+    card_data["text"] = card_text
+
+    avatar_bytes = None
+    if tweet_data.get("author_avatar_url"):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
+                if av_resp.status_code == 200:
+                    avatar_bytes = av_resp.content
+        except Exception as e:
+            logger.warning(f"Failed to fetch avatar for @{username}: {e}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        card_png = await loop.run_in_executor(
+            None,
+            lambda: tweet_card.generate_tweet_card(card_data, avatar_bytes)
+        )
+
+        await update.message.reply_photo(
+            photo=card_png,
+            reply_markup=keyboard,
+            reply_to_message_id=update.message.message_id
+        )
+        logger.info(f"Sent dark tweet card for @{username}/status/{tweet_id}")
+    except Exception as e:
+        logger.error(f"Failed to render/send tweet card: {e}")
+        try:
+            await update.message.reply_text(
+                caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                reply_to_message_id=update.message.message_id,
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+
+    # ─── 2. Send Attached Media (Video / Photos) Separately If Present ─────────
     videos = tweet_data.get("videos") or []
     if videos:
         try:
@@ -1492,9 +1542,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                     if v_resp.status_code == 200 and len(v_resp.content) <= 50 * 1024 * 1024:
                         await update.message.reply_video(
                             video=v_resp.content,
-                            caption=caption,
-                            parse_mode="HTML",
-                            reply_markup=keyboard,
                             supports_streaming=True,
                             reply_to_message_id=update.message.message_id
                         )
@@ -1528,9 +1575,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                 if tw_bytes and len(tw_bytes) <= 50 * 1024 * 1024:
                     await update.message.reply_video(
                         video=tw_bytes,
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=keyboard,
                         supports_streaming=True,
                         reply_to_message_id=update.message.message_id
                     )
@@ -1539,10 +1583,9 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 logger.error(f"yt-dlp fallback failed for Twitter video @{username}/{tweet_id}: {e}")
 
-        if video_sent:
-            return
+        return
 
-    # ─── CASE B: Photo Media Present ─────────────────────────────────────────────
+    # If no video, check photos
     photos = tweet_data.get("photos") or []
     if photos:
         try:
@@ -1555,21 +1598,14 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
             if len(photo_urls) == 1:
                 await update.message.reply_photo(
                     photo=photo_urls[0],
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
                     reply_to_message_id=update.message.message_id
                 )
                 logger.info(f"Sent Twitter photo for @{username}/status/{tweet_id}")
                 return
             elif len(photo_urls) > 1:
                 media_group = [
-                    InputMediaPhoto(
-                        media=p_url,
-                        caption=caption if i == 0 else None,
-                        parse_mode="HTML" if i == 0 else None
-                    )
-                    for i, p_url in enumerate(photo_urls[:10])
+                    InputMediaPhoto(media=p_url)
+                    for p_url in photo_urls[:10]
                 ]
                 await update.message.reply_media_group(
                     media=media_group,
@@ -1579,47 +1615,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                 return
         except Exception as e:
             logger.warning(f"Failed to send Twitter photo(s) for @{username}/{tweet_id}: {e}")
-
-    # ─── CASE C: Text-Only Tweet (Dark Tweet Card) ───────────────────────────────
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
-    except Exception:
-        pass
-
-    avatar_bytes = None
-    if tweet_data.get("author_avatar_url"):
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
-                if av_resp.status_code == 200:
-                    avatar_bytes = av_resp.content
-        except Exception as e:
-            logger.warning(f"Failed to fetch avatar for @{username}: {e}")
-
-    try:
-        loop = asyncio.get_running_loop()
-        card_png = await loop.run_in_executor(
-            None,
-            lambda: tweet_card.generate_tweet_card(tweet_data, avatar_bytes)
-        )
-
-        await update.message.reply_photo(
-            photo=card_png,
-            reply_to_message_id=update.message.message_id
-        )
-        logger.info(f"Sent dark tweet card for @{username}/status/{tweet_id}")
-    except Exception as e:
-        logger.error(f"Failed to render/send tweet card: {e}")
-        try:
-            await update.message.reply_text(
-                caption,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                reply_to_message_id=update.message.message_id,
-                disable_web_page_preview=True
-            )
-        except Exception:
-            pass
 
 
 # ─── Auto-Translate in Private Chat ──────────────────────────────────────────

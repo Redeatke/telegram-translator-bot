@@ -92,6 +92,30 @@ def draw_verified_badge(draw: ImageDraw.ImageDraw, x: int, y: int, radius: int =
     ]
     draw.line(check_coords, fill=(255, 255, 255), width=2)
 
+def clean_text_for_card(text: str) -> str:
+    """Filter emojis and unsupported symbols that render as boxed missing glyphs in standard PIL fonts."""
+    if not text:
+        return ""
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # Emoticons
+        "\U0001F300-\U0001F5FF"  # Misc Symbols and Pictographs
+        "\U0001F680-\U0001F6FF"  # Transport and Map Symbols
+        "\U0001F1E0-\U0001F1FF"  # Flags / Regional Indicator Symbols
+        "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+        "\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
+        "\u2600-\u27BF"          # Misc Symbols / Dingbats
+        "\u200d"                 # Zero width joiner
+        "\ufe00-\ufe0f"          # Variation selectors
+        "\u200e-\u200f"          # Directional marks
+        "]+",
+        flags=re.UNICODE
+    )
+    cleaned = emoji_pattern.sub("", text)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    lines = [line.strip() for line in cleaned.split("\n")]
+    return "\n".join(lines).strip()
+
 def generate_tweet_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
     # Card settings (Twitter Dark Mode)
     CARD_WIDTH = 680
@@ -121,7 +145,7 @@ def generate_tweet_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
     dummy_img = Image.new("RGB", (CARD_WIDTH, 500))
     dummy_draw = ImageDraw.Draw(dummy_img)
 
-    tweet_text = tweet_data.get("text", "")
+    tweet_text = clean_text_for_card(tweet_data.get("text", ""))
     content_width = CARD_WIDTH - (PADDING * 2)
     lines = wrap_text(tweet_text, font_body, content_width, dummy_draw)
 
@@ -177,7 +201,9 @@ def generate_tweet_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
 
     # 2. Author Name & Handle
     name_x = avatar_x + avatar_size + 14
-    author_name = tweet_data.get("author_name") or "User"
+    author_name = clean_text_for_card(tweet_data.get("author_name") or "User")
+    if not author_name:
+        author_name = tweet_data.get("author_screen_name") or "User"
     author_handle = f"@{tweet_data.get('author_screen_name') or 'user'}"
 
     draw.text((name_x, avatar_y + 2), author_name, font=font_name, fill=TEXT_PRIMARY)

@@ -1473,9 +1473,9 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
         q_text = (quote.get("text") or "").strip()
         if q_text:
             if card_text:
-                card_text += f"\n\n💬 {q_author} (@{q_screen}):\n{q_text}"
+                card_text += f"\n\nQuoting {q_author} (@{q_screen}):\n{q_text}"
             else:
-                card_text = f"💬 {q_author} (@{q_screen}):\n{q_text}"
+                card_text = f"Quoting {q_author} (@{q_screen}):\n{q_text}"
     card_data["text"] = card_text
 
     avatar_bytes = None

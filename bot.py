@@ -1557,18 +1557,24 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
         if video_bytes:
             try:
-                media_group = [
-                    InputMediaVideo(media=video_bytes, supports_streaming=True),
-                    InputMediaPhoto(media=card_png)
-                ]
-                await update.message.reply_media_group(
-                    media=media_group,
+                # Send standalone video first so Telegram enables native auto-play
+                await update.message.reply_video(
+                    video=video_bytes,
+                    supports_streaming=True,
                     reply_to_message_id=update.message.message_id
                 )
-                logger.info(f"Sent single-message Video + Card media group for @{username}/status/{tweet_id}")
+                logger.info(f"Sent auto-playing Twitter video for @{username}/status/{tweet_id}")
+                
+                # Send Tweet Card photo right below it
+                if card_png:
+                    await update.message.reply_photo(
+                        photo=card_png,
+                        reply_markup=keyboard,
+                    )
+                    logger.info(f"Sent dark tweet card below video for @{username}/status/{tweet_id}")
                 return
             except Exception as e:
-                logger.error(f"Failed to send combined media group: {e}")
+                logger.error(f"Failed to send video / card sequence: {e}")
 
     # ─── 3. If Photos are present, send Card + Photos in 1 single media group ──────
     if photos and card_png:

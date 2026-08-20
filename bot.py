@@ -8,7 +8,7 @@ import uuid
 import time
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1464,7 +1464,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     tweet_url = tweet_data.get("url") or f"https://x.com/{username}/status/{tweet_id}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("↗️ View on 𝕏", url=tweet_url)]])
 
-    # ─── 1. Generate and Send Dark Tweet Card First ───────────────────────────
+    # ─── 1. Prepare Dark Tweet Card Data & Avatar ──────────────────────────────
     card_data = dict(tweet_data)
     card_text = main_text
     if quote:
@@ -1488,41 +1488,26 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.warning(f"Failed to fetch avatar for @{username}: {e}")
 
+    card_png = None
     try:
         loop = asyncio.get_running_loop()
         card_png = await loop.run_in_executor(
             None,
             lambda: tweet_card.generate_tweet_card(card_data, avatar_bytes)
         )
-
-        await update.message.reply_photo(
-            photo=card_png,
-            reply_markup=keyboard,
-            reply_to_message_id=update.message.message_id
-        )
-        logger.info(f"Sent dark tweet card for @{username}/status/{tweet_id}")
     except Exception as e:
-        logger.error(f"Failed to render/send tweet card: {e}")
-        try:
-            await update.message.reply_text(
-                caption,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                reply_to_message_id=update.message.message_id,
-                disable_web_page_preview=True
-            )
-        except Exception:
-            pass
+        logger.error(f"Failed to render tweet card: {e}")
 
-    # ─── 2. Send Attached Media (Video / Photos) Separately If Present ─────────
     videos = tweet_data.get("videos") or []
-    if videos:
+    photos = tweet_data.get("photos") or []
+
+    # ─── 2. If Video is present, send Card + Video in 1 single message bubble ─────
+    if videos and card_png:
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
         except Exception:
             pass
 
-        # Pick best video url
         v_obj = videos[0]
         video_url = v_obj.get("url")
         variants = v_obj.get("variants") or v_obj.get("formats") or []
@@ -1534,24 +1519,17 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
             mp4_variants.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
             video_url = mp4_variants[0].get("url") or video_url
 
-        video_sent = False
+        video_bytes = None
         if video_url:
             try:
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as v_client:
                     v_resp = await v_client.get(video_url, headers=headers)
                     if v_resp.status_code == 200 and len(v_resp.content) <= 50 * 1024 * 1024:
-                        await update.message.reply_video(
-                            video=v_resp.content,
-                            supports_streaming=True,
-                            reply_to_message_id=update.message.message_id
-                        )
-                        video_sent = True
-                        logger.info(f"Sent direct Twitter video for @{username}/status/{tweet_id}")
+                        video_bytes = v_resp.content
             except Exception as e:
                 logger.warning(f"Direct Twitter video download failed for @{username}/{tweet_id}: {e}")
 
-        # Fallback to yt-dlp if direct stream download did not work
-        if not video_sent:
+        if not video_bytes:
             try:
                 loop = asyncio.get_running_loop()
                 def _yt_dlp_tw():
@@ -1571,50 +1549,68 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                                     return vf.read()
                         return None
 
-                tw_bytes = await loop.run_in_executor(None, _yt_dlp_tw)
-                if tw_bytes and len(tw_bytes) <= 50 * 1024 * 1024:
-                    await update.message.reply_video(
-                        video=tw_bytes,
-                        supports_streaming=True,
-                        reply_to_message_id=update.message.message_id
-                    )
-                    video_sent = True
-                    logger.info(f"Sent yt-dlp Twitter video for @{username}/status/{tweet_id}")
+                tw_b = await loop.run_in_executor(None, _yt_dlp_tw)
+                if tw_b and len(tw_b) <= 50 * 1024 * 1024:
+                    video_bytes = tw_b
             except Exception as e:
                 logger.error(f"yt-dlp fallback failed for Twitter video @{username}/{tweet_id}: {e}")
 
-        return
-
-    # If no video, check photos
-    photos = tweet_data.get("photos") or []
-    if photos:
-        try:
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
-        except Exception:
-            pass
-
-        try:
-            photo_urls = [p.get("url") for p in photos if p.get("url")]
-            if len(photo_urls) == 1:
-                await update.message.reply_photo(
-                    photo=photo_urls[0],
-                    reply_to_message_id=update.message.message_id
-                )
-                logger.info(f"Sent Twitter photo for @{username}/status/{tweet_id}")
-                return
-            elif len(photo_urls) > 1:
+        if video_bytes:
+            try:
                 media_group = [
-                    InputMediaPhoto(media=p_url)
-                    for p_url in photo_urls[:10]
+                    InputMediaPhoto(media=card_png),
+                    InputMediaVideo(media=video_bytes, supports_streaming=True)
                 ]
                 await update.message.reply_media_group(
                     media=media_group,
                     reply_to_message_id=update.message.message_id
                 )
-                logger.info(f"Sent Twitter photo group ({len(photo_urls)}) for @{username}/status/{tweet_id}")
+                logger.info(f"Sent single-message Card + Video media group for @{username}/status/{tweet_id}")
+                return
+            except Exception as e:
+                logger.error(f"Failed to send combined media group: {e}")
+
+    # ─── 3. If Photos are present, send Card + Photos in 1 single media group ──────
+    if photos and card_png:
+        try:
+            photo_urls = [p.get("url") for p in photos if p.get("url")]
+            if photo_urls:
+                media_group = [InputMediaPhoto(media=card_png)] + [
+                    InputMediaPhoto(media=p_url) for p_url in photo_urls[:9]
+                ]
+                await update.message.reply_media_group(
+                    media=media_group,
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"Sent single-message Card + Photo(s) media group for @{username}/status/{tweet_id}")
                 return
         except Exception as e:
-            logger.warning(f"Failed to send Twitter photo(s) for @{username}/{tweet_id}: {e}")
+            logger.error(f"Failed to send photo media group: {e}")
+
+    # ─── 4. Text-Only (or Media Fallback): Send Card Alone ────────────────────────
+    if card_png:
+        try:
+            await update.message.reply_photo(
+                photo=card_png,
+                reply_markup=keyboard,
+                reply_to_message_id=update.message.message_id
+            )
+            logger.info(f"Sent dark tweet card for @{username}/status/{tweet_id}")
+            return
+        except Exception as e:
+            logger.error(f"Failed to send tweet card photo: {e}")
+
+    # Final Text Fallback
+    try:
+        await update.message.reply_text(
+            caption,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            reply_to_message_id=update.message.message_id,
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
 
 
 # ─── Auto-Translate in Private Chat ──────────────────────────────────────────

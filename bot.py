@@ -1558,14 +1558,14 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
         if video_bytes:
             try:
                 media_group = [
-                    InputMediaPhoto(media=card_png),
-                    InputMediaVideo(media=video_bytes, supports_streaming=True)
+                    InputMediaVideo(media=video_bytes, supports_streaming=True),
+                    InputMediaPhoto(media=card_png)
                 ]
                 await update.message.reply_media_group(
                     media=media_group,
                     reply_to_message_id=update.message.message_id
                 )
-                logger.info(f"Sent single-message Card + Video media group for @{username}/status/{tweet_id}")
+                logger.info(f"Sent single-message Video + Card media group for @{username}/status/{tweet_id}")
                 return
             except Exception as e:
                 logger.error(f"Failed to send combined media group: {e}")

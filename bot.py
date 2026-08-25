@@ -1833,13 +1833,14 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as dl_err:
                 logger.info(f"yt-dlp video download not applicable for Reddit URL ({dl_err}). Generating Reddit Card...")
 
-            # 2. Extract complete Reddit metadata via multi-source resolution
+            # 2. Extract complete Reddit metadata and attached image URLs via multi-source resolution
             subreddit = "r/reddit"
             author = "user"
             title = "Reddit Post"
             selftext = ""
             score = 0
             num_comments = 0
+            image_urls = []
 
             m_sub = re.search(r'r/([A-Za-z0-9_]+)', canonical_url)
             if m_sub:
@@ -1861,7 +1862,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as oe_err:
                 logger.warning(f"Reddit oEmbed error: {oe_err}")
 
-            # Source B: Query old.reddit.com for full selftext body, upvotes, and comments
+            # Source B: Query old.reddit.com for images, full selftext body, upvotes, and comments
             old_url = re.sub(r'https?://(?:www\.|old\.)?reddit\.com', 'https://old.reddit.com', canonical_url)
             try:
                 async with httpx.AsyncClient(timeout=8.0) as client:
@@ -1888,6 +1889,19 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
                         m_comments = re.search(r'(\d+)\s+comments', target_html)
                         if m_comments:
                             num_comments = int(m_comments.group(1))
+
+                        # Extract image URLs (i.redd.it, preview.redd.it, i.imgur.com)
+                        imgs = re.findall(r'href="(https://(?:i|preview)\.redd\.it/[^"]+\.(?:jpg|jpeg|png|gif|webp))"', target_html, re.IGNORECASE)
+                        if not imgs:
+                            imgs = re.findall(r'href="(https://i\.imgur\.com/[^"]+\.(?:jpg|jpeg|png|gif|webp))"', target_html, re.IGNORECASE)
+                        if not imgs:
+                            m_exp = re.search(r'data-url="(https://(?:i|preview)\.redd\.it/[^"]+)"', target_html)
+                            if m_exp: imgs = [m_exp.group(1)]
+
+                        for img_u in imgs:
+                            clean_u = html.unescape(img_u)
+                            if clean_u not in image_urls:
+                                image_urls.append(clean_u)
 
                         m_selftext = re.search(r'<div[^>]*class="[^"]*usertext-body[^"]*"[^>]*>(.*?)</div>', target_html, re.DOTALL)
                         if m_selftext:
@@ -1918,9 +1932,62 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
                                     if score == 0: score = int(m_parsed.group(1))
                                     if num_comments == 0: num_comments = int(m_parsed.group(2))
                                     if not selftext: selftext = m_parsed.group(3).strip()
+
+                            if not image_urls:
+                                m_og_img = re.search(r'<meta [^>]*property="og:image" content="([^"]+)"', bot_html)
+                                if m_og_img and "share.redd.it" not in m_og_img.group(1):
+                                    image_urls.append(html.unescape(m_og_img.group(1)))
                 except Exception as b_err:
                     logger.warning(f"TelegramBot HTML fallback error: {b_err}")
 
+            # 3. If image post: download and send photo(s)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Reddit Post", url=canonical_url)]])
+            if image_urls:
+                try:
+                    photo_bytes_list = []
+                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                        for img_link in image_urls[:8]:
+                            try:
+                                p_resp = await client.get(img_link, headers=browser_headers)
+                                if p_resp.status_code == 200:
+                                    photo_bytes_list.append(p_resp.content)
+                            except Exception as p_err:
+                                logger.warning(f"Failed to fetch Reddit photo {img_link}: {p_err}")
+
+                    if photo_bytes_list:
+                        caption = (
+                            f"🤖 <b>{html.escape(title)}</b>\n"
+                            f"👤 <i>Posted by u/{html.escape(author)} in {html.escape(subreddit)}</i>\n\n"
+                            f"🔗 <a href='{canonical_url}'>View on Reddit</a>"
+                        )
+                        if len(caption) > 1024:
+                            caption = caption[:1020] + "…"
+
+                        if len(photo_bytes_list) == 1:
+                            await update.message.reply_photo(
+                                photo=photo_bytes_list[0],
+                                caption=caption,
+                                parse_mode="HTML",
+                                reply_markup=kb,
+                                reply_to_message_id=update.message.message_id
+                            )
+                        else:
+                            media_group = [InputMediaPhoto(media=photo_bytes_list[0], caption=caption, parse_mode="HTML")] + [
+                                InputMediaPhoto(media=pb) for pb in photo_bytes_list[1:]
+                            ]
+                            await update.message.reply_media_group(
+                                media=media_group,
+                                reply_to_message_id=update.message.message_id
+                            )
+                        try:
+                            await status_msg.delete()
+                        except Exception:
+                            pass
+                        return
+                except Exception as img_send_err:
+                    logger.error(f"Failed to send Reddit photo: {img_send_err}")
+
+            # 4. If text post (or image download failed): generate & send Dark Reddit Card
             reddit_data = {
                 "subreddit": subreddit,
                 "author": author,
@@ -1932,7 +1999,6 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             }
 
             card_png = card.generate_reddit_card(reddit_data)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Reddit Post", url=canonical_url)]])
 
             await update.message.reply_photo(
                 photo=card_png,

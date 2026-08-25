@@ -1409,11 +1409,6 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
 
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "youtube"):
-        await update.message.reply_text(
-            fmt_warning("🔴 <b>YouTube downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
         return
 
     yt_url = match.group(0)
@@ -1518,11 +1513,6 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
 
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "twitch"):
-        await update.message.reply_text(
-            fmt_warning("🔴 <b>Twitch clip downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
         return
 
     clip_url = match.group(0)
@@ -1722,11 +1712,6 @@ async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "tiktok"):
-        await update.message.reply_text(
-            fmt_warning("🔴 <b>TikTok downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
         return
 
     auto_dl = get_download_mode(chat_id)
@@ -1753,11 +1738,6 @@ async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT
 
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "instagram"):
-        await update.message.reply_text(
-            fmt_warning("🔴 <b>Instagram downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
         return
 
     auto_dl = get_download_mode(chat_id)
@@ -1784,11 +1764,6 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "reddit"):
-        await update.message.reply_text(
-            fmt_warning("🔴 <b>Reddit downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
         return
 
     logger.info(f"Reddit link detected: {raw_url}")
@@ -1956,11 +1931,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "twitter"):
-        await update.message.reply_text(
-            fmt_warning("🔴 <b>Twitter / X downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
         return
 
     username, tweet_id = match.groups()

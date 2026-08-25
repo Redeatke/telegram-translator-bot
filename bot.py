@@ -25,7 +25,8 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
-import tweet_card
+import card
+
 
 try:
     from pytubefix import YouTube as PytubeFixYouTube
@@ -1852,41 +1853,51 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as dl_err:
                 logger.info(f"yt-dlp video download not applicable for Reddit URL ({dl_err}). Generating Reddit Card...")
 
-            # 2. If no video downloaded, generate Reddit Dark Card
-            subreddit = "Reddit"
+            # 2. If no video downloaded, extract Reddit metadata via TelegramBot HTML query
+            subreddit = "r/reddit"
             author = "user"
             title = "Reddit Post"
             selftext = ""
+            score = 0
+            num_comments = 0
 
-            m_sub = re.search(r'r/([A-Za-z0-9_]+)', canonical_url)
-            if m_sub:
-                subreddit = f"r/{m_sub.group(1)}"
-
-            # Fetch OpenGraph / rxddit metadata
-            rx_url = canonical_url.replace("reddit.com", "rxddit.com").replace("www.", "")
+            bot_headers = {"User-Agent": "TelegramBot (like TwitterBot)"}
             try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    rx_resp = await client.get(rx_url, headers=headers, follow_redirects=True)
-                    if rx_resp.status_code == 200:
-                        rx_html = rx_resp.text
-                        m_title = re.search(r'<meta (?:property|name)="og:title" content="([^"]+)"', rx_html)
-                        m_desc = re.search(r'<meta (?:property|name)="og:description" content="([^"]+)"', rx_html)
-                        if m_title: title = m_title.group(1)
-                        if m_desc: selftext = m_desc.group(1)
-            except Exception as rx_err:
-                logger.warning(f"rxddit metadata query failed: {rx_err}")
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r_html = await client.get(canonical_url, headers=bot_headers, follow_redirects=True)
+                    if r_html.status_code == 200:
+                        html_text = r_html.text
+                        m_title = re.search(r'<title>(.*?)\s*:\s*(r/[A-Za-z0-9_]+)</title>', html_text, re.IGNORECASE)
+                        if m_title:
+                            title = m_title.group(1).strip()
+                            subreddit = m_title.group(2).strip()
+
+                        m_meta = re.search(r'<meta [^>]*content="(\d+\s+votes?,\s*\d+\s+comments?\.[^"]*)"', html_text, re.IGNORECASE)
+                        if m_meta:
+                            meta_str = m_meta.group(1)
+                            m_parsed = re.search(r'(\d+)\s+votes?,\s*(\d+)\s+comments?\.\s*(.*)', meta_str, re.DOTALL)
+                            if m_parsed:
+                                score = int(m_parsed.group(1))
+                                num_comments = int(m_parsed.group(2))
+                                selftext = m_parsed.group(3).strip()
+
+                        m_author = re.search(r'author="([^"]+)"', html_text) or re.search(r'u/([A-Za-z0-9_-]+)', html_text)
+                        if m_author:
+                            author = m_author.group(1).strip()
+            except Exception as r_err:
+                logger.warning(f"Reddit HTML metadata extraction error: {r_err}")
 
             reddit_data = {
                 "subreddit": subreddit,
                 "author": author,
                 "title": title,
                 "body": selftext,
-                "score": 0,
-                "num_comments": 0,
+                "score": score,
+                "num_comments": num_comments,
                 "url": canonical_url,
             }
 
-            card_png = tweet_card.generate_reddit_card(reddit_data)
+            card_png = card.generate_reddit_card(reddit_data)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Reddit Post", url=canonical_url)]])
 
             await update.message.reply_photo(
@@ -2063,11 +2074,11 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
     stats = []
     if likes:
-        stats.append(f"❤️ {tweet_card.format_count(likes)}")
+        stats.append(f"❤️ {card.format_count(likes)}")
     if retweets:
-        stats.append(f"🔁 {tweet_card.format_count(retweets)}")
+        stats.append(f"🔁 {card.format_count(retweets)}")
     if views:
-        stats.append(f"👁️ {tweet_card.format_count(views)}")
+        stats.append(f"👁️ {card.format_count(views)}")
 
     if stats:
         caption_parts.append(f"\n{'  •  '.join(stats)}")
@@ -2108,7 +2119,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
         loop = asyncio.get_running_loop()
         card_png = await loop.run_in_executor(
             None,
-            lambda: tweet_card.generate_tweet_card(card_data, avatar_bytes)
+            lambda: card.generate_twitter_card(card_data, avatar_bytes)
         )
     except Exception as e:
         logger.error(f"Failed to render tweet card: {e}")
@@ -2194,10 +2205,21 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     # ─── 3. If Photos are present, send Card + Photos in 1 single media group ──────
     if photos and card_png:
         try:
-            photo_urls = [p.get("url") for p in photos if p.get("url")]
-            if photo_urls:
+            photo_bytes_list = []
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                for p in photos[:8]:
+                    p_url = p.get("url")
+                    if p_url:
+                        try:
+                            p_resp = await client.get(p_url, headers=headers)
+                            if p_resp.status_code == 200:
+                                photo_bytes_list.append(p_resp.content)
+                        except Exception as p_err:
+                            logger.warning(f"Failed to download photo {p_url}: {p_err}")
+
+            if photo_bytes_list:
                 media_group = [InputMediaPhoto(media=card_png)] + [
-                    InputMediaPhoto(media=p_url) for p_url in photo_urls[:9]
+                    InputMediaPhoto(media=pb) for pb in photo_bytes_list
                 ]
                 await update.message.reply_media_group(
                     media=media_group,

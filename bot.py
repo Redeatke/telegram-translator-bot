@@ -6,6 +6,7 @@ import html
 import tempfile
 import uuid
 import time
+import json
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
@@ -14,6 +15,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -117,6 +119,100 @@ logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
 # In-memory user configs: { user_id: { "engine": "free" | "ai", "target": "en" } }
 user_configs = {}
 
+# ─── Chat Media Config Persistence ──────────────────────────────────────────
+
+CHAT_CONFIGS_FILE = os.path.join(os.path.dirname(__file__), "chat_configs.json")
+chat_configs = {}
+
+DEFAULT_CHAT_CONFIG = {
+    "youtube": True,
+    "twitter": True,
+    "twitch": True,
+    "tiktok": True,
+    "instagram": True,
+    "reddit": True,
+    "auto_download": True,  # True = Auto-download; False = Prompt with button
+}
+
+def load_chat_configs() -> None:
+    """Load chat media configurations from chat_configs.json."""
+    global chat_configs
+    if os.path.exists(CHAT_CONFIGS_FILE):
+        try:
+            with open(CHAT_CONFIGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                chat_configs = {int(k): v for k, v in data.items()}
+                logger.info(f"Loaded media configs for {len(chat_configs)} chats.")
+        except Exception as e:
+            logger.error(f"Failed to load chat_configs.json: {e}")
+            chat_configs = {}
+
+def save_chat_configs() -> None:
+    """Save chat media configurations to chat_configs.json."""
+    try:
+        with open(CHAT_CONFIGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(chat_configs, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save chat_configs.json: {e}")
+
+def get_chat_config(chat_id: int) -> dict:
+    """Get or initialize media download configuration for a chat."""
+    if chat_id not in chat_configs:
+        chat_configs[chat_id] = DEFAULT_CHAT_CONFIG.copy()
+        save_chat_configs()
+    else:
+        updated = False
+        for k, v in DEFAULT_CHAT_CONFIG.items():
+            if k not in chat_configs[chat_id]:
+                chat_configs[chat_id][k] = v
+                updated = True
+        if updated:
+            save_chat_configs()
+    return chat_configs[chat_id]
+
+def is_downloader_enabled(chat_id: int, platform: str) -> bool:
+    """Check if a platform downloader is enabled for a given chat."""
+    config = get_chat_config(chat_id)
+    return config.get(platform, True)
+
+def get_download_mode(chat_id: int) -> bool:
+    """Return True if auto-download mode is enabled, False if button-prompt mode."""
+    config = get_chat_config(chat_id)
+    return config.get("auto_download", True)
+
+def toggle_downloader(chat_id: int, platform: str) -> bool:
+    """Toggle a platform downloader for a chat and persist change."""
+    config = get_chat_config(chat_id)
+    new_state = not config.get(platform, True)
+    config[platform] = new_state
+    save_chat_configs()
+    return new_state
+
+def toggle_download_mode(chat_id: int) -> bool:
+    """Toggle auto_download mode for a chat and persist change."""
+    config = get_chat_config(chat_id)
+    new_state = not config.get("auto_download", True)
+    config["auto_download"] = new_state
+    save_chat_configs()
+    return new_state
+
+# Load chat configs on module startup
+load_chat_configs()
+
+# Cache for pending download buttons: { short_id: { "url": str, "platform": str, "time": float } }
+pending_downloads = {}
+
+def store_pending_download(url: str, platform: str) -> str:
+    """Store URL in pending downloads cache and return a short ID."""
+    short_id = uuid.uuid4().hex[:10]
+    pending_downloads[short_id] = {"url": url, "platform": platform, "time": time.time()}
+    now = time.time()
+    for k in list(pending_downloads.keys()):
+        if now - pending_downloads[k]["time"] > 7200:
+            pending_downloads.pop(k, None)
+    return short_id
+
+
 DEFAULT_ENGINE = "free"
 DEFAULT_TARGET_LANG = "en"
 
@@ -168,6 +264,36 @@ TWITTER_URL_PATTERN = re.compile(
     r'(?:https?://)?(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)/status/(\d+)',
     re.IGNORECASE
 )
+
+# ─── Twitch Clip URL Pattern ──────────────────────────────────────────────────
+
+TWITCH_CLIP_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.|m\.)?(?:clips\.twitch\.tv/|twitch\.tv/[A-Za-z0-9_]+/clip/)([A-Za-z0-9_-]+)',
+    re.IGNORECASE
+)
+
+# ─── TikTok URL Pattern ───────────────────────────────────────────────────────
+
+TIKTOK_URL_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.|vm\.|vt\.)?tiktok\.com/(?:@[A-Za-z0-9_.]+/video/|v/|t/)?([A-Za-z0-9_]+)',
+    re.IGNORECASE
+)
+
+# ─── Instagram URL Pattern ────────────────────────────────────────────────────
+
+INSTAGRAM_URL_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)',
+    re.IGNORECASE
+)
+
+# ─── Reddit URL Pattern ───────────────────────────────────────────────────────
+
+REDDIT_URL_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.|old\.)?reddit\.com/r/[A-Za-z0-9_]+/comments/([A-Za-z0-9]+)|(?:https?://)?v\.redd\.it/([A-Za-z0-9]+)',
+    re.IGNORECASE
+)
+
+
 
 # Maximum video duration in seconds (30 minutes)
 MAX_VIDEO_DURATION = 1800
@@ -1265,8 +1391,12 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
 
 
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-detect YouTube links in messages. Shorts auto-download; standard videos show a download button."""
+    """Auto-detect YouTube links in messages."""
     if not update.message or not update.message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "youtube"):
         return
 
     user = update.effective_user
@@ -1320,11 +1450,352 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
     await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg)
 
 
+# ─── Twitch Clip Auto-Download ────────────────────────────────────────────────
+
+async def download_twitch_clip(url: str, output_dir: str) -> dict:
+    """Download a Twitch clip using yt-dlp. Returns dict with filepath, title, duration, uploader."""
+    filename = f"{uuid.uuid4().hex}"
+    output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
+
+    loop = asyncio.get_running_loop()
+
+    def _download():
+        logger.info(f"Downloading Twitch clip: {url}...")
+        ydl_opts = {
+            'outtmpl': output_template,
+            'format': 'best[ext=mp4]/best',
+            'socket_timeout': 20,
+            'retries': 3,
+            'quiet': True,
+            'nocheckcertificate': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for ext in ['.mp4', '.mkv', '.webm']:
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return {
+                    'filepath': filepath,
+                    'title': info.get('title', 'Twitch Clip'),
+                    'duration': info.get('duration', 0),
+                    'uploader': info.get('uploader') or info.get('creator') or 'Twitch',
+                }
+        raise Exception("Failed to download Twitch clip.")
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=180  # 3 minute cap for clips
+        )
+    except asyncio.TimeoutError:
+        raise Exception("Twitch clip download timed out.")
+
+
+async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect Twitch clip links in messages and download/upload the clip."""
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "twitch"):
+        return
+
+    user = update.effective_user
+    if user and is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    text = update.message.text.strip()
+    match = TWITCH_CLIP_PATTERN.search(text)
+    if not match:
+        return
+
+    clip_url = match.group(0)
+    logger.info(f"Twitch Clip URL detected: {clip_url}")
+
+    auto_dl = get_download_mode(chat_id)
+    if not auto_dl:
+        short_id = store_pending_download(clip_url, "twitch")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download Twitch Clip", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text(
+            f"🎮 <b>Twitch Clip Detected</b>\n<code>{clip_url}</code>\n\n<i>Click below to download clip:</i>",
+            parse_mode="HTML",
+            reply_markup=kb,
+            reply_to_message_id=update.message.message_id
+        )
+        return
+
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
+    except Exception:
+        pass
+
+    status_msg = await update.message.reply_text("⏳ Downloading Twitch clip...", reply_to_message_id=update.message.message_id)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            clip_info = await download_twitch_clip(clip_url, tmp_dir)
+            filepath = clip_info['filepath']
+            title = clip_info.get('title', 'Twitch Clip')
+            uploader = clip_info.get('uploader', 'Twitch')
+            duration = int(clip_info.get('duration', 0))
+
+            file_size = os.path.getsize(filepath)
+            if file_size > 50 * 1024 * 1024:
+                await status_msg.edit_text(
+                    fmt_warning(f"This clip exceeds Telegram's 50MB bot upload limit ({file_size / (1024*1024):.1f}MB).")
+                )
+                return
+
+            caption = (
+                f"🎮 <b>{html.escape(title)}</b>\n"
+                f"👤 <i>Channel: {html.escape(uploader)}</i>\n\n"
+                f"🔗 <a href='{clip_url}'>Twitch Clip Link</a>"
+            )
+
+            await status_msg.edit_text("📤 Uploading clip to Telegram...")
+
+            with open(filepath, "rb") as video_file:
+                await update.message.reply_video(
+                    video=video_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    duration=duration,
+                    supports_streaming=True,
+                    reply_to_message_id=update.message.message_id
+                )
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Twitch clip download failed for {clip_url}: {type(e).__name__}: {e}")
+        error_lower = error_msg.lower()
+        if 'no longer available' in error_lower or 'deleted' in error_lower or '404' in error_lower:
+            await status_msg.edit_text(fmt_error("This Twitch clip is deleted or no longer available."))
+        elif 'private' in error_lower or 'unavailable' in error_lower:
+            await status_msg.edit_text(fmt_error("This clip is private or restricted."))
+        else:
+            await status_msg.edit_text(fmt_error(f"Failed to download Twitch clip: {html.escape(error_msg)}"))
+
+
+# ─── Universal Generic Downloader (TikTok, Instagram, Reddit) ─────────────────
+
+async def download_generic_media(url: str, output_dir: str, platform_name: str = "Media") -> dict:
+    """Download video from TikTok, Instagram, Reddit, etc. using yt-dlp. Returns dict with filepath, title, duration, uploader."""
+    filename = f"{uuid.uuid4().hex}"
+    output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
+
+    loop = asyncio.get_running_loop()
+
+    def _download():
+        logger.info(f"Downloading {platform_name} video: {url}...")
+        ydl_opts = {
+            'outtmpl': output_template,
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            'merge_output_format': 'mp4',
+            'socket_timeout': 20,
+            'retries': 3,
+            'quiet': True,
+            'nocheckcertificate': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for ext in ['.mp4', '.mkv', '.webm', '.jpg', '.png']:
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return {
+                    'filepath': filepath,
+                    'title': info.get('title') or f"{platform_name} Media",
+                    'duration': info.get('duration', 0),
+                    'uploader': info.get('uploader') or info.get('creator') or info.get('channel') or platform_name,
+                }
+        raise Exception(f"Failed to download {platform_name} media.")
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=180
+        )
+    except asyncio.TimeoutError:
+        raise Exception(f"{platform_name} download timed out.")
+
+
+async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+    """Execute download and upload for generic media (TikTok, Instagram, Reddit)."""
+    if not status_msg:
+        status_msg = await target_message.reply_text(f"⏳ Downloading {platform_name} media...", reply_to_message_id=target_message.message_id)
+    else:
+        await status_msg.edit_text(f"⏳ Downloading {platform_name} media...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            info = await download_generic_media(url, tmp_dir, platform_name)
+            filepath = info['filepath']
+            title = info.get('title', f'{platform_name} Media')
+            uploader = info.get('uploader', platform_name)
+            duration = int(info.get('duration', 0))
+
+            file_size = os.path.getsize(filepath)
+            if file_size > 50 * 1024 * 1024:
+                await status_msg.edit_text(
+                    fmt_warning(f"This media exceeds Telegram's 50MB bot limit ({file_size / (1024*1024):.1f}MB).")
+                )
+                return
+
+            caption = (
+                f"<b>{html.escape(title)}</b>\n"
+                f"👤 <i>Source: {html.escape(uploader)}</i>\n\n"
+                f"🔗 <a href='{url}'>{platform_name} Link</a>"
+            )
+
+            await status_msg.edit_text("📤 Uploading to Telegram...")
+
+            is_image = filepath.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+            if is_image:
+                with open(filepath, "rb") as photo_file:
+                    await target_message.reply_photo(
+                        photo=photo_file,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_to_message_id=target_message.message_id
+                    )
+            else:
+                with open(filepath, "rb") as video_file:
+                    await target_message.reply_video(
+                        video=video_file,
+                        caption=caption,
+                        parse_mode="HTML",
+                        duration=duration,
+                        supports_streaming=True,
+                        reply_to_message_id=target_message.message_id
+                    )
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"{platform_name} download failed for {url}: {type(e).__name__}: {e}")
+        try:
+            await status_msg.edit_text(fmt_error(f"Failed to download {platform_name} media: {html.escape(error_msg)}"))
+        except Exception:
+            pass
+
+
+async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect TikTok links."""
+    if not update.message or not update.message.text: return
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "tiktok"): return
+    user = update.effective_user
+    if user and is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
+
+    text = update.message.text.strip()
+    match = TIKTOK_URL_PATTERN.search(text)
+    if not match: return
+    url = match.group(0)
+
+    auto_dl = get_download_mode(chat_id)
+    if not auto_dl:
+        short_id = store_pending_download(url, "TikTok")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download TikTok Video", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text("🎵 <b>TikTok Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
+        return
+
+    await execute_generic_media_download(update.message, url, "TikTok", context)
+
+
+async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect Instagram links."""
+    if not update.message or not update.message.text: return
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "instagram"): return
+    user = update.effective_user
+    if user and is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
+
+    text = update.message.text.strip()
+    match = INSTAGRAM_URL_PATTERN.search(text)
+    if not match: return
+    url = match.group(0)
+
+    auto_dl = get_download_mode(chat_id)
+    if not auto_dl:
+        short_id = store_pending_download(url, "Instagram")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download Instagram Media", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text("📸 <b>Instagram Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
+        return
+
+    await execute_generic_media_download(update.message, url, "Instagram", context)
+
+
+async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect Reddit links."""
+    if not update.message or not update.message.text: return
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "reddit"): return
+    user = update.effective_user
+    if user and is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
+
+    text = update.message.text.strip()
+    match = REDDIT_URL_PATTERN.search(text)
+    if not match: return
+    url = match.group(0)
+
+    auto_dl = get_download_mode(chat_id)
+    if not auto_dl:
+        short_id = store_pending_download(url, "Reddit")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download Reddit Video", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text("🤖 <b>Reddit Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
+        return
+
+    await execute_generic_media_download(update.message, url, "Reddit", context)
+
+
+async def handle_pending_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle download buttons created in button-prompt mode (dlmed:<short_id>)."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if not data or not data.startswith("dlmed:"): return
+    short_id = data[6:]
+    item = pending_downloads.get(short_id)
+    if not item:
+        await query.message.reply_text(fmt_error("Download link expired. Please post the link again."))
+        return
+    url = item["url"]
+    platform = item["platform"]
+    status_msg = await query.message.reply_text(f"⏳ Starting {platform} download...")
+    await execute_generic_media_download(query.message, url, platform, context, status_msg=status_msg)
+
+
 # ─── Twitter / X Media & Card Handler ─────────────────────────────────────────
 
 async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Detect Twitter/X links. If media is present, download and send video/photo with caption. If text-only, send a dark tweet card."""
+    """Detect Twitter/X links."""
     if not update.message or not update.message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "twitter"):
         return
 
     user = update.effective_user
@@ -1673,6 +2144,194 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(response_msg, parse_mode="HTML")
 
 
+# ─── Interactive Media Settings Menu (/downloads) ─────────────────────────────
+
+def build_downloads_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Build interactive inline keyboard for per-chat download settings."""
+    cfg = get_chat_config(chat_id)
+
+    def btn_txt(key: str, name: str) -> str:
+        icon = "🟢" if cfg.get(key, True) else "🔴"
+        return f"{icon} {name}"
+
+    mode_txt = "⚡ Mode: Auto-Download" if cfg.get("auto_download", True) else "🔘 Mode: Button-Prompt"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(btn_txt("youtube", "YouTube"), callback_data="dltog:youtube"),
+            InlineKeyboardButton(btn_txt("twitter", "Twitter/X"), callback_data="dltog:twitter"),
+        ],
+        [
+            InlineKeyboardButton(btn_txt("twitch", "Twitch Clips"), callback_data="dltog:twitch"),
+            InlineKeyboardButton(btn_txt("tiktok", "TikTok"), callback_data="dltog:tiktok"),
+        ],
+        [
+            InlineKeyboardButton(btn_txt("instagram", "Instagram"), callback_data="dltog:instagram"),
+            InlineKeyboardButton(btn_txt("reddit", "Reddit"), callback_data="dltog:reddit"),
+        ],
+        [
+            InlineKeyboardButton(mode_txt, callback_data="dltog:mode"),
+        ],
+        [
+            InlineKeyboardButton("✖️ Close Settings", callback_data="dltog:close"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_downloads_text(chat_id: int, chat_title: str = "") -> str:
+    """Build text summary for `/downloads` command."""
+    cfg = get_chat_config(chat_id)
+    title_str = f" for <b>{html.escape(chat_title)}</b>" if chat_title else ""
+
+    platforms = [
+        ("YouTube", cfg.get("youtube", True)),
+        ("Twitter / X", cfg.get("twitter", True)),
+        ("Twitch Clips", cfg.get("twitch", True)),
+        ("TikTok", cfg.get("tiktok", True)),
+        ("Instagram", cfg.get("instagram", True)),
+        ("Reddit", cfg.get("reddit", True)),
+    ]
+
+    status_lines = []
+    for name, enabled in platforms:
+        status_lines.append(f"{'🟢' if enabled else '🔴'} <b>{name}</b>")
+
+    mode_desc = (
+        "⚡ <b>Auto-Download Mode</b>\n<i>Link downloads trigger automatically upon posting.</i>"
+        if cfg.get("auto_download", True)
+        else "🔘 <b>Button-Prompt Mode</b>\n<i>Links display a download button before fetching media.</i>"
+    )
+
+    return (
+        f"⚙️ <b>Media Download Settings</b>{title_str}\n\n"
+        f"<b>Platform Permissions:</b>\n"
+        + "  •  ".join(status_lines[:3]) + "\n"
+        + "  •  ".join(status_lines[3:]) + "\n\n"
+        f"<b>Current Download Mode:</b>\n{mode_desc}\n\n"
+        f"<i>Group Administrators can click the buttons below to toggle permissions or modes live.</i>"
+    )
+
+
+async def downloads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /downloads or /mediaconfig command."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return
+
+    if is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    # Check admin privileges in group chats
+    if chat.type in ["group", "supergroup"]:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            if member.status not in ["administrator", "creator"] and user.id not in ADMIN_USER_IDS:
+                await update.message.reply_text(
+                    fmt_error("Only Group Administrators can configure media settings."),
+                    parse_mode="HTML"
+                )
+                return
+        except Exception as e:
+            logger.error(f"Admin check error in /downloads: {e}")
+
+    text = build_downloads_text(chat.id, chat.title or "")
+    kb = build_downloads_keyboard(chat.id)
+
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button presses for download settings (dltog:...)."""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("dltog:"):
+        return
+
+    user = query.from_user
+    chat = query.message.chat if query.message else None
+
+    if not chat:
+        await query.answer()
+        return
+
+    # Check admin privileges in group chats
+    if chat.type in ["group", "supergroup"]:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            if member.status not in ["administrator", "creator"] and user.id not in ADMIN_USER_IDS:
+                await query.answer("❌ Only Group Administrators can modify settings.", show_alert=True)
+                return
+        except Exception:
+            await query.answer("❌ Verification failed.", show_alert=True)
+            return
+
+    action = query.data[6:]
+
+    if action == "close":
+        await query.answer("Closed settings.")
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "menu":
+        await query.answer()
+        text = build_downloads_text(chat.id, chat.title or "")
+        kb = build_downloads_keyboard(chat.id)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if action == "mode":
+        new_mode = toggle_download_mode(chat.id)
+        mode_str = "Auto-Download" if new_mode else "Button-Prompt"
+        await query.answer(f"Switched mode to {mode_str}")
+    else:
+        new_state = toggle_downloader(chat.id, action)
+        state_str = "Enabled" if new_state else "Disabled"
+        await query.answer(f"{action.capitalize()} {state_str}")
+
+    # Update message text and inline keyboard live
+    text = build_downloads_text(chat.id, chat.title or "")
+    kb = build_downloads_keyboard(chat.id)
+
+    try:
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome greeting when bot joins a group."""
+    result = update.my_chat_member
+    if not result:
+        return
+    new_status = result.new_chat_member.status
+    old_status = result.old_chat_member.status
+
+    if old_status in ["left", "kicked"] and new_status in ["member", "administrator"]:
+        chat = result.chat
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Configure Download Settings", callback_data="dltog:menu")]
+        ])
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"👋 <b>Hello {html.escape(chat.title or 'everyone')}!</b>\n\n"
+                f"I'm your <b>Translator & Media Downloader Bot</b>!\n"
+                f"• Auto-translates text in private chats\n"
+                f"• Downloads video/media from <b>YouTube, Twitter, Twitch Clips, TikTok, Instagram, and Reddit</b>\n\n"
+                f"<i>Group Administrators can run /downloads to configure platform permissions.</i>"
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+
+
 # ─── Main Application Runner ─────────────────────────────────────────────────
 
 async def auto_pinger_loop(application: Application) -> None:
@@ -1704,6 +2363,7 @@ async def post_init(application: Application) -> None:
     """Register bot commands in Telegram's menu button and start background tasks on startup."""
     await application.bot.set_my_commands([
         ("start", "Start the bot and see configuration"),
+        ("downloads", "Configure media download permissions (Admins)"),
         ("tr", "Translate text (reply or inline)"),
         ("target", "Set translation target language"),
         ("engine", "Switch AI / Free engine"),
@@ -1755,6 +2415,7 @@ def main() -> None:
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler(["downloads", "mediaconfig"], downloads_command))
     application.add_handler(CommandHandler("tr", tr_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
@@ -1771,19 +2432,43 @@ def main() -> None:
         setcookies_command
     ))
 
-    # Register YouTube button callback handler
+    # Register Settings & Media Download Button callback handlers
+    application.add_handler(CallbackQueryHandler(handle_downloads_callback, pattern="^dltog:"))
+    application.add_handler(CallbackQueryHandler(handle_pending_download_button, pattern="^dlmed:"))
     application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:"))
 
-    # Register YouTube auto-download handler (before general text handler so it takes priority)
+    # Register Bot Join Greeting handler
+    application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Register platform media handlers (before general text handler so they take priority)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_URL_PATTERN),
         handle_youtube_message
     ))
 
-    # Register Twitter/X media & card handler (before general text handler so it takes priority)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(TWITTER_URL_PATTERN),
         handle_twitter_message
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(TWITCH_CLIP_PATTERN),
+        handle_twitch_clip_message
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(TIKTOK_URL_PATTERN),
+        handle_tiktok_message
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(INSTAGRAM_URL_PATTERN),
+        handle_instagram_message
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(REDDIT_URL_PATTERN),
+        handle_reddit_message
     ))
 
     # Register text message handler

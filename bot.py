@@ -2185,45 +2185,11 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     tweet_url = tweet_data.get("url") or f"https://x.com/{username}/status/{tweet_id}"
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("↗️ View on 𝕏", url=tweet_url)]])
 
-    # ─── 1. Prepare Dark Tweet Card Data & Avatar ──────────────────────────────
-    card_data = dict(tweet_data)
-    card_text = main_text
-    if quote:
-        q_author = quote.get("author", {}).get("name") or "Quoted"
-        q_screen = quote.get("author", {}).get("screen_name") or ""
-        q_text = (quote.get("text") or "").strip()
-        if q_text:
-            if card_text:
-                card_text += f"\n\nQuoting {q_author} (@{q_screen}):\n{q_text}"
-            else:
-                card_text = f"Quoting {q_author} (@{q_screen}):\n{q_text}"
-    card_data["text"] = card_text
-
-    avatar_bytes = None
-    if tweet_data.get("author_avatar_url"):
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
-                if av_resp.status_code == 200:
-                    avatar_bytes = av_resp.content
-        except Exception as e:
-            logger.warning(f"Failed to fetch avatar for @{username}: {e}")
-
-    card_png = None
-    try:
-        loop = asyncio.get_running_loop()
-        card_png = await loop.run_in_executor(
-            None,
-            lambda: card.generate_twitter_card(card_data, avatar_bytes)
-        )
-    except Exception as e:
-        logger.error(f"Failed to render tweet card: {e}")
-
     videos = tweet_data.get("videos") or []
     photos = tweet_data.get("photos") or []
 
-    # ─── 2. If Video is present, send Card + Video in 1 single message bubble ─────
-    if videos and card_png:
+    # ─── 1. If Video is present: send Video only (with text caption & button) ─────
+    if videos:
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
         except Exception:
@@ -2278,9 +2244,11 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
         if video_bytes:
             try:
-                # Send standalone video first so Telegram enables native auto-play
                 await update.message.reply_video(
                     video=video_bytes,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
                     supports_streaming=True,
                     reply_to_message_id=update.message.message_id
                 )

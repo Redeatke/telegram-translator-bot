@@ -1769,13 +1769,18 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info(f"Reddit link detected: {raw_url}")
 
     # Resolve share link / mobile redirect to canonical URL
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    browser_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
     canonical_url = raw_url
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(raw_url, headers=headers, follow_redirects=True)
-            if resp.status_code == 200:
-                canonical_url = str(resp.url).split("?")[0]
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=browser_headers) as client:
+            resp = await client.get(raw_url)
+            final_url = str(resp.url).split("?")[0]
+            if "/comments/" in final_url:
+                canonical_url = final_url
+            elif "/s/" in raw_url and resp.text:
+                m_canon = re.search(r'<link rel="canonical" href="([^"]+)"', resp.text) or re.search(r'property="og:url" content="([^"]+)"', resp.text)
+                if m_canon:
+                    canonical_url = m_canon.group(1).split("?")[0]
     except Exception as e:
         logger.warning(f"Failed to resolve Reddit redirect for {raw_url}: {e}")
 
@@ -1828,7 +1833,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as dl_err:
                 logger.info(f"yt-dlp video download not applicable for Reddit URL ({dl_err}). Generating Reddit Card...")
 
-            # 2. Extract complete Reddit metadata via old.reddit.com HTML query
+            # 2. Extract complete Reddit metadata via multi-source resolution
             subreddit = "r/reddit"
             author = "user"
             title = "Reddit Post"
@@ -1836,27 +1841,45 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             score = 0
             num_comments = 0
 
-            old_url = canonical_url.replace("www.reddit.com", "old.reddit.com").replace("reddit.com", "old.reddit.com")
             m_sub = re.search(r'r/([A-Za-z0-9_]+)', canonical_url)
             if m_sub:
                 subreddit = f"r/{m_sub.group(1)}"
 
-            browser_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            browser_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
+            # Source A: Query Official Reddit oEmbed API for guaranteed Title & Author
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                oembed_url = f"https://www.reddit.com/oembed?url={canonical_url}"
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    o_resp = await client.get(oembed_url, headers=browser_headers)
+                    if o_resp.status_code == 200:
+                        o_data = o_resp.json()
+                        if o_data.get("title"):
+                            title = html.unescape(o_data["title"].strip())
+                        if o_data.get("author_name"):
+                            author = o_data["author_name"].strip()
+            except Exception as oe_err:
+                logger.warning(f"Reddit oEmbed error: {oe_err}")
+
+            # Source B: Query old.reddit.com for full selftext body, upvotes, and comments
+            old_url = re.sub(r'https?://(?:www\.|old\.)?reddit\.com', 'https://old.reddit.com', canonical_url)
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
                     resp = await client.get(old_url, headers=browser_headers, follow_redirects=True)
                     if resp.status_code == 200:
                         html_text = resp.text
                         m_post = re.search(r'<div[^>]*id="siteTable"[^>]*>(.*?)<div[^>]*class="[^"]*commentarea', html_text, re.DOTALL)
                         target_html = m_post.group(1) if m_post else html_text
 
-                        m_author = re.search(r'data-author="([^"]+)"', target_html) or re.search(r'class="author[^"]*"[^>]*>([^<]+)<', target_html)
-                        if m_author:
-                            author = m_author.group(1).strip()
+                        if author == "user":
+                            m_author = re.search(r'data-author="([^"]+)"', target_html) or re.search(r'class="author[^"]*"[^>]*>([^<]+)<', target_html)
+                            if m_author:
+                                author = m_author.group(1).strip()
 
-                        m_title = re.search(r'<a[^>]*class="title[^"]*"[^>]*>([^<]+)<', target_html)
-                        if m_title:
-                            title = html.unescape(m_title.group(1).strip())
+                        if title == "Reddit Post":
+                            m_title = re.search(r'<a[^>]*class="title[^"]*"[^>]*>([^<]+)<', target_html)
+                            if m_title:
+                                title = html.unescape(m_title.group(1).strip())
 
                         m_score = re.search(r'data-score="(\d+)"', target_html) or re.search(r'<div[^>]*class="score unvoted"[^>]*title="(\d+)"', target_html)
                         if m_score:
@@ -1874,6 +1897,29 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
                             selftext = html.unescape(clean_body)
             except Exception as r_err:
                 logger.warning(f"old.reddit.com metadata extraction error: {r_err}")
+
+            # Source C: Fallback to TelegramBot headers if selftext or score/comments still missing
+            if not selftext or score == 0:
+                try:
+                    bot_headers = {"User-Agent": "TelegramBot (like TwitterBot)"}
+                    async with httpx.AsyncClient(timeout=8.0) as client:
+                        r_bot = await client.get(canonical_url, headers=bot_headers, follow_redirects=True)
+                        if r_bot.status_code == 200:
+                            bot_html = r_bot.text
+                            if title == "Reddit Post":
+                                m_bt = re.search(r'<title>(.*?)\s*:\s*(r/[A-Za-z0-9_]+)</title>', bot_html, re.IGNORECASE)
+                                if m_bt: title = m_bt.group(1).strip()
+
+                            m_meta = re.search(r'<meta [^>]*content="(\d+\s+votes?,\s*\d+\s+comments?\.[^"]*)"', bot_html, re.IGNORECASE)
+                            if m_meta:
+                                meta_str = m_meta.group(1)
+                                m_parsed = re.search(r'(\d+)\s+votes?,\s*(\d+)\s+comments?\.\s*(.*)', meta_str, re.DOTALL)
+                                if m_parsed:
+                                    if score == 0: score = int(m_parsed.group(1))
+                                    if num_comments == 0: num_comments = int(m_parsed.group(2))
+                                    if not selftext: selftext = m_parsed.group(3).strip()
+                except Exception as b_err:
+                    logger.warning(f"TelegramBot HTML fallback error: {b_err}")
 
             reddit_data = {
                 "subreddit": subreddit,

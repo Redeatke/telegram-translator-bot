@@ -1,5 +1,6 @@
 import io
 import re
+import html
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
@@ -115,6 +116,18 @@ def draw_verified_badge(draw: ImageDraw.ImageDraw, x: int, y: int, radius: int =
     check_coords = [(x - 4, y), (x - 1, y + 3), (x + 4, y - 3)]
     draw.line(check_coords, fill=(255, 255, 255), width=2)
 
+def draw_upvote_arrow(draw: ImageDraw.ImageDraw, x: int, y: int, color=(255, 69, 0)):
+    """Draw vector upvote arrow without emoji font dependencies."""
+    arrow_head = [(x + 6, y), (x, y + 7), (x + 12, y + 7)]
+    draw.polygon(arrow_head, fill=color)
+    draw.rectangle([(x + 4, y + 7), (x + 8, y + 13)], fill=color)
+
+def draw_comment_bubble(draw: ImageDraw.ImageDraw, x: int, y: int, color=(129, 131, 132)):
+    """Draw vector comment speech bubble icon without emoji font dependencies."""
+    draw.rounded_rectangle([(x, y), (x + 16, y + 12)], radius=3, outline=color, width=2)
+    tail_coords = [(x + 3, y + 12), (x + 1, y + 16), (x + 7, y + 12)]
+    draw.polygon(tail_coords, fill=color)
+
 
 def generate_twitter_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
     """Generate a sleek dark card PNG image for a Twitter/X post."""
@@ -139,8 +152,8 @@ def generate_twitter_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes
     content_width = CARD_WIDTH - (PADDING * 2)
 
     lines = wrap_text(tweet_text, font_body, content_width, dummy_draw)
-    if len(lines) > 12:
-        lines = lines[:11] + ["... (open link to read full tweet)"]
+    if len(lines) > 16:
+        lines = lines[:15] + ["... (open link to read full tweet)"]
 
     line_spacing = 8
     sample_bbox = dummy_draw.textbbox((0, 0), "Ag", font=font_body)
@@ -249,14 +262,15 @@ def generate_twitter_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes
 
 
 def generate_reddit_card(reddit_data: dict) -> bytes:
-    """Generate a sleek dark card PNG image for a Reddit post."""
+    """Generate a sleek dark card PNG image for a Reddit post, dynamically sizing for full text."""
     dummy_img = Image.new("RGBA", (1, 1))
     dummy_draw = ImageDraw.Draw(dummy_img)
 
     subreddit = f"{reddit_data.get('subreddit', 'r/reddit')}"
     if not subreddit.startswith("r/"):
         subreddit = f"r/{subreddit}"
-    author = f"u/{reddit_data.get('author', 'user')}"
+    author_name = reddit_data.get('author', 'user')
+    author = f"u/{author_name}" if not author_name.startswith("u/") else author_name
     title = clean_text_for_card(reddit_data.get("title", ""))
     body = clean_text_for_card(reddit_data.get("body", ""))
 
@@ -264,7 +278,7 @@ def generate_reddit_card(reddit_data: dict) -> bytes:
     if body and body != title:
         content_text += f"\n\n{body}"
 
-    CARD_WIDTH = 650
+    CARD_WIDTH = 680
     PADDING = 30
     content_width = CARD_WIDTH - (PADDING * 2)
 
@@ -274,8 +288,9 @@ def generate_reddit_card(reddit_data: dict) -> bytes:
     font_stats = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf"], 16)
 
     lines = wrap_text(content_text, font_body, content_width, dummy_draw)
-    if len(lines) > 14:
-        lines = lines[:13] + ["... (open link to read full post)"]
+    # Support full multi-paragraph text posts (up to 40 lines)
+    if len(lines) > 40:
+        lines = lines[:39] + ["... (open link to read full post)"]
 
     line_spacing = 8
     sample_bbox = dummy_draw.textbbox((0, 0), "Ag", font=font_body)
@@ -287,7 +302,7 @@ def generate_reddit_card(reddit_data: dict) -> bytes:
     y_body = y_header + header_height + 15
     y_divider = y_body + body_height + 18
     y_stats = y_divider + 14
-    CARD_HEIGHT = y_stats + 35
+    CARD_HEIGHT = y_stats + 38
 
     img = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -320,17 +335,19 @@ def generate_reddit_card(reddit_data: dict) -> bytes:
     # Divider
     draw.line([(PADDING, y_divider), (CARD_WIDTH - PADDING, y_divider)], fill=(52, 53, 54), width=1)
 
-    # Stats: Upvotes & Comments
+    # Stats: Upvotes & Comments (using vector shapes instead of emoji glyphs)
     score_str = format_count(reddit_data.get("score", 0))
     comments_str = format_count(reddit_data.get("num_comments", 0))
 
-    # Upvotes
-    draw.text((PADDING, y_stats), f"⬆️  {score_str}", font=font_stats, fill=(255, 69, 0))
-    score_bbox = draw.textbbox((PADDING, y_stats), f"⬆️  {score_str}", font=font_stats)
+    # Vector Upvote Arrow + Score
+    draw_upvote_arrow(draw, PADDING, y_stats + 2, color=(255, 69, 0))
+    draw.text((PADDING + 18, y_stats), score_str, font=font_stats, fill=(255, 69, 0))
+    score_bbox = draw.textbbox((PADDING + 18, y_stats), score_str, font=font_stats)
 
-    # Comments
-    comments_x = score_bbox[2] + 30
-    draw.text((comments_x, y_stats), f"💬  {comments_str} Comments", font=font_stats, fill=(129, 131, 132))
+    # Vector Comment Bubble + Comments Count
+    comments_x = score_bbox[2] + 28
+    draw_comment_bubble(draw, comments_x, y_stats + 2, color=(129, 131, 132))
+    draw.text((comments_x + 24, y_stats), f"{comments_str} Comments", font=font_stats, fill=(129, 131, 132))
 
     # Final RGB Image
     final_img = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0))

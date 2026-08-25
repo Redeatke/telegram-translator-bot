@@ -1828,7 +1828,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as dl_err:
                 logger.info(f"yt-dlp video download not applicable for Reddit URL ({dl_err}). Generating Reddit Card...")
 
-            # 2. If no video downloaded, extract Reddit metadata via TelegramBot HTML query
+            # 2. Extract complete Reddit metadata via old.reddit.com HTML query
             subreddit = "r/reddit"
             author = "user"
             title = "Reddit Post"
@@ -1836,31 +1836,44 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             score = 0
             num_comments = 0
 
-            bot_headers = {"User-Agent": "TelegramBot (like TwitterBot)"}
+            old_url = canonical_url.replace("www.reddit.com", "old.reddit.com").replace("reddit.com", "old.reddit.com")
+            m_sub = re.search(r'r/([A-Za-z0-9_]+)', canonical_url)
+            if m_sub:
+                subreddit = f"r/{m_sub.group(1)}"
+
+            browser_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    r_html = await client.get(canonical_url, headers=bot_headers, follow_redirects=True)
-                    if r_html.status_code == 200:
-                        html_text = r_html.text
-                        m_title = re.search(r'<title>(.*?)\s*:\s*(r/[A-Za-z0-9_]+)</title>', html_text, re.IGNORECASE)
-                        if m_title:
-                            title = m_title.group(1).strip()
-                            subreddit = m_title.group(2).strip()
+                    resp = await client.get(old_url, headers=browser_headers, follow_redirects=True)
+                    if resp.status_code == 200:
+                        html_text = resp.text
+                        m_post = re.search(r'<div[^>]*id="siteTable"[^>]*>(.*?)<div[^>]*class="[^"]*commentarea', html_text, re.DOTALL)
+                        target_html = m_post.group(1) if m_post else html_text
 
-                        m_meta = re.search(r'<meta [^>]*content="(\d+\s+votes?,\s*\d+\s+comments?\.[^"]*)"', html_text, re.IGNORECASE)
-                        if m_meta:
-                            meta_str = m_meta.group(1)
-                            m_parsed = re.search(r'(\d+)\s+votes?,\s*(\d+)\s+comments?\.\s*(.*)', meta_str, re.DOTALL)
-                            if m_parsed:
-                                score = int(m_parsed.group(1))
-                                num_comments = int(m_parsed.group(2))
-                                selftext = m_parsed.group(3).strip()
-
-                        m_author = re.search(r'author="([^"]+)"', html_text) or re.search(r'u/([A-Za-z0-9_-]+)', html_text)
+                        m_author = re.search(r'data-author="([^"]+)"', target_html) or re.search(r'class="author[^"]*"[^>]*>([^<]+)<', target_html)
                         if m_author:
                             author = m_author.group(1).strip()
+
+                        m_title = re.search(r'<a[^>]*class="title[^"]*"[^>]*>([^<]+)<', target_html)
+                        if m_title:
+                            title = html.unescape(m_title.group(1).strip())
+
+                        m_score = re.search(r'data-score="(\d+)"', target_html) or re.search(r'<div[^>]*class="score unvoted"[^>]*title="(\d+)"', target_html)
+                        if m_score:
+                            score = int(m_score.group(1))
+
+                        m_comments = re.search(r'(\d+)\s+comments', target_html)
+                        if m_comments:
+                            num_comments = int(m_comments.group(1))
+
+                        m_selftext = re.search(r'<div[^>]*class="[^"]*usertext-body[^"]*"[^>]*>(.*?)</div>', target_html, re.DOTALL)
+                        if m_selftext:
+                            raw_md = m_selftext.group(1)
+                            raw_md = re.sub(r'</p>\s*<p>', '\n\n', raw_md)
+                            clean_body = re.sub(r'<[^>]+>', '', raw_md).strip()
+                            selftext = html.unescape(clean_body)
             except Exception as r_err:
-                logger.warning(f"Reddit HTML metadata extraction error: {r_err}")
+                logger.warning(f"old.reddit.com metadata extraction error: {r_err}")
 
             reddit_data = {
                 "subreddit": subreddit,

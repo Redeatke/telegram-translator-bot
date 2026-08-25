@@ -289,9 +289,10 @@ INSTAGRAM_URL_PATTERN = re.compile(
 # ─── Reddit URL Pattern ───────────────────────────────────────────────────────
 
 REDDIT_URL_PATTERN = re.compile(
-    r'(?:https?://)?(?:www\.|old\.)?reddit\.com/r/[A-Za-z0-9_]+/comments/([A-Za-z0-9]+)|(?:https?://)?v\.redd\.it/([A-Za-z0-9]+)',
+    r'(?:https?://)?(?:www\.|old\.|m\.)?reddit\.com/(?:r/[A-Za-z0-9_]+/(?:comments|s)/|s/)[A-Za-z0-9_-]+|(?:https?://)?v\.redd\.it/[A-Za-z0-9_-]+',
     re.IGNORECASE
 )
+
 
 
 
@@ -1395,20 +1396,23 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id
-    if not is_downloader_enabled(chat_id, "youtube"):
-        return
-
     user = update.effective_user
     if user and is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
         return
 
     text = update.message.text.strip()
-
-    # Extract YouTube URL using regex
     match = YOUTUBE_URL_PATTERN.search(text)
     if not match:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "youtube"):
+        await update.message.reply_text(
+            fmt_warning("🔴 <b>YouTube downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
         return
 
     yt_url = match.group(0)
@@ -1501,10 +1505,6 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id
-    if not is_downloader_enabled(chat_id, "twitch"):
-        return
-
     user = update.effective_user
     if user and is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
@@ -1513,6 +1513,15 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
     text = update.message.text.strip()
     match = TWITCH_CLIP_PATTERN.search(text)
     if not match:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "twitch"):
+        await update.message.reply_text(
+            fmt_warning("🔴 <b>Twitch clip downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
         return
 
     clip_url = match.group(0)
@@ -1701,8 +1710,6 @@ async def execute_generic_media_download(target_message, url: str, platform_name
 async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect TikTok links."""
     if not update.message or not update.message.text: return
-    chat_id = update.effective_chat.id
-    if not is_downloader_enabled(chat_id, "tiktok"): return
     user = update.effective_user
     if user and is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
@@ -1711,6 +1718,15 @@ async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TY
     match = TIKTOK_URL_PATTERN.search(text)
     if not match: return
     url = match.group(0)
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "tiktok"):
+        await update.message.reply_text(
+            fmt_warning("🔴 <b>TikTok downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
+        return
 
     auto_dl = get_download_mode(chat_id)
     if not auto_dl:
@@ -1725,8 +1741,6 @@ async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect Instagram links."""
     if not update.message or not update.message.text: return
-    chat_id = update.effective_chat.id
-    if not is_downloader_enabled(chat_id, "instagram"): return
     user = update.effective_user
     if user and is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
@@ -1735,6 +1749,15 @@ async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT
     match = INSTAGRAM_URL_PATTERN.search(text)
     if not match: return
     url = match.group(0)
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "instagram"):
+        await update.message.reply_text(
+            fmt_warning("🔴 <b>Instagram downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
+        return
 
     auto_dl = get_download_mode(chat_id)
     if not auto_dl:
@@ -1747,10 +1770,8 @@ async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-detect Reddit links."""
+    """Auto-detect Reddit links. Downloads video if present, or sends a dark Reddit Card for text posts."""
     if not update.message or not update.message.text: return
-    chat_id = update.effective_chat.id
-    if not is_downloader_enabled(chat_id, "reddit"): return
     user = update.effective_user
     if user and is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
@@ -1758,16 +1779,134 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
     text = update.message.text.strip()
     match = REDDIT_URL_PATTERN.search(text)
     if not match: return
-    url = match.group(0)
+    raw_url = match.group(0)
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "reddit"):
+        await update.message.reply_text(
+            fmt_warning("🔴 <b>Reddit downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+
+    logger.info(f"Reddit link detected: {raw_url}")
+
+    # Resolve share link / mobile redirect to canonical URL
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    canonical_url = raw_url
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(raw_url, headers=headers, follow_redirects=True)
+            if resp.status_code == 200:
+                canonical_url = str(resp.url).split("?")[0]
+    except Exception as e:
+        logger.warning(f"Failed to resolve Reddit redirect for {raw_url}: {e}")
 
     auto_dl = get_download_mode(chat_id)
     if not auto_dl:
-        short_id = store_pending_download(url, "Reddit")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download Reddit Video", callback_data=f"dlmed:{short_id}")]])
-        await update.message.reply_text("🤖 <b>Reddit Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
+        short_id = store_pending_download(canonical_url, "Reddit")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download Reddit Media / Card", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text("🤖 <b>Reddit Link Detected</b>\n<i>Click below to process:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
         return
 
-    await execute_generic_media_download(update.message, url, "Reddit", context)
+    status_msg = await update.message.reply_text("⏳ Processing Reddit link...", reply_to_message_id=update.message.message_id)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # 1. Attempt yt-dlp media download first
+            try:
+                info = await download_generic_media(canonical_url, tmp_dir, "Reddit")
+                filepath = info["filepath"]
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    file_size = os.path.getsize(filepath)
+                    if file_size > 50 * 1024 * 1024:
+                        await status_msg.edit_text(fmt_warning(f"This video exceeds Telegram's 50MB bot limit ({file_size / (1024*1024):.1f}MB)."))
+                        return
+
+                    title = info.get("title", "Reddit Video")
+                    uploader = info.get("uploader", "Reddit")
+                    duration = int(info.get("duration", 0))
+
+                    caption = (
+                        f"🤖 <b>{html.escape(title)}</b>\n"
+                        f"👤 <i>Source: {html.escape(uploader)}</i>\n\n"
+                        f"🔗 <a href='{canonical_url}'>Reddit Link</a>"
+                    )
+
+                    await status_msg.edit_text("📤 Uploading video to Telegram...")
+                    with open(filepath, "rb") as video_file:
+                        await update.message.reply_video(
+                            video=video_file,
+                            caption=caption,
+                            parse_mode="HTML",
+                            duration=duration,
+                            supports_streaming=True,
+                            reply_to_message_id=update.message.message_id
+                        )
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                    return
+            except Exception as dl_err:
+                logger.info(f"yt-dlp video download not applicable for Reddit URL ({dl_err}). Generating Reddit Card...")
+
+            # 2. If no video downloaded, generate Reddit Dark Card
+            subreddit = "Reddit"
+            author = "user"
+            title = "Reddit Post"
+            selftext = ""
+
+            m_sub = re.search(r'r/([A-Za-z0-9_]+)', canonical_url)
+            if m_sub:
+                subreddit = f"r/{m_sub.group(1)}"
+
+            # Fetch OpenGraph / rxddit metadata
+            rx_url = canonical_url.replace("reddit.com", "rxddit.com").replace("www.", "")
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    rx_resp = await client.get(rx_url, headers=headers, follow_redirects=True)
+                    if rx_resp.status_code == 200:
+                        rx_html = rx_resp.text
+                        m_title = re.search(r'<meta (?:property|name)="og:title" content="([^"]+)"', rx_html)
+                        m_desc = re.search(r'<meta (?:property|name)="og:description" content="([^"]+)"', rx_html)
+                        if m_title: title = m_title.group(1)
+                        if m_desc: selftext = m_desc.group(1)
+            except Exception as rx_err:
+                logger.warning(f"rxddit metadata query failed: {rx_err}")
+
+            reddit_data = {
+                "subreddit": subreddit,
+                "author": author,
+                "title": title,
+                "body": selftext,
+                "score": 0,
+                "num_comments": 0,
+                "url": canonical_url,
+            }
+
+            card_png = tweet_card.generate_reddit_card(reddit_data)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Reddit Post", url=canonical_url)]])
+
+            await update.message.reply_photo(
+                photo=card_png,
+                caption=f"🤖 <b>From {html.escape(subreddit)} on Reddit</b>\n\n🔗 <a href='{canonical_url}'>View Post</a>",
+                parse_mode="HTML",
+                reply_markup=kb,
+                reply_to_message_id=update.message.message_id
+            )
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.error(f"Reddit message handler failed: {e}")
+        try:
+            await status_msg.edit_text(fmt_error("Failed to process Reddit link."))
+        except Exception:
+            pass
 
 
 async def handle_pending_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1794,10 +1933,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id
-    if not is_downloader_enabled(chat_id, "twitter"):
-        return
-
     user = update.effective_user
     if user and is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
@@ -1806,6 +1941,15 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     match = TWITTER_URL_PATTERN.search(text)
     if not match:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "twitter"):
+        await update.message.reply_text(
+            fmt_warning("🔴 <b>Twitter / X downloads are currently disabled in this chat.</b>\n<i>Group Administrators can use /downloads to enable them.</i>"),
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
         return
 
     username, tweet_id = match.groups()
@@ -2103,6 +2247,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if update.message.text.startswith("/"):
+        return
+
+    # Do not auto-translate if message contains HTTP/HTTPS URLs
+    text_lower = update.message.text.lower()
+    if "http://" in text_lower or "https://" in text_lower:
         return
 
     # Only auto-translate in private chats

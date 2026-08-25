@@ -116,6 +116,16 @@ def clean_text_for_card(text: str) -> str:
     lines = [line.strip() for line in cleaned.split("\n")]
     return "\n".join(lines).strip()
 
+def load_font(font_names, size):
+    if isinstance(font_names, str):
+        font_names = [font_names]
+    for name in font_names:
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
 def generate_tweet_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
     # Card settings (Twitter Dark Mode)
     CARD_WIDTH = 680
@@ -124,20 +134,13 @@ def generate_tweet_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
     BORDER_COLOR = (47, 51, 54)      # #2F3336
     TEXT_PRIMARY = (231, 233, 234)   # #E7E9EA
     TEXT_SECONDARY = (113, 118, 123) # #71767B
-    
-    # Load fonts with system fallbacks (works on Windows, Linux, Docker)
-    def load_font(font_names, size, bold=False):
-        for name in font_names:
-            try:
-                return ImageFont.truetype(name, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
 
-    font_name = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeuib.ttf"], 20, bold=True)
+    font_name = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeuib.ttf"], 20)
     font_handle = load_font(["arial.ttf", "DejaVuSans.ttf", "segoeui.ttf"], 16)
     font_body = load_font(["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"], 22)
     font_meta = load_font(["arial.ttf", "DejaVuSans.ttf"], 15)
+    font_stats = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf"], 16)
+    font_stats_label = load_font(["arial.ttf", "DejaVuSans.ttf"], 15)
     font_stats = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf"], 16, bold=True)
     font_stats_label = load_font(["arial.ttf", "DejaVuSans.ttf"], 15)
 
@@ -268,3 +271,97 @@ def generate_tweet_card(tweet_data: dict, avatar_bytes: bytes = None) -> bytes:
     buffer = io.BytesIO()
     final_img.save(buffer, format="PNG", quality=95)
     return buffer.getvalue()
+
+
+def generate_reddit_card(reddit_data: dict) -> bytes:
+    """Generate a sleek dark card PNG image for a Reddit post."""
+    dummy_img = Image.new("RGBA", (1, 1))
+    dummy_draw = ImageDraw.Draw(dummy_img)
+
+    subreddit = f"{reddit_data.get('subreddit', 'r/reddit')}"
+    if not subreddit.startswith("r/"):
+        subreddit = f"r/{subreddit}"
+    author = f"u/{reddit_data.get('author', 'user')}"
+    title = clean_text_for_card(reddit_data.get("title", ""))
+    body = clean_text_for_card(reddit_data.get("body", ""))
+
+    content_text = title
+    if body:
+        content_text += f"\n\n{body}"
+
+    CARD_WIDTH = 650
+    PADDING = 30
+    content_width = CARD_WIDTH - (PADDING * 2)
+
+    font_sub = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeuib.ttf"], 20)
+    font_author = load_font(["arial.ttf", "DejaVuSans.ttf", "segoeui.ttf"], 15)
+    font_body = load_font(["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"], 18)
+    font_stats = load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf"], 16)
+
+    lines = wrap_text(content_text, font_body, content_width, dummy_draw)
+    if len(lines) > 14:
+        lines = lines[:13] + ["... (open link to read full post)"]
+
+    line_spacing = 8
+    sample_bbox = dummy_draw.textbbox((0, 0), "Ag", font=font_body)
+    line_height = (sample_bbox[3] - sample_bbox[1]) + line_spacing
+    body_height = max(line_height, len(lines) * line_height)
+
+    header_height = 45
+    y_header = PADDING
+    y_body = y_header + header_height + 15
+    y_divider = y_body + body_height + 18
+    y_stats = y_divider + 14
+    CARD_HEIGHT = y_stats + 35
+
+    img = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Dark Reddit Card Background (Reddit dark mode style #1A1A1B)
+    draw.rounded_rectangle(
+        [(0, 0), (CARD_WIDTH - 1, CARD_HEIGHT - 1)],
+        radius=20,
+        fill=(26, 26, 27, 255),
+        outline=(52, 53, 54, 255),
+        width=2
+    )
+
+    # Reddit Orange Circle Logo on Header
+    orange_color = (255, 69, 0, 255)
+    draw.ellipse([(PADDING, y_header), (PADDING + 36, y_header + 36)], fill=orange_color)
+    draw.text((PADDING + 8, y_header + 6), "r/", font=font_sub, fill=(255, 255, 255))
+
+    # Subreddit & Author Header Text
+    name_x = PADDING + 48
+    draw.text((name_x, y_header + 1), subreddit, font=font_sub, fill=(255, 255, 255))
+    draw.text((name_x, y_header + 24), f"Posted by {author}", font=font_author, fill=(129, 131, 132))
+
+    # Body Text
+    current_y = y_body
+    for line in lines:
+        draw.text((PADDING, current_y), line, font=font_body, fill=(215, 218, 220))
+        current_y += line_height
+
+    # Divider
+    draw.line([(PADDING, y_divider), (CARD_WIDTH - PADDING, y_divider)], fill=(52, 53, 54), width=1)
+
+    # Stats: Upvotes & Comments
+    score_str = format_count(reddit_data.get("score", 0))
+    comments_str = format_count(reddit_data.get("num_comments", 0))
+
+    # Upvotes
+    draw.text((PADDING, y_stats), f"⬆️  {score_str}", font=font_stats, fill=(255, 69, 0))
+    score_bbox = draw.textbbox((PADDING, y_stats), f"⬆️  {score_str}", font=font_stats)
+
+    # Comments
+    comments_x = score_bbox[2] + 30
+    draw.text((comments_x, y_stats), f"💬  {comments_str} Comments", font=font_stats, fill=(129, 131, 132))
+
+    # Final RGB Image
+    final_img = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0))
+    final_img.paste(img, (0, 0), mask=img.split()[3])
+
+    buffer = io.BytesIO()
+    final_img.save(buffer, format="PNG", quality=95)
+    return buffer.getvalue()
+

@@ -10,7 +10,6 @@ Run as Administrator if you want the task to run even when not logged in.
 """
 
 import sys
-import os
 import subprocess
 from pathlib import Path
 
@@ -39,10 +38,6 @@ def main():
     if not script_path.exists():
         print("❌  refresh_cookies.py not found in this directory.")
         sys.exit(1)
-
-    # Build the command that Task Scheduler will run
-    # Runs every 5 days at 9:00 AM
-    task_cmd = f'"{python_exe}" "{script_path}"'
 
     print(f"  Python     : {python_exe}")
     print(f"  Script     : {script_path}")

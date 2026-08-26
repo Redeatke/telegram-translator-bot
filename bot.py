@@ -9,7 +9,7 @@ import time
 import json
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -2253,20 +2253,12 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                     reply_to_message_id=update.message.message_id
                 )
                 logger.info(f"Sent auto-playing Twitter video for @{username}/status/{tweet_id}")
-                
-                # Send Tweet Card photo right below it
-                if card_png:
-                    await update.message.reply_photo(
-                        photo=card_png,
-                        reply_markup=keyboard,
-                    )
-                    logger.info(f"Sent dark tweet card below video for @{username}/status/{tweet_id}")
                 return
             except Exception as e:
-                logger.error(f"Failed to send video / card sequence: {e}")
+                logger.error(f"Failed to send video: {e}")
 
-    # ─── 3. If Photos are present, send Card + Photos in 1 single media group ──────
-    if photos and card_png:
+    # ─── 2. If Photos are present, send Photos alone in 1 media group ─────────────
+    if photos:
         try:
             photo_bytes_list = []
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
@@ -2281,19 +2273,50 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                             logger.warning(f"Failed to download photo {p_url}: {p_err}")
 
             if photo_bytes_list:
-                media_group = [InputMediaPhoto(media=card_png)] + [
-                    InputMediaPhoto(media=pb) for pb in photo_bytes_list
-                ]
+                media_group = [InputMediaPhoto(media=pb) for pb in photo_bytes_list]
                 await update.message.reply_media_group(
                     media=media_group,
                     reply_to_message_id=update.message.message_id
                 )
-                logger.info(f"Sent single-message Card + Photo(s) media group for @{username}/status/{tweet_id}")
+                logger.info(f"Sent Photo(s) media group for @{username}/status/{tweet_id}")
                 return
         except Exception as e:
             logger.error(f"Failed to send photo media group: {e}")
 
-    # ─── 4. Text-Only (or Media Fallback): Send Card Alone ────────────────────────
+    # ─── 3. Text-Only (or Media Fallback): Send Dark Tweet Card ───────────────────
+    card_data = dict(tweet_data)
+    card_text = main_text
+    if quote:
+        q_author = quote.get("author", {}).get("name") or "Quoted"
+        q_screen = quote.get("author", {}).get("screen_name") or ""
+        q_text = (quote.get("text") or "").strip()
+        if q_text:
+            if card_text:
+                card_text += f"\n\nQuoting {q_author} (@{q_screen}):\n{q_text}"
+            else:
+                card_text = f"Quoting {q_author} (@{q_screen}):\n{q_text}"
+    card_data["text"] = card_text
+
+    avatar_bytes = None
+    if tweet_data.get("author_avatar_url"):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
+                if av_resp.status_code == 200:
+                    avatar_bytes = av_resp.content
+        except Exception as e:
+            logger.warning(f"Failed to fetch avatar for @{username}: {e}")
+
+    card_png = None
+    try:
+        loop = asyncio.get_running_loop()
+        card_png = await loop.run_in_executor(
+            None,
+            lambda: card.generate_twitter_card(card_data, avatar_bytes)
+        )
+    except Exception as e:
+        logger.error(f"Failed to render tweet card: {e}")
+
     if card_png:
         try:
             await update.message.reply_photo(

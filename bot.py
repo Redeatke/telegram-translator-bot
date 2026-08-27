@@ -1709,7 +1709,10 @@ async def execute_generic_media_download(target_message, url: str, platform_name
     if not status_msg:
         status_msg = await target_message.reply_text(f"⏳ Downloading {platform_name} media...", reply_to_message_id=target_message.message_id)
     else:
-        await status_msg.edit_text(f"⏳ Downloading {platform_name} media...")
+        try:
+            await status_msg.edit_text(f"⏳ Downloading {platform_name} media...")
+        except Exception:
+            pass  # e.g. text is already identical to the current status message
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1773,7 +1776,10 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
     if not status_msg:
         status_msg = await target_message.reply_text("⏳ Downloading Instagram media...", reply_to_message_id=target_message.message_id)
     else:
-        await status_msg.edit_text("⏳ Downloading Instagram media...")
+        try:
+            await status_msg.edit_text("⏳ Downloading Instagram media...")
+        except Exception:
+            pass  # e.g. text is already identical to the current status message
 
     try:
         loop = asyncio.get_running_loop()

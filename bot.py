@@ -9,7 +9,7 @@ import time
 import json
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,7 +25,31 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
+from yt_dlp.extractor.instagram import InstagramBaseIE
 import card
+
+# yt-dlp's Instagram extractor only turns `video_versions` into downloadable
+# formats, so photo-only carousel items have an empty format list and yt-dlp
+# raises "No video formats found!" before we ever see them. Patch it to fall
+# back to the best available image candidate when there's no video stream.
+_orig_ig_extract_product_media = InstagramBaseIE._extract_product_media
+
+def _ig_extract_product_media_with_photos(self, product_media):
+    result = _orig_ig_extract_product_media(self, product_media)
+    if not result.get('formats'):
+        thumbnails = result.get('thumbnails') or []
+        if thumbnails:
+            best = thumbnails[-1]
+            result['formats'] = [{
+                'url': best['url'],
+                'format_id': 'image',
+                'ext': 'jpg',
+                'width': best.get('width'),
+                'height': best.get('height'),
+            }]
+    return result
+
+InstagramBaseIE._extract_product_media = _ig_extract_product_media_with_photos
 
 
 try:
@@ -48,6 +72,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ─── API Configuration ───────────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Private Telegram channel used to persist chat_configs.json across redeploys
+# (the bot must be an admin there with Post + Pin permissions).
+_config_channel_id_raw = os.getenv("CONFIG_CHANNEL_ID", "").strip()
+CONFIG_CHANNEL_ID = int(_config_channel_id_raw) if _config_channel_id_raw else None
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
@@ -122,7 +151,7 @@ user_configs = {}
 
 # ─── Chat Media Config Persistence ──────────────────────────────────────────
 
-CHAT_CONFIGS_FILE = os.path.join(os.path.dirname(__file__), "chat_configs.json")
+CHAT_CONFIGS_FILE = os.path.join(os.environ.get("DATA_DIR", os.path.dirname(__file__)), "chat_configs.json")
 chat_configs = {}
 
 DEFAULT_CHAT_CONFIG = {
@@ -135,26 +164,67 @@ DEFAULT_CHAT_CONFIG = {
     "auto_download": True,  # True = Auto-download; False = Prompt with button
 }
 
+_config_bot = None  # set in post_init() once the Application's Bot exists
+
 def load_chat_configs() -> None:
-    """Load chat media configurations from chat_configs.json."""
+    """Load chat media configurations from the local chat_configs.json cache."""
     global chat_configs
     if os.path.exists(CHAT_CONFIGS_FILE):
         try:
             with open(CHAT_CONFIGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 chat_configs = {int(k): v for k, v in data.items()}
-                logger.info(f"Loaded media configs for {len(chat_configs)} chats.")
+                logger.info(f"Loaded media configs for {len(chat_configs)} chats from local cache.")
         except Exception as e:
             logger.error(f"Failed to load chat_configs.json: {e}")
             chat_configs = {}
 
+async def load_chat_configs_from_channel() -> None:
+    """Override the local cache with the copy pinned in the Telegram storage channel, if configured."""
+    global chat_configs
+    if not CONFIG_CHANNEL_ID or not _config_bot:
+        return
+    try:
+        chat = await _config_bot.get_chat(CONFIG_CHANNEL_ID)
+        if chat.pinned_message and chat.pinned_message.text:
+            data = json.loads(chat.pinned_message.text)
+            chat_configs = {int(k): v for k, v in data.items()}
+            logger.info(f"Loaded media configs for {len(chat_configs)} chats from Telegram storage channel.")
+    except Exception as e:
+        logger.error(f"Failed to load chat_configs from Telegram storage channel: {e}")
+
+async def _push_chat_configs_to_channel() -> None:
+    """Push the in-memory chat_configs to the pinned message in the storage channel."""
+    if not CONFIG_CHANNEL_ID or not _config_bot:
+        return
+    payload = json.dumps(chat_configs)
+    if len(payload) > 4096:
+        logger.error("chat_configs payload exceeds Telegram's 4096-char message limit; skipping channel sync.")
+        return
+    try:
+        chat = await _config_bot.get_chat(CONFIG_CHANNEL_ID)
+        if chat.pinned_message:
+            await _config_bot.edit_message_text(
+                chat_id=CONFIG_CHANNEL_ID, message_id=chat.pinned_message.message_id, text=payload
+            )
+        else:
+            msg = await _config_bot.send_message(chat_id=CONFIG_CHANNEL_ID, text=payload)
+            await _config_bot.pin_chat_message(chat_id=CONFIG_CHANNEL_ID, message_id=msg.message_id, disable_notification=True)
+    except Exception as e:
+        logger.error(f"Failed to push chat_configs to Telegram storage channel: {e}")
+
 def save_chat_configs() -> None:
-    """Save chat media configurations to chat_configs.json."""
+    """Save chat media configurations locally and sync them to the Telegram storage channel."""
     try:
         with open(CHAT_CONFIGS_FILE, "w", encoding="utf-8") as f:
             json.dump(chat_configs, f, indent=2)
     except Exception as e:
         logger.error(f"Failed to save chat_configs.json: {e}")
+
+    try:
+        asyncio.get_running_loop().create_task(_push_chat_configs_to_channel())
+    except RuntimeError:
+        pass  # called outside a running event loop (e.g. local scripting); local cache above still saved
 
 def get_chat_config(chat_id: int) -> dict:
     """Get or initialize media download configuration for a chat."""
@@ -1698,6 +1768,114 @@ async def execute_generic_media_download(target_message, url: str, platform_name
             pass
 
 
+async def execute_instagram_download(target_message, url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+    """Download and upload Instagram media, including photo-only and multi-item carousel posts."""
+    if not status_msg:
+        status_msg = await target_message.reply_text("⏳ Downloading Instagram media...", reply_to_message_id=target_message.message_id)
+    else:
+        await status_msg.edit_text("⏳ Downloading Instagram media...")
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        def _extract():
+            ydl_opts = {
+                'format': 'best',
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
+                items = []
+                for e in entries:
+                    if not e:
+                        continue
+                    item_url = e.get('url')
+                    if not item_url:
+                        formats = e.get('formats') or []
+                        if formats:
+                            item_url = formats[-1].get('url')
+                    if not item_url:
+                        continue
+                    items.append({'url': item_url, 'is_video': e.get('ext') != 'jpg'})
+                return {
+                    'items': items,
+                    'title': info.get('title') or 'Instagram Post',
+                    'uploader': info.get('channel') or info.get('uploader') or 'Instagram',
+                }
+
+        data = await loop.run_in_executor(None, _extract)
+        items = data['items']
+        if not items:
+            raise Exception("No media found in this post.")
+
+        # A single video is handled by the generic yt-dlp downloader, which
+        # merges best video+audio and enforces the 50MB size check properly.
+        if len(items) == 1 and items[0]['is_video']:
+            await execute_generic_media_download(target_message, url, "Instagram", context, status_msg=status_msg)
+            return
+
+        caption = (
+            f"<b>{html.escape(data['title'])}</b>\n"
+            f"👤 <i>Source: {html.escape(data['uploader'])}</i>\n\n"
+            f"🔗 <a href='{url}'>Instagram Link</a>"
+        )
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
+
+        await status_msg.edit_text("📤 Uploading to Telegram...")
+
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        media_items = []
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for item in items[:10]:
+                try:
+                    resp = await client.get(item['url'], headers=headers)
+                    if resp.status_code == 200 and len(resp.content) <= 50 * 1024 * 1024:
+                        media_items.append({'bytes': resp.content, 'is_video': item['is_video']})
+                except Exception as fetch_err:
+                    logger.warning(f"Failed to fetch Instagram media item: {fetch_err}")
+
+        if not media_items:
+            raise Exception("Failed to download any media from this post.")
+
+        if len(media_items) == 1:
+            m = media_items[0]
+            if m['is_video']:
+                await target_message.reply_video(
+                    video=m['bytes'], caption=caption, parse_mode="HTML",
+                    supports_streaming=True, reply_to_message_id=target_message.message_id
+                )
+            else:
+                await target_message.reply_photo(
+                    photo=m['bytes'], caption=caption, parse_mode="HTML",
+                    reply_to_message_id=target_message.message_id
+                )
+        else:
+            media_group = []
+            for i, m in enumerate(media_items):
+                kwargs = {'caption': caption, 'parse_mode': 'HTML'} if i == 0 else {}
+                if m['is_video']:
+                    media_group.append(InputMediaVideo(media=m['bytes'], **kwargs))
+                else:
+                    media_group.append(InputMediaPhoto(media=m['bytes'], **kwargs))
+            await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"Instagram download failed for {url}: {type(e).__name__}: {e}")
+        try:
+            await status_msg.edit_text(fmt_error(f"Failed to download Instagram media: {html.escape(str(e))}"))
+        except Exception:
+            pass
+
+
 async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect TikTok links."""
     if not update.message or not update.message.text: return
@@ -1747,7 +1925,7 @@ async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("📸 <b>Instagram Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
         return
 
-    await execute_generic_media_download(update.message, url, "Instagram", context)
+    await execute_instagram_download(update.message, url, context)
 
 
 async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2034,7 +2212,10 @@ async def handle_pending_download_button(update: Update, context: ContextTypes.D
     url = item["url"]
     platform = item["platform"]
     status_msg = await query.message.reply_text(f"⏳ Starting {platform} download...")
-    await execute_generic_media_download(query.message, url, platform, context, status_msg=status_msg)
+    if platform == "Instagram":
+        await execute_instagram_download(query.message, url, context, status_msg=status_msg)
+    else:
+        await execute_generic_media_download(query.message, url, platform, context, status_msg=status_msg)
 
 
 # ─── Twitter / X Media & Card Handler ─────────────────────────────────────────
@@ -2618,6 +2799,10 @@ async def auto_pinger_loop(application: Application) -> None:
 
 async def post_init(application: Application) -> None:
     """Register bot commands in Telegram's menu button and start background tasks on startup."""
+    global _config_bot
+    _config_bot = application.bot
+    await load_chat_configs_from_channel()
+
     await application.bot.set_my_commands([
         ("start", "Start the bot and see configuration"),
         ("downloads", "Configure media download permissions (Admins)"),

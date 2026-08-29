@@ -1494,13 +1494,40 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("⬇️ Download Video (720p)", callback_data=f"ytdl:{yt_url}")]
     ])
 
-    await update.message.reply_text(
+    caption = (
         f"📹 <b>YouTube Link Detected</b>\n"
-        f"🔗 <code>{yt_url}</code>\n\n"
-        f"<i>Click below to download (720p, max 30 min / 50MB):</i>",
+        f"🔗 {yt_url}\n\n"
+        f"<i>Click below to download (720p, max 30 min / 50MB):</i>"
+    )
+
+    thumbnail_url = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("https://www.youtube.com/oembed", params={"url": yt_url, "format": "json"})
+            if resp.status_code == 200:
+                thumbnail_url = resp.json().get("thumbnail_url")
+    except Exception as e:
+        logger.warning(f"Failed to fetch YouTube oEmbed thumbnail for {yt_url}: {e}")
+
+    if thumbnail_url:
+        try:
+            await update.message.reply_photo(
+                photo=thumbnail_url,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                reply_to_message_id=update.message.message_id
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send YouTube thumbnail preview, falling back to text: {e}")
+
+    await update.message.reply_text(
+        caption,
         parse_mode="HTML",
         reply_markup=keyboard,
-        reply_to_message_id=update.message.message_id
+        reply_to_message_id=update.message.message_id,
+        disable_web_page_preview=True
     )
 
 

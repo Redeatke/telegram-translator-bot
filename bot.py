@@ -443,6 +443,20 @@ def fmt_warning(text: str) -> str:
     return f"⚠️  {text}"
 
 
+_RESTRICTED_MEDIA_ERROR_MARKERS = (
+    "isn't available to everyone", "isn’t available to everyone", "certain audiences",
+    "this account is private", "login required", "sign in", "log in",
+    "age-restricted", "age restricted", "private video", "content isn't available",
+)
+
+def classify_media_error(error_str: str) -> str:
+    """Map a raw download error into a user-friendly message, without leaking provider internals."""
+    low = error_str.lower()
+    if any(marker in low for marker in _RESTRICTED_MEDIA_ERROR_MARKERS):
+        return "This content isn't available due to restrictions (private, age-restricted, or region-locked)."
+    return "Failed to download this media. The link may be broken or the content may have been removed."
+
+
 # ─── Translation Logic ────────────────────────────────────────────────────────
 
 async def translate_free(text: str, target_lang: str) -> str:
@@ -1462,6 +1476,21 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
             pass
 
 
+async def is_youtube_live(url: str) -> bool:
+    """Check whether a YouTube URL is a currently-active live stream via a plain page fetch (fast, no yt-dlp/GetPOT involved)."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US"},
+            )
+            if resp.status_code == 200:
+                return '"isLive":true' in resp.text
+    except Exception as e:
+        logger.warning(f"Failed to check live status for {url}: {e}")
+    return False
+
+
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect YouTube links in messages."""
     if not update.message or not update.message.text:
@@ -1487,6 +1516,12 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     # If it's a Short, download directly without button
     if "/shorts/" in yt_url.lower():
         await execute_youtube_download(update.message, yt_url, context)
+        return
+
+    # Live streams can't be downloaded — ignore the link entirely rather than
+    # showing a prompt that will just fail once clicked.
+    if await is_youtube_live(yt_url):
+        logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
     # For standard videos & live streams, show Inline Download Button
@@ -1793,7 +1828,7 @@ async def execute_generic_media_download(target_message, url: str, platform_name
         error_msg = str(e)
         logger.error(f"{platform_name} download failed for {url}: {type(e).__name__}: {e}")
         try:
-            await status_msg.edit_text(fmt_error(f"Failed to download {platform_name} media: {html.escape(error_msg)}"))
+            await status_msg.edit_text(fmt_error(classify_media_error(error_msg)))
         except Exception:
             pass
 
@@ -1904,7 +1939,7 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
     except Exception as e:
         logger.error(f"Instagram download failed for {url}: {type(e).__name__}: {e}")
         try:
-            await status_msg.edit_text(fmt_error(f"Failed to download Instagram media: {html.escape(str(e))}"))
+            await status_msg.edit_text(fmt_error(classify_media_error(str(e))))
         except Exception:
             pass
 

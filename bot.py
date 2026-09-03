@@ -1289,7 +1289,7 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
-async def download_youtube_video(url: str, output_dir: str) -> dict:
+async def download_youtube_video(url: str, output_dir: str, quality: int = 720) -> dict:
     """Download a YouTube video using optimized yt-dlp player clients with pytubefix fallback. Returns dict with filepath, title, duration."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
@@ -1304,8 +1304,8 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
         # Strategy 2: tv, android, ios fallback
         # Strategy 3: default auto-selection fallback
         # Multi-client strategy optimized for ultra-fast speed on datacenter IPs
-        # Format string prioritizes 720p pre-merged MP4 streams (skips ffmpeg processing completely & shrinks upload size)
-        fast_format = 'best[ext=mp4][height<=720]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best[height<=1080]/best'
+        # Format string prioritizes pre-merged MP4 streams at the requested height (skips ffmpeg processing completely & shrinks upload size)
+        fast_format = f'best[ext=mp4][height<={quality}]/bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}]/best'
         ydl_opts_list = [
             {
                 'outtmpl': output_template,
@@ -1333,7 +1333,7 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
             {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
-                'format': 'best[height<=720]/best',
+                'format': f'best[height<={quality}]/best',
                 'socket_timeout': 15,
                 'retries': 3,
                 'quiet': True,
@@ -1400,16 +1400,19 @@ async def download_youtube_video(url: str, output_dir: str) -> dict:
 
 
 
-async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality: int = 720) -> None:
     """Execute download and upload for YouTube video."""
     if not status_msg:
-        status_msg = await target_message.reply_text("⏳ Downloading YouTube video (720p)...")
+        status_msg = await target_message.reply_text(f"⏳ Downloading YouTube video ({quality}p)...")
     else:
-        await status_msg.edit_text("⏳ Downloading YouTube video (720p)...")
+        try:
+            await status_msg.edit_text(f"⏳ Downloading YouTube video ({quality}p)...")
+        except Exception:
+            pass  # e.g. text is already identical to the current status message
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            result = await download_youtube_video(yt_url, tmp_dir)
+            result = await download_youtube_video(yt_url, tmp_dir, quality=quality)
             filepath = result['filepath']
             title = result['title']
             duration = result.get('duration', 0)
@@ -1524,15 +1527,18 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
-    # For standard videos & live streams, show Inline Download Button
+    # For standard videos, offer a quality choice
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ Download Video (720p)", callback_data=f"ytdl:{yt_url}")]
+        [
+            InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
+            InlineKeyboardButton("⬇️ 1080p", callback_data=f"ytdl:1080:{yt_url}"),
+        ]
     ])
 
     caption = (
         f"📹 <b>YouTube Link Detected</b>\n"
         f"🔗 {yt_url}\n\n"
-        f"<i>Click below to download (720p, max 30 min / 50MB):</i>"
+        f"<i>Choose a quality to download (max 30 min / 50MB upload limit):</i>"
     )
 
     thumbnail_url = None
@@ -1575,11 +1581,12 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
     if not data or not data.startswith("ytdl:"):
         return
 
-    yt_url = data[5:]
-    logger.info(f"User clicked YouTube download button for: {yt_url}")
+    quality_str, _, yt_url = data[5:].partition(":")
+    quality = 1080 if quality_str == "1080" else 720
+    logger.info(f"User clicked YouTube download button ({quality}p) for: {yt_url}")
 
     status_msg = await query.message.reply_text("⏳ Starting YouTube download...")
-    await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg)
+    await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg, quality=quality)
 
 
 # ─── Twitch Clip Auto-Download ────────────────────────────────────────────────

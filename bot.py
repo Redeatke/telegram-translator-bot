@@ -510,6 +510,58 @@ async def translate_ai(text: str, target_lang: str) -> str:
         raise e
 
 
+async def translate_ai_word_aligned(text: str, target_lang: str) -> dict:
+    """Translate text and also split it into source->target word/phrase pairs in original
+    order, so differing grammar/word-order between the two languages is visible. Returns
+    {'translation': str, 'pairs': [(source, target), ...]}."""
+    if not has_ai or not ai_client:
+        raise ValueError("OpenRouter API key is not configured.")
+
+    lang_name = COMMON_LANGUAGES.get(target_lang, target_lang.upper())
+    prompt = (
+        f"Translate the following text into {lang_name} (ISO code: '{target_lang}'). "
+        f"Also split the source text into its natural words or short phrases, in their "
+        f"original order, and give the translation for each one — this shows how word "
+        f"order and grammar correspond between the two languages.\n\n"
+        f"Respond with ONLY valid JSON, no markdown fences, no explanation, in exactly this shape:\n"
+        f'{{"translation": "<full natural translation>", "pairs": [["<source word or phrase>", "<its translation>"], ...]}}\n\n'
+        f"Text to translate:\n{text}"
+    )
+
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: ai_client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a professional translation engine that also produces word-level alignments. Output only valid JSON, nothing else."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=1024,
+            )
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        translation = (data.get("translation") or "").strip()
+        pairs = [
+            (str(p[0]), str(p[1])) for p in (data.get("pairs") or [])
+            if isinstance(p, (list, tuple)) and len(p) == 2
+        ]
+        if not translation:
+            raise ValueError("Empty translation in AI response.")
+        return {"translation": translation, "pairs": pairs}
+    except Exception as e:
+        logger.error(f"AI Word-Aligned Translation Error: {e}")
+        raise e
+
+
 async def translate_image_ai(image_bytes: bytes, target_lang: str) -> str:
     """Read and translate any text found in an image using OpenRouter AI vision. Returns 'NO_TEXT_FOUND' if none."""
     if not has_ai or not ai_client:
@@ -1351,13 +1403,20 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     engine = config["engine"]
     translated_text = None
     fallback = False
+    aligned_pairs = []
 
     src_lang = detect_language_code(text_to_translate)
+    is_short = len(text_to_translate.split()) <= 10
 
-    # 1. Try AI engine
+    # 1. Try AI engine (short texts also get a word-by-word alignment)
     if engine == "ai" and has_ai:
         try:
-            translated_text = await translate_ai(text_to_translate, target_lang)
+            if is_short:
+                result = await translate_ai_word_aligned(text_to_translate, target_lang)
+                translated_text = result["translation"]
+                aligned_pairs = result["pairs"]
+            else:
+                translated_text = await translate_ai(text_to_translate, target_lang)
         except Exception as e:
             logger.error(f"AI translation failed: {e}. Falling back to free engine.")
             fallback = True
@@ -1374,6 +1433,9 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
     response_msg = fmt_translation(src_lang, target_lang, translated_text, fallback=fallback)
+    if aligned_pairs:
+        pair_lines = "\n".join(f"{html.escape(s)}: {html.escape(t)}" for s, t in aligned_pairs)
+        response_msg += f"\n\n<b>Word by word:</b>\n{pair_lines}"
 
     await update.message.reply_text(
         response_msg,

@@ -7,6 +7,7 @@ import tempfile
 import uuid
 import time
 import json
+import base64
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
@@ -506,6 +507,46 @@ async def translate_ai(text: str, target_lang: str) -> str:
         return translation
     except Exception as e:
         logger.error(f"AI Translation Error: {e}")
+        raise e
+
+
+async def translate_image_ai(image_bytes: bytes, target_lang: str) -> str:
+    """Read and translate any text found in an image using OpenRouter AI vision. Returns 'NO_TEXT_FOUND' if none."""
+    if not has_ai or not ai_client:
+        raise ValueError("OpenRouter API key is not configured.")
+
+    lang_name = COMMON_LANGUAGES.get(target_lang, target_lang.upper())
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    prompt = (
+        f"Read all text visible in this image and translate it into {lang_name} "
+        f"(ISO code: '{target_lang}'). Return ONLY the translated text, preserving "
+        f"line breaks between separate text elements, with no explanations or notes. "
+        f"If there is no readable text anywhere in the image, respond with exactly: NO_TEXT_FOUND"
+    )
+
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: ai_client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an OCR and translation engine. Output only the translated text, nothing else."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                    ]},
+                ],
+                temperature=0.1,
+                max_tokens=2048,
+            )
+        )
+        result = response.choices[0].message.content.strip()
+        if not result:
+            raise ValueError("Empty response received from AI.")
+        return result
+    except Exception as e:
+        logger.error(f"AI Image Translation Error: {e}")
         raise e
 
 
@@ -1212,6 +1253,57 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     config = get_user_config(user.id)
     target_lang = config["target"]
 
+    # Scenario A0: Reply to an image — read and translate any text found in it
+    if update.message.reply_to_message and update.message.reply_to_message.photo:
+        if context.args:
+            lang_candidate = context.args[0].lower().strip()
+            try:
+                GoogleTranslator(source="auto", target=lang_candidate)
+                target_lang = lang_candidate
+            except Exception:
+                pass
+
+        if config["engine"] != "ai" or not has_ai:
+            await update.message.reply_text(
+                fmt_error("Image translation requires the AI engine. Switch with /engine ai first."),
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+        try:
+            photo = update.message.reply_to_message.photo[-1]
+            tg_file = await context.bot.get_file(photo.file_id)
+            image_bytes = bytes(await tg_file.download_as_bytearray())
+            translated_text = await translate_image_ai(image_bytes, target_lang)
+        except Exception as e:
+            logger.error(f"Image translation failed: {e}")
+            await update.message.reply_text(
+                fmt_error("Couldn't translate text from this image. Please try again."),
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        if translated_text.strip() == "NO_TEXT_FOUND":
+            await update.message.reply_text(
+                fmt_warning("No readable text was found in this image."),
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        target_name = COMMON_LANGUAGES.get(target_lang, target_lang.upper())
+        await update.message.reply_photo(
+            photo=photo.file_id,
+            caption=f"🖼️ <b>Image Translation</b> (→ {html.escape(target_name)}):\n{html.escape(translated_text)}",
+            parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+
     # Scenario A: Reply to a message
     if update.message.reply_to_message and update.message.reply_to_message.text:
         text_to_translate = update.message.reply_to_message.text
@@ -1242,6 +1334,9 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"  <b>Reply mode:</b>\n"
                 f"  Reply to a message with /tr\n"
                 f"  or <code>/tr es</code> for a specific language\n"
+                f"\n"
+                f"  <b>Image mode (AI engine only):</b>\n"
+                f"  Reply to a photo with /tr to translate any text in it\n"
                 f"\n"
                 f"  <b>Inline mode:</b>\n"
                 f"  <code>/tr es hello world</code>\n"
@@ -2881,7 +2976,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         ("start", "Start the bot and see configuration"),
         ("downloads", "Configure media download permissions (Admins)"),
-        ("tr", "Translate text (reply or inline)"),
+        ("tr", "Translate text, or an image (reply)"),
         ("target", "Set translation target language"),
         ("engine", "Switch AI / Free engine"),
         ("status", "Show settings and status"),

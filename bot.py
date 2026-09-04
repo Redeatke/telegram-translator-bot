@@ -570,10 +570,16 @@ async def translate_image_ai(image_bytes: bytes, target_lang: str) -> str:
     lang_name = COMMON_LANGUAGES.get(target_lang, target_lang.upper())
     b64_image = base64.b64encode(image_bytes).decode("ascii")
     prompt = (
-        f"Read all text visible in this image and translate it into {lang_name} "
-        f"(ISO code: '{target_lang}'). Return ONLY the translated text, preserving "
-        f"line breaks between separate text elements, with no explanations or notes. "
-        f"If there is no readable text anywhere in the image, respond with exactly: NO_TEXT_FOUND"
+        f"Read all text visible in this image, exactly as laid out (do not reorder "
+        f"elements into a standard/memorized sequence such as alphabetical order — "
+        f"transcribe them in the order and position they actually appear). Translate "
+        f"it into {lang_name} (ISO code: '{target_lang}'). If an element is a single "
+        f"isolated letter or character rather than a full word (e.g. an alphabet "
+        f"chart or keyboard key), give its phonetic name/sound instead of leaving it "
+        f"unchanged, since individual letters have no direct translation. Return ONLY "
+        f"the translated text, preserving line breaks between separate text elements, "
+        f"with no explanations or notes. If there is no readable text anywhere in the "
+        f"image, respond with exactly: NO_TEXT_FOUND"
     )
 
     try:

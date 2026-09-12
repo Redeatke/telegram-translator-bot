@@ -20,6 +20,19 @@ RUN git clone --single-branch --branch 2.0.0 \
     npm ci && \
     npx tsc
 
+# Prime Deno's and Node's compile/module caches by running the provider script
+# once at build time (generous time budget here vs. none at request time), so
+# the first real request on a slow/throttled host isn't paying a cold-start
+# TS-compile cost against the plugin's internal timeout.
+RUN cd /root/bgutil-ytdlp-pot-provider/server && \
+    DENO_NO_UPDATE_CHECK=1 DENO_NO_PROMPT=1 deno run \
+      --allow-env --allow-net \
+      --allow-ffi=/root/bgutil-ytdlp-pot-provider/server/node_modules \
+      --allow-write=/root/.cache/bgutil-ytdlp-pot-provider \
+      --allow-read=/root/.cache/bgutil-ytdlp-pot-provider,/root/bgutil-ytdlp-pot-provider/server/node_modules \
+      src/generate_once.ts --version && \
+    node build/generate_once.js --version
+
 WORKDIR /app
 
 # Install Python dependencies

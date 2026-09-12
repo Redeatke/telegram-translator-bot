@@ -59,6 +59,19 @@ try:
 except ImportError:
     has_pytubefix = False
 
+# The bgutil PO Token provider's default timeouts (15s to check the script's
+# version, 20s to actually generate a token) are tuned for a fast local
+# machine. On a slow/CPU-throttled host, Deno's first-run TS compile alone
+# can exceed 15s, which raises an uncaught subprocess.TimeoutExpired that
+# aborts the whole yt-dlp strategy instead of just skipping the PO token.
+# Give it more headroom to actually finish instead of getting killed early.
+try:
+    from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
+    getpot_bgutil.BgUtilPTPBase._GETPOT_TIMEOUT = 45.0
+    getpot_bgutil_script.BgUtilScriptPTPBase._GET_SCRIPT_VSN_TIMEOUT = 45.0
+except ImportError:
+    pass
+
 # Load environment variables
 load_dotenv(override=True)
 

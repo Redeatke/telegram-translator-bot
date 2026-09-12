@@ -1479,7 +1479,8 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
                 'concurrent_fragment_downloads': 4,
                 'socket_timeout': 15,
                 'retries': 3,
-                'quiet': True,
+                'quiet': not os.getenv('YT_DEBUG'),
+                'verbose': bool(os.getenv('YT_DEBUG')),
                 'nocheckcertificate': True,
             },
             {

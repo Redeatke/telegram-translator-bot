@@ -1517,11 +1517,18 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
             },
         ]
 
+        # Cookies are tried last, not first: once YouTube flags an account, its
+        # cookies stop being merely stale and start actively hurting requests —
+        # presenting them gets the "web"/"mweb" clients a LOGIN_REQUIRED wall
+        # that the same request sails through anonymously (PO token only). So
+        # the anonymous strategies above run first, and a cookie-attached retry
+        # of strategy 1 only kicks in afterwards, for genuinely account-gated
+        # videos where anonymous access was never going to work anyway.
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-            logger.info(f"Using cookies file for web strategies: {YOUTUBE_COOKIES_FILE}")
-            # Attach cookies to strategy 1 (web/mweb) and strategy 3 (default)
-            ydl_opts_list[0]['cookiefile'] = YOUTUBE_COOKIES_FILE
-            ydl_opts_list[2]['cookiefile'] = YOUTUBE_COOKIES_FILE
+            logger.info(f"Cookies file available as last-resort strategy: {YOUTUBE_COOKIES_FILE}")
+            cookie_retry = dict(ydl_opts_list[0])
+            cookie_retry['cookiefile'] = YOUTUBE_COOKIES_FILE
+            ydl_opts_list.append(cookie_retry)
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:

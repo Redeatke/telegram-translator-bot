@@ -174,6 +174,7 @@ DEFAULT_CHAT_CONFIG = {
     "twitch": True,
     "tiktok": True,
     "instagram": True,
+    "threads": True,
     "reddit": True,
     "auto_download": True,  # True = Auto-download; False = Prompt with button
 }
@@ -368,6 +369,13 @@ TIKTOK_URL_PATTERN = re.compile(
 
 INSTAGRAM_URL_PATTERN = re.compile(
     r'(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)',
+    re.IGNORECASE
+)
+
+# ─── Threads URL Pattern ──────────────────────────────────────────────────────
+
+THREADS_URL_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.)?threads\.(?:net|com)/@([A-Za-z0-9_.]+)/post/([A-Za-z0-9_-]+)',
     re.IGNORECASE
 )
 
@@ -2135,6 +2143,230 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
             pass
 
 
+# ─── Threads Media Handler ─────────────────────────────────────────────────────
+# Threads has no yt-dlp extractor and its post pages are login-walled for normal
+# browsers, but they're still server-rendered (with the same private media schema
+# Instagram uses) for the Googlebot crawler. We scrape that rendering directly.
+
+_THREADS_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+
+
+def _match_json_bracket(text: str, open_idx: int) -> int:
+    """Given the index of an opening '{' or '[' in `text`, return the index just
+    past its matching closing bracket, respecting JSON string/escape state."""
+    open_ch = text[open_idx]
+    close_ch = '}' if open_ch == '{' else ']'
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+    raise ValueError("No matching bracket found")
+
+
+def _nearest_marker(text: str, marker: str, anchor_idx: int, lo: int, hi: int) -> int:
+    """Return the index of the occurrence of `marker` within text[lo:hi] closest
+    to anchor_idx, or -1 if there is none."""
+    best_pos, best_dist = -1, None
+    start = lo
+    while True:
+        pos = text.find(marker, start, hi)
+        if pos == -1:
+            return best_pos
+        dist = abs(pos - anchor_idx)
+        if best_dist is None or dist < best_dist:
+            best_pos, best_dist = pos, dist
+        start = pos + 1
+
+
+def _parse_threads_page(text: str, code: str) -> dict:
+    """Pull the media items, caption, and author for one Threads post out of its
+    Googlebot-rendered page HTML."""
+    idx_code = text.find(f'"code":"{code}"')
+    if idx_code == -1:
+        raise Exception("This post isn't available (it may be private, deleted, or region-locked).")
+
+    lo, hi = max(0, idx_code - 80000), min(len(text), idx_code + 5000)
+
+    def _media_from_item(item: dict) -> dict | None:
+        vv = item.get("video_versions")
+        if vv:
+            return {"url": vv[0]["url"], "is_video": True}
+        iv2 = item.get("image_versions2")
+        if iv2 and iv2.get("candidates"):
+            return {"url": iv2["candidates"][0]["url"], "is_video": False}
+        return None
+
+    items = []
+    cm_pos = _nearest_marker(text, '"carousel_media":[', idx_code, lo, hi)
+    if cm_pos != -1:
+        arr_start = cm_pos + len('"carousel_media":')
+        carousel = json.loads(text[arr_start:_match_json_bracket(text, arr_start)])
+        for entry in carousel:
+            media = _media_from_item(entry)
+            if media:
+                items.append(media)
+    else:
+        vid_pos = _nearest_marker(text, '"video_versions":[', idx_code, lo, hi)
+        img_pos = _nearest_marker(text, '"image_versions2":{', idx_code, lo, hi)
+        if vid_pos != -1 and (img_pos == -1 or abs(vid_pos - idx_code) <= abs(img_pos - idx_code)):
+            arr_start = vid_pos + len('"video_versions":')
+            video_versions = json.loads(text[arr_start:_match_json_bracket(text, arr_start)])
+            if video_versions:
+                items.append({"url": video_versions[0]["url"], "is_video": True})
+        elif img_pos != -1:
+            obj_start = img_pos + len('"image_versions2":')
+            image_versions2 = json.loads(text[obj_start:_match_json_bracket(text, obj_start)])
+            if image_versions2.get("candidates"):
+                items.append({"url": image_versions2["candidates"][0]["url"], "is_video": False})
+
+    title = None
+    cap_pos = _nearest_marker(text, '"caption":{"text":"', idx_code, lo, hi)
+    if cap_pos != -1:
+        obj_start = cap_pos + len('"caption":')
+        try:
+            caption = json.loads(text[obj_start:_match_json_bracket(text, obj_start)])
+            title = caption.get("text")
+        except Exception:
+            pass
+
+    return {"items": items, "title": title}
+
+
+async def download_threads_media(url: str, username: str, code: str) -> dict:
+    """Fetch a Threads post's media items by scraping its Googlebot-rendered page."""
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        resp = await client.get(url, headers={"User-Agent": _THREADS_UA})
+    if "error=invalid_post" in str(resp.url) or resp.status_code == 404:
+        raise Exception("This post isn't available (it may be private, deleted, or region-locked).")
+    data = _parse_threads_page(resp.text, code)
+    data["uploader"] = username
+    return data
+
+
+async def execute_threads_download(target_message, url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+    """Download and upload Threads media, including photo-only and multi-item posts."""
+    if not status_msg:
+        status_msg = await target_message.reply_text("⏳ Downloading Threads media...", reply_to_message_id=target_message.message_id)
+    else:
+        try:
+            await status_msg.edit_text("⏳ Downloading Threads media...")
+        except Exception:
+            pass
+
+    try:
+        match = THREADS_URL_PATTERN.search(url)
+        if not match:
+            raise Exception("Invalid Threads link.")
+        username, code = match.group(1), match.group(2)
+
+        data = await download_threads_media(url, username, code)
+        items = data["items"]
+        if not items:
+            raise Exception("No media found in this post.")
+
+        caption_text = html.escape(data["title"]) if data.get("title") else html.escape(data["uploader"])
+        caption = (
+            f"{caption_text}\n"
+            f"👤 <i>Source: @{html.escape(data['uploader'])}</i>\n\n"
+            f"🔗 <a href='{url}'>Threads Link</a>"
+        )
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
+
+        await status_msg.edit_text("📤 Uploading to Telegram...")
+
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        media_items = []
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for item in items[:10]:
+                try:
+                    resp = await client.get(item['url'], headers=headers)
+                    if resp.status_code == 200 and len(resp.content) <= 50 * 1024 * 1024:
+                        media_items.append({'bytes': resp.content, 'is_video': item['is_video']})
+                except Exception as fetch_err:
+                    logger.warning(f"Failed to fetch Threads media item: {fetch_err}")
+
+        if not media_items:
+            raise Exception("Failed to download any media from this post.")
+
+        if len(media_items) == 1:
+            m = media_items[0]
+            if m['is_video']:
+                await target_message.reply_video(
+                    video=m['bytes'], caption=caption, parse_mode="HTML",
+                    supports_streaming=True, reply_to_message_id=target_message.message_id
+                )
+            else:
+                await target_message.reply_photo(
+                    photo=m['bytes'], caption=caption, parse_mode="HTML",
+                    reply_to_message_id=target_message.message_id
+                )
+        else:
+            media_group = []
+            for i, m in enumerate(media_items):
+                kwargs = {'caption': caption, 'parse_mode': 'HTML'} if i == 0 else {}
+                if m['is_video']:
+                    media_group.append(InputMediaVideo(media=m['bytes'], **kwargs))
+                else:
+                    media_group.append(InputMediaPhoto(media=m['bytes'], **kwargs))
+            await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"Threads download failed for {url}: {type(e).__name__}: {e}")
+        try:
+            await status_msg.edit_text(fmt_error(classify_media_error(str(e))))
+        except Exception:
+            pass
+
+
+async def handle_threads_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect Threads links."""
+    if not update.message or not update.message.text: return
+    user = update.effective_user
+    if user and is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
+
+    text = update.message.text.strip()
+    match = THREADS_URL_PATTERN.search(text)
+    if not match: return
+    url = match.group(0)
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "threads"):
+        return
+
+    auto_dl = get_download_mode(chat_id)
+    if not auto_dl:
+        short_id = store_pending_download(url, "Threads")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download Threads Media", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text("🧵 <b>Threads Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
+        return
+
+    await execute_threads_download(update.message, url, context)
+
+
 async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect TikTok links."""
     if not update.message or not update.message.text: return
@@ -2473,6 +2705,8 @@ async def handle_pending_download_button(update: Update, context: ContextTypes.D
     status_msg = await query.message.reply_text(f"⏳ Starting {platform} download...")
     if platform == "Instagram":
         await execute_instagram_download(query.message, url, context, status_msg=status_msg)
+    elif platform == "Threads":
+        await execute_threads_download(query.message, url, context, status_msg=status_msg)
     else:
         await execute_generic_media_download(query.message, url, platform, context, status_msg=status_msg)
 
@@ -2864,6 +3098,9 @@ def build_downloads_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(btn_txt("instagram", "Instagram"), callback_data="dltog:instagram"),
+            InlineKeyboardButton(btn_txt("threads", "Threads"), callback_data="dltog:threads"),
+        ],
+        [
             InlineKeyboardButton(btn_txt("reddit", "Reddit"), callback_data="dltog:reddit"),
         ],
         [
@@ -2887,6 +3124,7 @@ def build_downloads_text(chat_id: int, chat_title: str = "") -> str:
         ("Twitch Clips", cfg.get("twitch", True)),
         ("TikTok", cfg.get("tiktok", True)),
         ("Instagram", cfg.get("instagram", True)),
+        ("Threads", cfg.get("threads", True)),
         ("Reddit", cfg.get("reddit", True)),
     ]
 
@@ -2900,11 +3138,13 @@ def build_downloads_text(chat_id: int, chat_title: str = "") -> str:
         else "🔘 <b>Button-Prompt Mode</b>\n<i>Links display a download button before fetching media.</i>"
     )
 
+    rows = [status_lines[i:i + 3] for i in range(0, len(status_lines), 3)]
+    permissions_block = "\n".join("  •  ".join(row) for row in rows)
+
     return (
         f"⚙️ <b>Media Download Settings</b>{title_str}\n\n"
         f"<b>Platform Permissions:</b>\n"
-        + "  •  ".join(status_lines[:3]) + "\n"
-        + "  •  ".join(status_lines[3:]) + "\n\n"
+        f"{permissions_block}\n\n"
         f"<b>Current Download Mode:</b>\n{mode_desc}\n\n"
         f"<i>Group Administrators can click the buttons below to toggle permissions or modes live.</i>"
     )
@@ -3020,7 +3260,7 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
                 f"👋 <b>Hello {html.escape(chat.title or 'everyone')}!</b>\n\n"
                 f"I'm your <b>Translator & Media Downloader Bot</b>!\n"
                 f"• Auto-translates text in private chats\n"
-                f"• Downloads video/media from <b>YouTube, Twitter, Twitch Clips, TikTok, Instagram, and Reddit</b>\n\n"
+                f"• Downloads video/media from <b>YouTube, Twitter, Twitch Clips, TikTok, Instagram, Threads, and Reddit</b>\n\n"
                 f"<i>Group Administrators can run /downloads to configure platform permissions.</i>"
             ),
             parse_mode="HTML",
@@ -3165,6 +3405,11 @@ def main() -> None:
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(INSTAGRAM_URL_PATTERN),
         handle_instagram_message
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(THREADS_URL_PATTERN),
+        handle_threads_message
     ))
 
     application.add_handler(MessageHandler(

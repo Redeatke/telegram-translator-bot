@@ -2189,19 +2189,57 @@ def _match_json_bracket(text: str, open_idx: int) -> int:
     raise ValueError("No matching bracket found")
 
 
-def _nearest_marker(text: str, marker: str, anchor_idx: int, lo: int, hi: int) -> int:
-    """Return the index of the occurrence of `marker` within text[lo:hi] closest
-    to anchor_idx, or -1 if there is none."""
-    best_pos, best_dist = -1, None
-    start = lo
-    while True:
-        pos = text.find(marker, start, hi)
-        if pos == -1:
-            return best_pos
-        dist = abs(pos - anchor_idx)
-        if best_dist is None or dist < best_dist:
-            best_pos, best_dist = pos, dist
-        start = pos + 1
+_THREADS_CODE_FIELD = re.compile(r'"code":"([^"]+)"')
+
+
+def _find_in_post_scope(text: str, marker: str, idx_code: int, code: str, radius: int = 200000) -> int:
+    """Return the occurrence of `marker` closest to idx_code that still belongs to
+    *this* post, or -1 if none does.
+
+    A video post's own cover-frame thumbnail (`image_versions2`) always sits a few
+    characters from its "code" field, while the actual `video_versions` can be tens
+    of thousands of characters away on the other side of an inlined DASH manifest --
+    so nearest-by-distance alone would wrongly pick the thumbnail. Instead we require
+    that no *other* post's "code" field falls between idx_code and the candidate,
+    which keeps the search anchored to this post's own slice of the page no matter
+    how far apart its fields land.
+    """
+    lo, hi = max(0, idx_code - radius), min(len(text), idx_code + radius)
+    candidates = sorted(
+        (m.start() + lo for m in re.finditer(re.escape(marker), text[lo:hi])),
+        key=lambda p: abs(p - idx_code)
+    )
+    for pos in candidates:
+        seg_start, seg_end = (idx_code, pos) if pos > idx_code else (pos, idx_code)
+        if all(m.group(1) == code for m in _THREADS_CODE_FIELD.finditer(text, seg_start, seg_end)):
+            return pos
+    return -1
+
+
+def _find_carousel_media_array(text: str, idx_code: int, radius: int = 200000):
+    """Return (arr_start, arr_end) for this post's own `carousel_media` array, or
+    None if it has none.
+
+    Carousel items carry their own "code" fields (each is individually
+    addressable), so `_find_in_post_scope`'s foreign-code check can't be used here
+    -- it would reject the real array because of its own nested codes. Instead we
+    rely on this schema's fixed field order: the array closes immediately before
+    this post's own "code" field, separated only by a comma.
+    """
+    lo = max(0, idx_code - radius)
+    candidates = sorted(
+        (m.start() + lo for m in re.finditer(r'"carousel_media":\[', text[lo:idx_code])),
+        key=lambda p: idx_code - p
+    )
+    for pos in candidates:
+        arr_start = pos + len('"carousel_media":')
+        try:
+            arr_end = _match_json_bracket(text, arr_start)
+        except ValueError:
+            continue
+        if text[arr_end:idx_code] == ',':
+            return arr_start, arr_end
+    return None
 
 
 def _parse_threads_page(text: str, code: str) -> dict:
@@ -2210,8 +2248,6 @@ def _parse_threads_page(text: str, code: str) -> dict:
     idx_code = text.find(f'"code":"{code}"')
     if idx_code == -1:
         raise Exception("This post isn't available (it may be private, deleted, or region-locked).")
-
-    lo, hi = max(0, idx_code - 80000), min(len(text), idx_code + 5000)
 
     def _media_from_item(item: dict) -> dict | None:
         vv = item.get("video_versions")
@@ -2223,30 +2259,35 @@ def _parse_threads_page(text: str, code: str) -> dict:
         return None
 
     items = []
-    cm_pos = _nearest_marker(text, '"carousel_media":[', idx_code, lo, hi)
-    if cm_pos != -1:
-        arr_start = cm_pos + len('"carousel_media":')
-        carousel = json.loads(text[arr_start:_match_json_bracket(text, arr_start)])
+    carousel_bounds = _find_carousel_media_array(text, idx_code)
+    if carousel_bounds:
+        arr_start, arr_end = carousel_bounds
+        carousel = json.loads(text[arr_start:arr_end])
         for entry in carousel:
             media = _media_from_item(entry)
             if media:
                 items.append(media)
+        caption_scope_end = arr_start
     else:
-        vid_pos = _nearest_marker(text, '"video_versions":[', idx_code, lo, hi)
-        img_pos = _nearest_marker(text, '"image_versions2":{', idx_code, lo, hi)
-        if vid_pos != -1 and (img_pos == -1 or abs(vid_pos - idx_code) <= abs(img_pos - idx_code)):
+        # A video post always carries its own cover-frame image_versions2 too, so
+        # video takes priority whenever both are present -- it's the real content.
+        vid_pos = _find_in_post_scope(text, '"video_versions":[', idx_code, code)
+        if vid_pos != -1:
             arr_start = vid_pos + len('"video_versions":')
             video_versions = json.loads(text[arr_start:_match_json_bracket(text, arr_start)])
             if video_versions:
                 items.append({"url": video_versions[0]["url"], "is_video": True})
-        elif img_pos != -1:
-            obj_start = img_pos + len('"image_versions2":')
-            image_versions2 = json.loads(text[obj_start:_match_json_bracket(text, obj_start)])
-            if image_versions2.get("candidates"):
-                items.append({"url": image_versions2["candidates"][0]["url"], "is_video": False})
+        else:
+            img_pos = _find_in_post_scope(text, '"image_versions2":{', idx_code, code)
+            if img_pos != -1:
+                obj_start = img_pos + len('"image_versions2":')
+                image_versions2 = json.loads(text[obj_start:_match_json_bracket(text, obj_start)])
+                if image_versions2.get("candidates"):
+                    items.append({"url": image_versions2["candidates"][0]["url"], "is_video": False})
+        caption_scope_end = idx_code
 
     title = None
-    cap_pos = _nearest_marker(text, '"caption":{"text":"', idx_code, lo, hi)
+    cap_pos = _find_in_post_scope(text, '"caption":{"text":"', caption_scope_end, code)
     if cap_pos != -1:
         obj_start = cap_pos + len('"caption":')
         try:

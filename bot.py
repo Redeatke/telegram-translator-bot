@@ -373,9 +373,18 @@ INSTAGRAM_URL_PATTERN = re.compile(
 )
 
 # ─── Threads URL Pattern ──────────────────────────────────────────────────────
+# Matches both full post links (/@user/post/code) and the short links the
+# Threads app's native Share button generates (/share/code or /t/code), which
+# redirect to the full form and carry no username of their own.
 
 THREADS_URL_PATTERN = re.compile(
-    r'(?:https?://)?(?:www\.)?threads\.(?:net|com)/@([A-Za-z0-9_.]+)/post/([A-Za-z0-9_-]+)',
+    r'(?:https?://)?(?:www\.)?threads\.(?:net|com)/(?:@[A-Za-z0-9_.]+/post/[A-Za-z0-9_-]+|share/[A-Za-z0-9_-]+|t/[A-Za-z0-9_-]+)',
+    re.IGNORECASE
+)
+
+# Extracts {username, code} from a resolved/canonical Threads post URL.
+THREADS_CANONICAL_PATTERN = re.compile(
+    r'threads\.(?:net|com)/@([A-Za-z0-9_.]+)/post/([A-Za-z0-9_-]+)',
     re.IGNORECASE
 )
 
@@ -2249,14 +2258,25 @@ def _parse_threads_page(text: str, code: str) -> dict:
     return {"items": items, "title": title}
 
 
-async def download_threads_media(url: str, username: str, code: str) -> dict:
-    """Fetch a Threads post's media items by scraping its Googlebot-rendered page."""
+async def download_threads_media(url: str) -> dict:
+    """Fetch a Threads post's media items by scraping its Googlebot-rendered page.
+
+    `url` may be a full post link or a short /share/ or /t/ link -- either way,
+    the username and post code are read off the final redirected URL rather
+    than the input, since share links carry no username of their own.
+    """
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         resp = await client.get(url, headers={"User-Agent": _THREADS_UA})
-    if "error=invalid_post" in str(resp.url) or resp.status_code == 404:
+    resolved_url = str(resp.url)
+    if "error=invalid_post" in resolved_url or resp.status_code == 404:
         raise Exception("This post isn't available (it may be private, deleted, or region-locked).")
+    canonical = THREADS_CANONICAL_PATTERN.search(resolved_url)
+    if not canonical:
+        raise Exception("This post isn't available (it may be private, deleted, or region-locked).")
+    username, code = canonical.group(1), canonical.group(2)
     data = _parse_threads_page(resp.text, code)
     data["uploader"] = username
+    data["url"] = resolved_url.split("?")[0]
     return data
 
 
@@ -2271,12 +2291,7 @@ async def execute_threads_download(target_message, url: str, context: ContextTyp
             pass
 
     try:
-        match = THREADS_URL_PATTERN.search(url)
-        if not match:
-            raise Exception("Invalid Threads link.")
-        username, code = match.group(1), match.group(2)
-
-        data = await download_threads_media(url, username, code)
+        data = await download_threads_media(url)
         items = data["items"]
         if not items:
             raise Exception("No media found in this post.")
@@ -2285,7 +2300,7 @@ async def execute_threads_download(target_message, url: str, context: ContextTyp
         caption = (
             f"{caption_text}\n"
             f"👤 <i>Source: @{html.escape(data['uploader'])}</i>\n\n"
-            f"🔗 <a href='{url}'>Threads Link</a>"
+            f"🔗 <a href='{data['url']}'>Threads Link</a>"
         )
         if len(caption) > 1024:
             caption = caption[:1020] + "…"

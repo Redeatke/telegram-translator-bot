@@ -490,18 +490,58 @@ def classify_media_error(error_str: str) -> str:
 
 # ─── Translation Logic ────────────────────────────────────────────────────────
 
+async def _translate_google_direct(text: str, target_lang: str) -> str:
+    """Translate text by calling Google Translate's free web API directly via httpx.
+    This bypasses deep-translator and is more resilient to library-level breakage."""
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": target_lang,
+        "dt": "t",
+        "q": text,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, params=params, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        # Response is a nested list: [[['translated text', 'source text', ...], ...], ...]
+        translated_parts = []
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            for part in data[0]:
+                if isinstance(part, list) and part:
+                    translated_parts.append(str(part[0]))
+        result = "".join(translated_parts)
+        if not result:
+            raise ValueError("Empty translation response from Google API")
+        return result
+
+
 async def translate_free(text: str, target_lang: str) -> str:
-    """Translate text using deep-translator (Google Translate free backend)."""
+    """Translate text using deep-translator first, falling back to direct Google API."""
     loop = asyncio.get_running_loop()
+    # Attempt 1: deep-translator library
     try:
         translated = await loop.run_in_executor(
             None,
             lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
         )
-        return translated
+        if translated:
+            return translated
     except Exception as e:
-        logger.error(f"Free Translation Error: {e}")
-        raise e
+        logger.warning(f"deep-translator failed, trying direct Google API: {e}")
+
+    # Attempt 2: direct httpx call to Google Translate
+    try:
+        translated = await _translate_google_direct(text, target_lang)
+        return translated
+    except Exception as e2:
+        logger.error(f"Direct Google Translate API also failed: {e2}")
+        raise e2
 
 
 async def translate_ai(text: str, target_lang: str) -> str:
@@ -1528,6 +1568,7 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': f'best[height<={quality}]/best',
+                'js_runtimes': {'deno': {}, 'node': {}},
                 'socket_timeout': 15,
                 'retries': 3,
                 'quiet': True,

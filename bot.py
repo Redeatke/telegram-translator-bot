@@ -158,17 +158,23 @@ elif os.path.exists("cookies.txt"):
 # Log yt-dlp version
 logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
 
-# ─── YouTube Proxy Setup ──────────────────────────────────────────────────────
-# Route YouTube downloads through a residential proxy to bypass datacenter IP
-# blocks. Set YOUTUBE_PROXY to an HTTP/SOCKS5 proxy URL in .env, e.g.:
+# ─── YouTube Proxy / Relay Setup ──────────────────────────────────────────────
+# Option 1: Route yt-dlp through a residential proxy (SOCKS5 or HTTP CONNECT)
 #   YOUTUBE_PROXY=http://0.tcp.us.ngrok.io:12345
 #   YOUTUBE_PROXY=socks5://user:pass@proxy.example.com:1080
+#
+# Option 2: Use a home relay API (run home_proxy.py on your PC + ngrok http)
+#   YOUTUBE_RELAY_URL=https://abc123.ngrok-free.app
 
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
-if YOUTUBE_PROXY:
+YOUTUBE_RELAY_URL = os.getenv("YOUTUBE_RELAY_URL", "").strip().rstrip("/") or None
+
+if YOUTUBE_RELAY_URL:
+    logger.info(f"YouTube relay configured: {YOUTUBE_RELAY_URL}")
+elif YOUTUBE_PROXY:
     logger.info(f"YouTube proxy configured: {YOUTUBE_PROXY}")
 else:
-    logger.info("No YouTube proxy configured (YOUTUBE_PROXY not set).")
+    logger.info("No YouTube proxy/relay configured.")
 
 # ─── User State ───────────────────────────────────────────────────────────────
 
@@ -1534,8 +1540,69 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
+async def download_youtube_via_relay(url: str, output_dir: str, quality: int = 720) -> dict:
+    """Download a YouTube video via the home relay API. The relay runs on a
+    residential IP and streams the file back to us."""
+    relay_auth = os.getenv("RELAY_AUTH", "").strip()
+    headers = {"Content-Type": "application/json"}
+    if relay_auth:
+        headers["Authorization"] = f"Bearer {relay_auth}"
+
+    # ngrok free tier requires this header to skip the browser warning page
+    headers["ngrok-skip-browser-warning"] = "true"
+
+    logger.info(f"Requesting YouTube relay download: {url} via {YOUTUBE_RELAY_URL}")
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        # Step 1: Ask the relay to download the video
+        resp = await client.post(
+            f"{YOUTUBE_RELAY_URL}/download",
+            json={"url": url, "quality": quality},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "error" in data:
+            raise Exception(f"Relay error: {data['error']}")
+
+        download_path = data["download_url"]
+        title = data.get("title", "Video")
+        duration = data.get("duration", 0)
+
+        # Step 2: Stream the file from the relay to local disk
+        logger.info(f"Streaming file from relay: {download_path} ({data.get('file_size', 0)} bytes)")
+        file_resp = await client.get(
+            f"{YOUTUBE_RELAY_URL}{download_path}",
+            headers=headers,
+        )
+        file_resp.raise_for_status()
+
+        local_path = os.path.join(output_dir, data["filename"])
+        with open(local_path, "wb") as f:
+            f.write(file_resp.content)
+
+        if os.path.getsize(local_path) == 0:
+            raise Exception("Relay returned empty file")
+
+        logger.info(f"Relay download complete: {title} -> {local_path}")
+        return {
+            "filepath": local_path,
+            "title": title,
+            "duration": duration,
+        }
+
+
 async def download_youtube_video(url: str, output_dir: str, quality: int = 720) -> dict:
     """Download a YouTube video using optimized yt-dlp player clients with pytubefix fallback. Returns dict with filepath, title, duration."""
+
+    # Try home relay first if configured (residential IP bypass)
+    if YOUTUBE_RELAY_URL:
+        try:
+            return await download_youtube_via_relay(url, output_dir, quality)
+        except Exception as e:
+            logger.warning(f"Relay download failed, falling back to local yt-dlp: {e}")
+
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 

@@ -1,191 +1,249 @@
 #!/usr/bin/env python3
 """
-Lightweight HTTP CONNECT proxy for routing yt-dlp traffic through your home IP.
+YouTube Download Relay — runs on your home PC behind your residential IP.
 
-Usage:
-  1. Run this script on your home PC:
+The Render-hosted bot sends YouTube URLs to this API, which downloads them
+locally (through your home IP that YouTube doesn't block) and streams the
+file back to the bot.
+
+Setup:
+  1. Install dependencies:
+       pip install flask yt-dlp
+
+  2. Run this script:
        python home_proxy.py
 
-  2. Expose it via ngrok (free):
-       ngrok tcp 8899
+  3. In another terminal, start ngrok:
+       ngrok http 8899
 
-  3. Copy the ngrok forwarding address (e.g. tcp://0.tcp.us.ngrok.io:12345)
-     and set it as YOUTUBE_PROXY in your Render environment:
-       YOUTUBE_PROXY=http://0.tcp.us.ngrok.io:12345
+  4. Copy the ngrok HTTPS URL (e.g. https://abc123.ngrok-free.app)
+     and set it in Render's environment variables:
+       YOUTUBE_RELAY_URL=https://abc123.ngrok-free.app
 
-The bot's yt-dlp will then route YouTube downloads through your residential IP,
-bypassing YouTube's datacenter IP blocks.
+The bot will automatically use your home PC's residential IP for YouTube
+downloads, bypassing datacenter IP blocks.
 """
 
-import socket
-import threading
-import select
-import logging
-import sys
 import os
+import sys
+import json
+import uuid
+import time
+import shutil
+import logging
+import tempfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 HOST = "0.0.0.0"
-PORT = int(os.getenv("PROXY_PORT", "8899"))
-BUFFER_SIZE = 65536
-AUTH_TOKEN = os.getenv("PROXY_AUTH", "")  # Optional: set to require auth
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
+PORT = int(os.getenv("RELAY_PORT", "8899"))
+AUTH_TOKEN = os.getenv("RELAY_AUTH", "")  # Optional: set to require auth
+MAX_DURATION = 1800  # 30 min max video
+CLEANUP_AFTER = 300  # Delete temp files after 5 min
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("home_proxy")
+logger = logging.getLogger("yt_relay")
 
+# ─── Temp file cleanup ───────────────────────────────────────────────────────
 
-def pipe(sock_a, sock_b):
-    """Bidirectionally copy data between two sockets until one closes."""
-    try:
-        while True:
-            readable, _, _ = select.select([sock_a, sock_b], [], [], 60)
-            if not readable:
-                break  # Timeout — connection idle
-            for sock in readable:
-                data = sock.recv(BUFFER_SIZE)
-                if not data:
-                    return
-                target = sock_b if sock is sock_a else sock_a
-                target.sendall(data)
-    except (OSError, BrokenPipeError, ConnectionResetError):
-        pass
+_temp_files = {}  # {filepath: created_timestamp}
 
+def cleanup_old_files():
+    """Periodically remove downloaded temp files."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        to_remove = [f for f, t in _temp_files.items() if now - t > CLEANUP_AFTER]
+        for f in to_remove:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+                _temp_files.pop(f, None)
+                logger.info(f"Cleaned up temp file: {f}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up {f}: {e}")
 
-def handle_client(client_sock, client_addr):
-    """Handle one incoming proxy request."""
-    try:
-        request = b""
-        while b"\r\n\r\n" not in request:
-            chunk = client_sock.recv(4096)
-            if not chunk:
-                return
-            request += chunk
+threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-        first_line = request.split(b"\r\n")[0].decode("utf-8", errors="replace")
-        parts = first_line.split()
-        if len(parts) < 3:
-            client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+# ─── HTTP Request Handler ────────────────────────────────────────────────────
+
+class RelayHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, format, *args):
+        logger.info(f"{self.client_address[0]} - {format % args}")
+
+    def _send_json(self, status, data):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _check_auth(self):
+        if not AUTH_TOKEN:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth == f"Bearer {AUTH_TOKEN}" or auth == AUTH_TOKEN:
+            return True
+        self._send_json(401, {"error": "Unauthorized"})
+        return False
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        # Health check
+        if parsed.path == "/" or parsed.path == "/health":
+            self._send_json(200, {"status": "ok", "service": "yt-relay"})
             return
 
-        method = parts[0].upper()
-
-        # Optional auth check
-        if AUTH_TOKEN:
-            auth_ok = False
-            for line in request.split(b"\r\n"):
-                if line.lower().startswith(b"proxy-authorization:"):
-                    token = line.split(b":", 1)[1].strip().decode()
-                    if token == f"Basic {AUTH_TOKEN}" or token == AUTH_TOKEN:
-                        auth_ok = True
-                        break
-            if not auth_ok:
-                client_sock.sendall(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                    b"Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"
-                )
+        # File download (stream back to bot)
+        if parsed.path.startswith("/file/"):
+            if not self._check_auth():
+                return
+            filename = parsed.path[6:]  # strip /file/
+            filepath = os.path.join(tempfile.gettempdir(), f"ytrelay_{filename}")
+            if not os.path.exists(filepath):
+                self._send_json(404, {"error": "File not found"})
                 return
 
-        if method == "CONNECT":
-            # HTTPS tunneling — this is what yt-dlp uses
-            host_port = parts[1].decode()
-            if ":" in host_port:
-                host, port = host_port.rsplit(":", 1)
-                port = int(port)
-            else:
-                host, port = host_port, 443
+            file_size = os.path.getsize(filepath)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
 
-            logger.info(f"CONNECT {host}:{port} from {client_addr[0]}")
+            with open(filepath, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+            return
+
+        self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/download":
+            if not self._check_auth():
+                return
+
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len)
 
             try:
-                remote_sock = socket.create_connection((host, port), timeout=15)
-            except Exception as e:
-                logger.warning(f"Failed to connect to {host}:{port}: {e}")
-                client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                data = json.loads(body)
+            except Exception:
+                self._send_json(400, {"error": "Invalid JSON"})
                 return
 
-            client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            pipe(client_sock, remote_sock)
-            remote_sock.close()
+            url = data.get("url", "").strip()
+            quality = data.get("quality", 720)
 
-        else:
-            # Plain HTTP forwarding (GET, POST, etc.)
-            url = parts[1].decode()
-            if url.startswith("http://"):
-                url = url[7:]
-                slash = url.find("/")
-                if slash == -1:
-                    host_port, path = url, "/"
-                else:
-                    host_port, path = url[:slash], url[slash:]
-                if ":" in host_port:
-                    host, port = host_port.rsplit(":", 1)
-                    port = int(port)
-                else:
-                    host, port = host_port, 80
+            if not url:
+                self._send_json(400, {"error": "Missing 'url' field"})
+                return
 
-                logger.info(f"{method} {host}:{port}{path} from {client_addr[0]}")
+            logger.info(f"Download request: {url} (quality={quality})")
 
-                try:
-                    remote_sock = socket.create_connection((host, port), timeout=15)
-                except Exception as e:
-                    logger.warning(f"Failed to connect to {host}:{port}: {e}")
-                    client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                    return
+            try:
+                result = self._download_video(url, quality)
+                self._send_json(200, result)
+            except Exception as e:
+                logger.error(f"Download failed: {e}")
+                self._send_json(500, {"error": str(e)})
+            return
 
-                # Rewrite request to be a direct request (not proxy-style)
-                rewritten = f"{method} {path} HTTP/1.1\r\n".encode()
-                header_lines = request.split(b"\r\n")[1:]
-                rewritten += b"\r\n".join(header_lines)
-                remote_sock.sendall(rewritten)
-                pipe(client_sock, remote_sock)
-                remote_sock.close()
-            else:
-                client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        self._send_json(404, {"error": "Not found"})
 
-    except Exception as e:
-        logger.error(f"Error handling {client_addr}: {e}")
-    finally:
+    def _download_video(self, url, quality=720):
+        """Download a YouTube video using yt-dlp and return metadata + file reference."""
         try:
-            client_sock.close()
-        except Exception:
-            pass
+            import yt_dlp
+        except ImportError:
+            raise RuntimeError("yt-dlp is not installed. Run: pip install yt-dlp")
 
+        file_id = uuid.uuid4().hex
+        tmp_dir = tempfile.gettempdir()
+        output_template = os.path.join(tmp_dir, f"ytrelay_{file_id}.%(ext)s")
+
+        fast_format = (
+            f"best[ext=mp4][height<={quality}]/"
+            f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"best[height<={quality}]/best"
+        )
+
+        ydl_opts = {
+            "outtmpl": output_template,
+            "merge_output_format": "mp4",
+            "format": fast_format,
+            "socket_timeout": 15,
+            "retries": 3,
+            "quiet": True,
+            "nocheckcertificate": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+
+            # Find the actual file (ext may differ after merge)
+            if not os.path.exists(filepath):
+                base = os.path.splitext(filepath)[0]
+                for ext in [".mp4", ".webm", ".mkv"]:
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+
+            if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+                raise RuntimeError("Download produced no output file")
+
+            filename = os.path.basename(filepath)
+            file_size = os.path.getsize(filepath)
+
+            # Track for cleanup
+            _temp_files[filepath] = time.time()
+
+            logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
+
+            return {
+                "title": info.get("title", "Video"),
+                "duration": info.get("duration", 0),
+                "filename": filename,
+                "file_size": file_size,
+                "download_url": f"/file/{filename}",
+            }
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(50)
+    server = HTTPServer((HOST, PORT), RelayHandler)
 
-    logger.info(f"")
-    logger.info(f"  🏠 Home Proxy running on {HOST}:{PORT}")
-    logger.info(f"")
-    logger.info(f"  Next steps:")
-    logger.info(f"    1. Open another terminal and run:")
-    logger.info(f"       ngrok tcp {PORT}")
-    logger.info(f"    2. Copy the Forwarding address from ngrok")
-    logger.info(f"    3. Set YOUTUBE_PROXY in Render dashboard:")
-    logger.info(f"       YOUTUBE_PROXY=http://<ngrok-address>:<port>")
-    logger.info(f"")
+    print()
+    print("  =================================================")
+    print("  YouTube Download Relay")
+    print(f"  Running on http://{HOST}:{PORT}")
+    print("  =================================================")
+    print()
+    print("  Next steps:")
+    print(f"    1. Open another terminal and run:")
+    print(f"       ngrok http {PORT}")
+    print(f"    2. Copy the Forwarding HTTPS URL from ngrok")
+    print(f"    3. Set YOUTUBE_RELAY_URL in Render environment:")
+    print(f"       YOUTUBE_RELAY_URL=https://<ngrok-url>")
+    print()
 
     try:
-        while True:
-            client_sock, client_addr = server.accept()
-            thread = threading.Thread(
-                target=handle_client,
-                args=(client_sock, client_addr),
-                daemon=True,
-            )
-            thread.start()
+        server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Shutting down proxy...")
-        server.close()
+        logger.info("Shutting down relay...")
+        server.server_close()
 
 
 if __name__ == "__main__":

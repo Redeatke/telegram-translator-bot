@@ -108,7 +108,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             if not self._check_auth():
                 return
             filename = parsed.path[6:]  # strip /file/
-            filepath = os.path.join(tempfile.gettempdir(), f"ytrelay_{filename}")
+            filepath = os.path.join(tempfile.gettempdir(), filename)
+            if not os.path.exists(filepath):
+                filepath = os.path.join(tempfile.gettempdir(), f"ytrelay_{filename}")
             if not os.path.exists(filepath):
                 self._send_json(404, {"error": "File not found"})
                 return

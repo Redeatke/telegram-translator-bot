@@ -158,6 +158,18 @@ elif os.path.exists("cookies.txt"):
 # Log yt-dlp version
 logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
 
+# ─── YouTube Proxy Setup ──────────────────────────────────────────────────────
+# Route YouTube downloads through a residential proxy to bypass datacenter IP
+# blocks. Set YOUTUBE_PROXY to an HTTP/SOCKS5 proxy URL in .env, e.g.:
+#   YOUTUBE_PROXY=http://0.tcp.us.ngrok.io:12345
+#   YOUTUBE_PROXY=socks5://user:pass@proxy.example.com:1080
+
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
+if YOUTUBE_PROXY:
+    logger.info(f"YouTube proxy configured: {YOUTUBE_PROXY}")
+else:
+    logger.info("No YouTube proxy configured (YOUTUBE_PROXY not set).")
+
 # ─── User State ───────────────────────────────────────────────────────────────
 
 # In-memory user configs: { user_id: { "engine": "free" | "ai", "target": "en" } }
@@ -1574,6 +1586,12 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
                 'quiet': True,
             },
         ]
+
+        # Inject residential proxy into all strategies if configured
+        if YOUTUBE_PROXY:
+            logger.info(f"Using YouTube proxy for all strategies: {YOUTUBE_PROXY}")
+            for opts in ydl_opts_list:
+                opts['proxy'] = YOUTUBE_PROXY
 
         # Cookies are tried last, not first: once YouTube flags an account, its
         # cookies stop being merely stale and start actively hurting requests —

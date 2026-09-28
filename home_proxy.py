@@ -251,6 +251,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    HTTPServer.allow_reuse_address = True
     server = HTTPServer((HOST, PORT), RelayHandler)
 
     print()

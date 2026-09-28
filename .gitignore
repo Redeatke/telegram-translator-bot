@@ -13,3 +13,4 @@ setup_auto_refresh_task.bat
 test_*.py
 sample_*.png
 *.png
+*.exe

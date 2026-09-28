@@ -115,9 +115,11 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "File not found"})
                 return
 
-            file_size = os.path.getsize(filepath)
+            # Determine content type based on extension
+            _, ext = os.path.splitext(filepath)
+            content_type = "audio/mpeg" if ext.lower() == ".mp3" else "video/mp4"
             self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(file_size))
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
@@ -164,7 +166,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "Not found"})
 
     def _download_video(self, url, quality=720):
-        """Download a YouTube video using yt-dlp and return metadata + file reference."""
+        """Download a YouTube video or audio using yt-dlp and return metadata + file reference."""
         try:
             import yt_dlp
         except ImportError:
@@ -174,30 +176,53 @@ class RelayHandler(BaseHTTPRequestHandler):
         tmp_dir = tempfile.gettempdir()
         output_template = os.path.join(tmp_dir, f"ytrelay_{file_id}.%(ext)s")
 
-        fast_format = (
-            f"best[ext=mp4][height<={quality}]/"
-            f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best[height<={quality}]/best"
-        )
+        is_audio = str(quality).lower() in ("audio", "mp3")
 
-        ydl_opts = {
-            "outtmpl": output_template,
-            "merge_output_format": "mp4",
-            "format": fast_format,
-            "socket_timeout": 15,
-            "retries": 3,
-            "quiet": True,
-            "nocheckcertificate": True,
-        }
+        if is_audio:
+            ydl_opts = {
+                "outtmpl": output_template,
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+                "concurrent_fragment_downloads": 4,
+                "socket_timeout": 20,
+                "retries": 3,
+                "quiet": True,
+                "nocheckcertificate": True,
+            }
+        else:
+            try:
+                q_val = int(quality)
+            except (ValueError, TypeError):
+                q_val = 720
+
+            fast_format = (
+                f"best[ext=mp4][height<={q_val}]/"
+                f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
+            )
+
+            ydl_opts = {
+                "outtmpl": output_template,
+                "merge_output_format": "mp4",
+                "format": fast_format,
+                "concurrent_fragment_downloads": 4,
+                "socket_timeout": 20,
+                "retries": 3,
+                "quiet": True,
+                "nocheckcertificate": True,
+            }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
 
-            # Find the actual file (ext may differ after merge)
+            # Find the actual file (ext may differ after merge or audio extraction)
             if not os.path.exists(filepath):
                 base = os.path.splitext(filepath)[0]
-                for ext in [".mp4", ".webm", ".mkv"]:
+                for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
                     if os.path.exists(base + ext):
                         filepath = base + ext
                         break

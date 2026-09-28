@@ -1540,7 +1540,7 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ─── YouTube Auto-Download ────────────────────────────────────────────────────
 
-async def download_youtube_via_relay(url: str, output_dir: str, quality: int = 720) -> dict:
+async def download_youtube_via_relay(url: str, output_dir: str, quality=720) -> dict:
     """Download a YouTube video via the home relay API. The relay runs on a
     residential IP and streams the file back to us."""
     relay_auth = os.getenv("RELAY_AUTH", "").strip()
@@ -1551,7 +1551,7 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality: int = 7
     # ngrok free tier requires this header to skip the browser warning page
     headers["ngrok-skip-browser-warning"] = "true"
 
-    logger.info(f"Requesting YouTube relay download: {url} via {YOUTUBE_RELAY_URL}")
+    logger.info(f"Requesting YouTube relay download: {url} via {YOUTUBE_RELAY_URL} (quality={quality})")
 
     async with httpx.AsyncClient(timeout=300) as client:
         # Step 1: Ask the relay to download the video
@@ -1593,7 +1593,7 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality: int = 7
         }
 
 
-async def download_youtube_video(url: str, output_dir: str, quality: int = 720) -> dict:
+async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict:
     """Download a YouTube video using optimized yt-dlp player clients with pytubefix fallback. Returns dict with filepath, title, duration."""
 
     # Try home relay first if configured (residential IP bypass)
@@ -1609,50 +1609,90 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
     loop = asyncio.get_running_loop()
 
     def _download():
-        logger.info(f"Downloading YouTube video: {url}...")
+        logger.info(f"Downloading YouTube media: {url} (quality={quality})...")
 
-        # Multi-client strategy optimized for datacenter IPs and YouTube Shorts
-        # Strategy 1: web, mweb with cookies and JS challenge solvers (deno, node)
-        # Strategy 2: tv, android, ios fallback
-        # Strategy 3: default auto-selection fallback
-        # Multi-client strategy optimized for ultra-fast speed on datacenter IPs
-        # Format string prioritizes pre-merged MP4 streams at the requested height (skips ffmpeg processing completely & shrinks upload size)
-        fast_format = f'best[ext=mp4][height<={quality}]/bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}]/best'
-        ydl_opts_list = [
-            {
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'format': fast_format,
-                'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-                'js_runtimes': {'deno': {}, 'node': {}},
-                'concurrent_fragment_downloads': 4,
-                'socket_timeout': 15,
-                'retries': 3,
-                'quiet': not os.getenv('YT_DEBUG'),
-                'verbose': bool(os.getenv('YT_DEBUG')),
-                'nocheckcertificate': True,
-            },
-            {
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'format': fast_format,
-                'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
-                'js_runtimes': {'deno': {}, 'node': {}},
-                'concurrent_fragment_downloads': 4,
-                'socket_timeout': 15,
-                'retries': 3,
-                'quiet': True,
-            },
-            {
-                'outtmpl': output_template,
-                'merge_output_format': 'mp4',
-                'format': f'best[height<={quality}]/best',
-                'js_runtimes': {'deno': {}, 'node': {}},
-                'socket_timeout': 15,
-                'retries': 3,
-                'quiet': True,
-            },
-        ]
+        is_audio = str(quality).lower() in ("audio", "mp3")
+
+        if is_audio:
+            ydl_opts_list = [
+                {
+                    'outtmpl': output_template,
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'concurrent_fragment_downloads': 4,
+                    'socket_timeout': 15,
+                    'retries': 3,
+                    'quiet': not os.getenv('YT_DEBUG'),
+                    'verbose': bool(os.getenv('YT_DEBUG')),
+                    'nocheckcertificate': True,
+                },
+                {
+                    'outtmpl': output_template,
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
+                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'concurrent_fragment_downloads': 4,
+                    'socket_timeout': 15,
+                    'retries': 3,
+                    'quiet': True,
+                },
+            ]
+        else:
+            try:
+                q_val = int(quality)
+            except (ValueError, TypeError):
+                q_val = 720
+
+            fast_format = (
+                f'best[ext=mp4][height<={q_val}]/'
+                f'bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best'
+            )
+            ydl_opts_list = [
+                {
+                    'outtmpl': output_template,
+                    'merge_output_format': 'mp4',
+                    'format': fast_format,
+                    'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'concurrent_fragment_downloads': 4,
+                    'socket_timeout': 15,
+                    'retries': 3,
+                    'quiet': not os.getenv('YT_DEBUG'),
+                    'verbose': bool(os.getenv('YT_DEBUG')),
+                    'nocheckcertificate': True,
+                },
+                {
+                    'outtmpl': output_template,
+                    'merge_output_format': 'mp4',
+                    'format': fast_format,
+                    'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
+                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'concurrent_fragment_downloads': 4,
+                    'socket_timeout': 15,
+                    'retries': 3,
+                    'quiet': True,
+                },
+                {
+                    'outtmpl': output_template,
+                    'merge_output_format': 'mp4',
+                    'format': f'best[height<={q_val}]/best',
+                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'socket_timeout': 15,
+                    'retries': 3,
+                    'quiet': True,
+                },
+            ]
 
         # Inject residential proxy into all strategies if configured
         if YOUTUBE_PROXY:
@@ -1661,12 +1701,7 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
                 opts['proxy'] = YOUTUBE_PROXY
 
         # Cookies are tried last, not first: once YouTube flags an account, its
-        # cookies stop being merely stale and start actively hurting requests —
-        # presenting them gets the "web"/"mweb" clients a LOGIN_REQUIRED wall
-        # that the same request sails through anonymously (PO token only). So
-        # the anonymous strategies above run first, and a cookie-attached retry
-        # of strategy 1 only kicks in afterwards, for genuinely account-gated
-        # videos where anonymous access was never going to work anyway.
+        # cookies stop being merely stale and start actively hurting requests
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
             logger.info(f"Cookies file available as last-resort strategy: {YOUTUBE_COOKIES_FILE}")
             cookie_retry = dict(ydl_opts_list[0])
@@ -1681,7 +1716,7 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
                     filepath = ydl.prepare_filename(info)
                     if not os.path.exists(filepath):
                         base = os.path.splitext(filepath)[0]
-                        for ext in ['.mp4', '.webm', '.mkv']:
+                        for ext in ['.mp3', '.m4a', '.mp4', '.webm', '.mkv']:
                             if os.path.exists(base + ext):
                                 filepath = base + ext
                                 break
@@ -1701,14 +1736,17 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
             try:
                 logger.info(f"Trying pytubefix fallback for {url}...")
                 yt = PytubeFixYouTube(url)
-                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution()
-                if not stream:
-                    stream = yt.streams.filter(file_extension='mp4').first()
+                if is_audio:
+                    stream = yt.streams.filter(only_audio=True).first()
+                else:
+                    stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution()
+                    if not stream:
+                        stream = yt.streams.filter(file_extension='mp4').first()
                 if stream:
-                    fp = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
+                    fp = stream.download(output_path=output_dir, filename=f"{filename}.{'mp3' if is_audio else 'mp4'}")
                     return {
                         'filepath': fp,
-                        'title': yt.title or 'Video',
+                        'title': yt.title or 'Media',
                         'duration': yt.length or 0,
                     }
             except Exception as e:
@@ -1727,13 +1765,15 @@ async def download_youtube_video(url: str, output_dir: str, quality: int = 720) 
 
 
 
-async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality: int = 720) -> None:
-    """Execute download and upload for YouTube video."""
+async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=720) -> None:
+    """Execute download and upload for YouTube video or audio."""
+    is_audio = str(quality).lower() in ("audio", "mp3")
+    label = "audio (MP3)" if is_audio else f"{quality}p"
     if not status_msg:
-        status_msg = await target_message.reply_text(f"⏳ Downloading YouTube video ({quality}p)...")
+        status_msg = await target_message.reply_text(f"⏳ Downloading YouTube {label}...")
     else:
         try:
-            await status_msg.edit_text(f"⏳ Downloading YouTube video ({quality}p)...")
+            await status_msg.edit_text(f"⏳ Downloading YouTube {label}...")
         except Exception:
             pass  # e.g. text is already identical to the current status message
 
@@ -1749,7 +1789,7 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                 mins = duration // 60
                 secs = duration % 60
                 await status_msg.edit_text(
-                    fmt_warning(f"Video is too long ({mins}m {secs}s). Max allowed duration is 30 minutes.")
+                    fmt_warning(f"Media is too long ({mins}m {secs}s). Max allowed duration is 30 minutes.")
                 )
                 return
 
@@ -1758,31 +1798,44 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
             if file_size > 50 * 1024 * 1024:
                 mb_size = file_size / (1024 * 1024)
                 await status_msg.edit_text(
-                    fmt_warning(f"Video file is too large for Telegram ({mb_size:.1f} MB). Max limit is 50 MB.")
+                    fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is 50 MB.")
                 )
                 return
 
             await status_msg.edit_text("📤 Uploading to Telegram...")
 
-            await context.bot.send_chat_action(
-                chat_id=target_message.chat_id, action="upload_video"
-            )
-
-            with open(filepath, 'rb') as video_file:
-                await target_message.reply_video(
-                    video=video_file,
-                    caption=f"📹 {title}",
-                    supports_streaming=True,
-                    read_timeout=120,
-                    write_timeout=120,
+            if is_audio:
+                await context.bot.send_chat_action(
+                    chat_id=target_message.chat_id, action="upload_document"
                 )
+                with open(filepath, 'rb') as audio_file:
+                    await target_message.reply_audio(
+                        audio=audio_file,
+                        title=title,
+                        caption=f"🎵 {title}",
+                        duration=int(duration) if duration else None,
+                        read_timeout=120,
+                        write_timeout=120,
+                    )
+            else:
+                await context.bot.send_chat_action(
+                    chat_id=target_message.chat_id, action="upload_video"
+                )
+                with open(filepath, 'rb') as video_file:
+                    await target_message.reply_video(
+                        video=video_file,
+                        caption=f"📹 {title}",
+                        supports_streaming=True,
+                        read_timeout=120,
+                        write_timeout=120,
+                    )
 
             try:
                 await status_msg.delete()
             except Exception:
                 pass
 
-            logger.info(f"YouTube video sent successfully: {title}")
+            logger.info(f"YouTube {'audio' if is_audio else 'video'} sent successfully: {title}")
 
     except yt_dlp.utils.DownloadError as e:
         error_str = str(e)
@@ -1854,18 +1907,19 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
-    # For standard videos, offer a quality choice
+    # For standard videos, offer quality choices + MP3 option
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
             InlineKeyboardButton("⬇️ 1080p", callback_data=f"ytdl:1080:{yt_url}"),
+            InlineKeyboardButton("🎵 MP3", callback_data=f"ytdl:audio:{yt_url}"),
         ]
     ])
 
     caption = (
         f"📹 <b>YouTube Link Detected</b>\n"
         f"🔗 {yt_url}\n\n"
-        f"<i>Choose a quality to download (max 30 min / 50MB upload limit):</i>"
+        f"<i>Choose a format to download (max 30 min / 50MB upload limit):</i>"
     )
 
     thumbnail_url = None
@@ -1900,7 +1954,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_youtube_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'Download Video' inline keyboard button presses."""
+    """Handle 'Download Video / Audio' inline keyboard button presses."""
     query = update.callback_query
     await query.answer()
 
@@ -1909,8 +1963,15 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
         return
 
     quality_str, _, yt_url = data[5:].partition(":")
-    quality = 1080 if quality_str == "1080" else 720
-    logger.info(f"User clicked YouTube download button ({quality}p) for: {yt_url}")
+    if quality_str in ("audio", "mp3"):
+        quality = "audio"
+        logger.info(f"User clicked YouTube download button (MP3 audio) for: {yt_url}")
+    elif quality_str == "1080":
+        quality = 1080
+        logger.info(f"User clicked YouTube download button (1080p) for: {yt_url}")
+    else:
+        quality = 720
+        logger.info(f"User clicked YouTube download button (720p) for: {yt_url}")
 
     status_msg = await query.message.reply_text("⏳ Starting YouTube download...")
     await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg, quality=quality)

@@ -3761,8 +3761,23 @@ def main() -> None:
         if not base_url.endswith("/bot"):
             base_url = f"{base_url}/bot"
         base_file_url = base_url.replace("/bot", "/file/bot")
-        logger.info(f"Using custom Local Telegram Bot API: {base_url} (file url: {base_file_url})")
-        builder = builder.base_url(base_url).base_file_url(base_file_url)
+
+        # Test if Local Bot API is reachable before switching over
+        is_reachable = False
+        try:
+            test_resp = httpx.get(f"{base_url}{TELEGRAM_BOT_TOKEN}/getMe", timeout=4.0)
+            if test_resp.status_code == 200:
+                is_reachable = True
+            else:
+                logger.warning(f"Local Bot API at {base_url} returned status {test_resp.status_code}: {test_resp.text}")
+        except Exception as e:
+            logger.warning(f"Local Bot API at {base_url} is currently unreachable ({e}).")
+
+        if is_reachable:
+            logger.info(f"Using custom Local Telegram Bot API: {base_url} (file url: {base_file_url})")
+            builder = builder.base_url(base_url).base_file_url(base_file_url)
+        else:
+            logger.warning("Falling back to official Telegram Bot API (https://api.telegram.org) to keep bot online.")
 
     application = builder.build()
 

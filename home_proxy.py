@@ -36,6 +36,12 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+try:
+    from pytubefix import YouTube as PytubeFixYouTube
+    has_pytubefix = True
+except ImportError:
+    has_pytubefix = False
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 HOST = "0.0.0.0"
@@ -191,7 +197,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                         "preferredcodec": "mp3",
                         "preferredquality": "192",
                     }],
-                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
+                    "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+                    "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": 20,
                     "retries": 3,
@@ -207,6 +214,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                         "preferredquality": "192",
                     }],
                     "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
+                    "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": 20,
                     "retries": 3,
@@ -230,7 +238,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "outtmpl": output_template,
                     "merge_output_format": "mp4",
                     "format": fast_format,
-                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
+                    "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+                    "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": 20,
                     "retries": 3,
@@ -242,6 +251,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "merge_output_format": "mp4",
                     "format": fast_format,
                     "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
+                    "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": 20,
                     "retries": 3,
@@ -252,6 +262,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "outtmpl": output_template,
                     "merge_output_format": "mp4",
                     "format": f"best[height<={q_val}]/best",
+                    "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": 20,
                     "retries": 3,
@@ -296,6 +307,34 @@ class RelayHandler(BaseHTTPRequestHandler):
                 logger.warning(f"Relay download strategy {i} failed: {e}")
                 if i < len(ydl_opts_list):
                     time.sleep(1)
+
+        # Fallback to pytubefix if available
+        if has_pytubefix:
+            try:
+                logger.info(f"Trying pytubefix fallback for {url}...")
+                yt = PytubeFixYouTube(url)
+                if is_audio:
+                    stream = yt.streams.filter(only_audio=True).first()
+                else:
+                    stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(file_extension='mp4').first()
+                if stream:
+                    ext = "mp3" if is_audio else "mp4"
+                    out_name = f"ytrelay_{file_id}.{ext}"
+                    fp = stream.download(output_path=tmp_dir, filename=out_name)
+                    if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                        file_size = os.path.getsize(fp)
+                        filename = os.path.basename(fp)
+                        _temp_files[fp] = time.time()
+                        logger.info(f"Downloaded via pytubefix: {yt.title} ({file_size} bytes)")
+                        return {
+                            "title": yt.title or "Media",
+                            "duration": yt.length or 0,
+                            "filename": filename,
+                            "file_size": file_size,
+                            "download_url": f"/file/{filename}",
+                        }
+            except Exception as pe:
+                logger.warning(f"pytubefix fallback failed: {pe}")
 
         raise RuntimeError(f"Relay download failed across all strategies: {last_err}")
 

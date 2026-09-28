@@ -49,13 +49,31 @@ PORT = int(os.getenv("RELAY_PORT", "8899"))
 AUTH_TOKEN = os.getenv("RELAY_AUTH", "")  # Optional: set to require auth
 MAX_DURATION = 1800  # 30 min max video
 CLEANUP_AFTER = 300  # Delete temp files after 5 min
-CONCURRENT_FRAGMENTS = int(os.getenv("CONCURRENT_FRAGMENTS", "5"))
+
+# Detect Termux environment for resource-constrained settings
+IS_TERMUX = bool(os.getenv("TERMUX_VERSION") or (os.getenv("PREFIX", "").startswith("/data/data/com.termux")))
+
+CONCURRENT_FRAGMENTS = int(os.getenv("CONCURRENT_FRAGMENTS", "2" if IS_TERMUX else "5"))
+
+# Per-strategy timeout: kill a single yt-dlp attempt if it hangs (PO token gen, etc.)
+STRATEGY_TIMEOUT = int(os.getenv("STRATEGY_TIMEOUT", "60" if IS_TERMUX else "120"))
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("yt_relay")
+
+# Tame bgutil PO Token provider timeouts so they fail fast on Termux
+# instead of hanging for 45+ seconds per strategy waiting for Deno/Node.
+try:
+    from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
+    _po_timeout = 15.0 if IS_TERMUX else 30.0
+    getpot_bgutil.BgUtilPTPBase._GETPOT_TIMEOUT = _po_timeout
+    getpot_bgutil_script.BgUtilScriptPTPBase._GET_SCRIPT_VSN_TIMEOUT = _po_timeout
+    logger.info(f"PO token timeout set to {_po_timeout}s")
+except ImportError:
+    pass
 
 # ─── Temp file cleanup ───────────────────────────────────────────────────────
 
@@ -181,11 +199,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         except ImportError:
             raise RuntimeError("yt-dlp is not installed. Run: pip install yt-dlp")
 
+        import concurrent.futures
+
         file_id = uuid.uuid4().hex
         tmp_dir = tempfile.gettempdir()
         output_template = os.path.join(tmp_dir, f"ytrelay_{file_id}.%(ext)s")
 
         is_audio = str(quality).lower() in ("audio", "mp3")
+
+        # On Termux, show yt-dlp output so errors are visible
+        _quiet = not IS_TERMUX
+        _sock_timeout = 15 if IS_TERMUX else 20
 
         if is_audio:
             ydl_opts_list = [
@@ -197,12 +221,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                         "preferredcodec": "mp3",
                         "preferredquality": "192",
                     }],
-                    "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": 20,
+                    "socket_timeout": _sock_timeout,
                     "retries": 3,
-                    "quiet": True,
+                    "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
                 {
@@ -216,9 +240,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": 20,
+                    "socket_timeout": _sock_timeout,
                     "retries": 3,
-                    "quiet": True,
+                    "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
             ]
@@ -238,12 +262,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "outtmpl": output_template,
                     "merge_output_format": "mp4",
                     "format": fast_format,
-                    "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": 20,
+                    "socket_timeout": _sock_timeout,
                     "retries": 3,
-                    "quiet": True,
+                    "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
                 {
@@ -253,9 +277,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": 20,
+                    "socket_timeout": _sock_timeout,
                     "retries": 3,
-                    "quiet": True,
+                    "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
                 {
@@ -264,49 +288,63 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "format": f"best[height<={q_val}]/best",
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": 20,
+                    "socket_timeout": _sock_timeout,
                     "retries": 3,
-                    "quiet": True,
+                    "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
             ]
 
+        def _run_strategy(ydl_opts):
+            """Run a single yt-dlp strategy (called inside a timeout-guarded thread)."""
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+
+                # Find the actual file (ext may differ after merge or audio extraction)
+                if not os.path.exists(filepath):
+                    base = os.path.splitext(filepath)[0]
+                    for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
+                        if os.path.exists(base + ext):
+                            filepath = base + ext
+                            break
+
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    filename = os.path.basename(filepath)
+                    file_size = os.path.getsize(filepath)
+                    _temp_files[filepath] = time.time()
+                    logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
+                    return {
+                        "title": info.get("title", "Video"),
+                        "duration": info.get("duration", 0),
+                        "filename": filename,
+                        "file_size": file_size,
+                        "download_url": f"/file/{filename}",
+                    }
+            return None
+
         last_err = None
         for i, ydl_opts in enumerate(ydl_opts_list, 1):
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    filepath = ydl.prepare_filename(info)
+                logger.info(f"Trying strategy {i}/{len(ydl_opts_list)} "
+                            f"(clients={ydl_opts.get('extractor_args', {}).get('youtube', {}).get('player_client', '?')}, "
+                            f"timeout={STRATEGY_TIMEOUT}s)...")
 
-                    # Find the actual file (ext may differ after merge or audio extraction)
-                    if not os.path.exists(filepath):
-                        base = os.path.splitext(filepath)[0]
-                        for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
-                            if os.path.exists(base + ext):
-                                filepath = base + ext
-                                break
+                # Run with a hard per-strategy timeout to prevent PO token hangs
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    fut = pool.submit(_run_strategy, ydl_opts)
+                    result = fut.result(timeout=STRATEGY_TIMEOUT)
+                    if result:
+                        return result
 
-                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                        filename = os.path.basename(filepath)
-                        file_size = os.path.getsize(filepath)
-
-                        # Track for cleanup
-                        _temp_files[filepath] = time.time()
-
-                        logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
-
-                        return {
-                            "title": info.get("title", "Video"),
-                            "duration": info.get("duration", 0),
-                            "filename": filename,
-                            "file_size": file_size,
-                            "download_url": f"/file/{filename}",
-                        }
+            except concurrent.futures.TimeoutError:
+                last_err = Exception(f"Strategy {i} timed out after {STRATEGY_TIMEOUT}s (likely PO token generation hang)")
+                logger.warning(f"Relay strategy {i} TIMED OUT after {STRATEGY_TIMEOUT}s for {url}")
             except Exception as e:
                 last_err = e
-                logger.warning(f"Relay download strategy {i} failed: {e}")
-                if i < len(ydl_opts_list):
-                    time.sleep(1)
+                logger.warning(f"Relay download strategy {i} failed: {type(e).__name__}: {e}")
+            if i < len(ydl_opts_list):
+                time.sleep(1)
 
         # Fallback to pytubefix if available
         if has_pytubefix:
@@ -349,15 +387,20 @@ def main():
     print("  =================================================")
     print("  YouTube Download Relay")
     print(f"  Running on http://{HOST}:{PORT}")
+    if IS_TERMUX:
+        print("  Environment: Termux (lightweight mode)")
+        print(f"  Concurrent fragments: {CONCURRENT_FRAGMENTS}")
+        print(f"  Per-strategy timeout: {STRATEGY_TIMEOUT}s")
     print("  =================================================")
     print()
-    print("  Next steps:")
-    print(f"    1. Open another terminal and run:")
-    print(f"       ngrok http {PORT}")
-    print(f"    2. Copy the Forwarding HTTPS URL from ngrok")
-    print(f"    3. Set YOUTUBE_RELAY_URL in Render environment:")
-    print(f"       YOUTUBE_RELAY_URL=https://<ngrok-url>")
-    print()
+    if not IS_TERMUX:
+        print("  Next steps:")
+        print(f"    1. Open another terminal and run:")
+        print(f"       ngrok http {PORT}")
+        print(f"    2. Copy the Forwarding HTTPS URL from ngrok")
+        print(f"    3. Set YOUTUBE_RELAY_URL in your deployment:")
+        print(f"       YOUTUBE_RELAY_URL=https://<ngrok-url>")
+        print()
 
     try:
         server.serve_forever()

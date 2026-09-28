@@ -60,16 +60,20 @@ try:
 except ImportError:
     has_pytubefix = False
 
+# Detect Termux environment for resource-constrained settings
+IS_TERMUX = bool(os.getenv("TERMUX_VERSION") or (os.getenv("PREFIX", "").startswith("/data/data/com.termux")))
+
 # The bgutil PO Token provider's default timeouts (15s to check the script's
 # version, 20s to actually generate a token) are tuned for a fast local
 # machine. On a slow/CPU-throttled host, Deno's first-run TS compile alone
 # can exceed 15s, which raises an uncaught subprocess.TimeoutExpired that
 # aborts the whole yt-dlp strategy instead of just skipping the PO token.
-# Give it more headroom to actually finish instead of getting killed early.
+# On Termux use a shorter timeout to fail fast; elsewhere give more headroom.
+_PO_TOKEN_TIMEOUT = 20.0 if IS_TERMUX else 45.0
 try:
     from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
-    getpot_bgutil.BgUtilPTPBase._GETPOT_TIMEOUT = 45.0
-    getpot_bgutil_script.BgUtilScriptPTPBase._GET_SCRIPT_VSN_TIMEOUT = 45.0
+    getpot_bgutil.BgUtilPTPBase._GETPOT_TIMEOUT = _PO_TOKEN_TIMEOUT
+    getpot_bgutil_script.BgUtilScriptPTPBase._GET_SCRIPT_VSN_TIMEOUT = _PO_TOKEN_TIMEOUT
 except ImportError:
     pass
 
@@ -1641,8 +1645,47 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
 
     loop = asyncio.get_running_loop()
 
+    # Adapt resource usage to the environment
+    _concurrent_frags = 2 if IS_TERMUX else 4
+    _sock_timeout = 10 if IS_TERMUX else 15
+    # Per-strategy timeout: on Termux, cap each attempt at 45s so we fail
+    # fast instead of letting PO token generation hang for minutes.
+    _strategy_timeout = 45 if IS_TERMUX else 90
+
+    def _run_single_strategy(opts, url, strategy_num):
+        """Run a single yt-dlp strategy with a hard per-strategy timeout."""
+        import concurrent.futures
+        def _inner():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                if not os.path.exists(filepath):
+                    base = os.path.splitext(filepath)[0]
+                    for ext in ['.mp3', '.m4a', '.mp4', '.webm', '.mkv']:
+                        if os.path.exists(base + ext):
+                            filepath = base + ext
+                            break
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    return {
+                        'filepath': filepath,
+                        'title': info.get('title', 'Video'),
+                        'duration': info.get('duration', 0),
+                    }
+                return None
+
+        # Use a dedicated thread with a hard timeout to avoid PO token hangs
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_inner)
+            try:
+                return fut.result(timeout=_strategy_timeout)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"yt-dlp strategy {strategy_num} timed out after {_strategy_timeout}s for {url}")
+                raise Exception(f"Strategy {strategy_num} timed out after {_strategy_timeout}s")
+
     def _download():
         logger.info(f"Downloading YouTube media: {url} (quality={quality})...")
+        if IS_TERMUX:
+            logger.info("Termux environment detected — using lightweight download settings.")
 
         is_audio = str(quality).lower() in ("audio", "mp3")
 
@@ -1658,8 +1701,8 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                     }],
                     'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
                     'js_runtimes': {'deno': {}, 'node': {}},
-                    'concurrent_fragment_downloads': 4,
-                    'socket_timeout': 15,
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
                     'retries': 3,
                     'quiet': not os.getenv('YT_DEBUG'),
                     'verbose': bool(os.getenv('YT_DEBUG')),
@@ -1675,8 +1718,8 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                     }],
                     'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
                     'js_runtimes': {'deno': {}, 'node': {}},
-                    'concurrent_fragment_downloads': 4,
-                    'socket_timeout': 15,
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
                     'retries': 3,
                     'quiet': True,
                 },
@@ -1698,8 +1741,8 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                     'format': fast_format,
                     'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
                     'js_runtimes': {'deno': {}, 'node': {}},
-                    'concurrent_fragment_downloads': 4,
-                    'socket_timeout': 15,
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
                     'retries': 3,
                     'quiet': not os.getenv('YT_DEBUG'),
                     'verbose': bool(os.getenv('YT_DEBUG')),
@@ -1711,8 +1754,8 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                     'format': fast_format,
                     'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
                     'js_runtimes': {'deno': {}, 'node': {}},
-                    'concurrent_fragment_downloads': 4,
-                    'socket_timeout': 15,
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
                     'retries': 3,
                     'quiet': True,
                 },
@@ -1721,7 +1764,7 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                     'merge_output_format': 'mp4',
                     'format': f'best[height<={q_val}]/best',
                     'js_runtimes': {'deno': {}, 'node': {}},
-                    'socket_timeout': 15,
+                    'socket_timeout': _sock_timeout,
                     'retries': 3,
                     'quiet': True,
                 },
@@ -1743,26 +1786,14 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:
-                logger.info(f"Trying yt-dlp strategy {i} for {url}...")
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    filepath = ydl.prepare_filename(info)
-                    if not os.path.exists(filepath):
-                        base = os.path.splitext(filepath)[0]
-                        for ext in ['.mp3', '.m4a', '.mp4', '.webm', '.mkv']:
-                            if os.path.exists(base + ext):
-                                filepath = base + ext
-                                break
-                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                        return {
-                            'filepath': filepath,
-                            'title': info.get('title', 'Video'),
-                            'duration': info.get('duration', 0),
-                        }
+                logger.info(f"Trying yt-dlp strategy {i}/{len(ydl_opts_list)} for {url}...")
+                result = _run_single_strategy(opts, url, i)
+                if result:
+                    return result
             except Exception as e:
                 logger.warning(f"yt-dlp strategy {i} failed for {url}: {e}")
                 if i < len(ydl_opts_list):
-                    time.sleep(2)  # Brief delay between strategies to avoid rate limiting
+                    time.sleep(1)  # Brief delay between strategies to avoid rate limiting
 
         # Fallback to pytubefix if available
         if has_pytubefix:
@@ -3858,10 +3889,10 @@ def main() -> None:
         # ─── Webhook mode (Render / Koyeb / Custom) ───
         webhook_url = f"{webhook_base.rstrip('/')}/{TELEGRAM_BOT_TOKEN}"
         logger.info(f"Running in webhook mode on {webhook_base} (port {port})")
-        print("\n" + "─" * 45)
-        print("  🤖  Translation Bot (Webhook Mode)")
+        print("\n" + "-" * 45)
+        print("  Translation Bot (Webhook Mode)")
         print(f"  Listening on port {port}")
-        print("─" * 45 + "\n")
+        print("-" * 45 + "\n")
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
@@ -3871,10 +3902,10 @@ def main() -> None:
     else:
         # ─── Local / other: Use polling mode ───
         logger.info("Bot is starting polling...")
-        print("\n" + "─" * 45)
-        print("  🤖  Translation Bot is now running!")
+        print("\n" + "-" * 45)
+        print("  Translation Bot is now running!")
         print("  Press Ctrl+C to stop.")
-        print("─" * 45 + "\n")
+        print("-" * 45 + "\n")
         application.run_polling(bootstrap_retries=-1)
 
 

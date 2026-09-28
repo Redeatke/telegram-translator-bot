@@ -1605,19 +1605,17 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality=720) -> 
         title = data.get("title", "Video")
         duration = data.get("duration", 0)
 
-        # Step 2: Stream the file from the relay to local disk
+        # Step 2: Stream the file from the relay to local disk in 128KB chunks (zero RAM overhead)
         logger.info(f"Streaming file from relay: {download_path} ({data.get('file_size', 0)} bytes)")
-        file_resp = await client.get(
-            f"{YOUTUBE_RELAY_URL}{download_path}",
-            headers=headers,
-        )
-        file_resp.raise_for_status()
-
         local_path = os.path.join(output_dir, data["filename"])
-        with open(local_path, "wb") as f:
-            f.write(file_resp.content)
 
-        if os.path.getsize(local_path) == 0:
+        async with client.stream("GET", f"{YOUTUBE_RELAY_URL}{download_path}", headers=headers) as file_resp:
+            file_resp.raise_for_status()
+            with open(local_path, "wb") as f:
+                async for chunk in file_resp.aiter_bytes(chunk_size=128 * 1024):
+                    f.write(chunk)
+
+        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
             raise Exception("Relay returned empty file")
 
         logger.info(f"Relay download complete: {title} -> {local_path}")
@@ -1850,8 +1848,8 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                         title=title,
                         caption=f"🎵 {title}",
                         duration=int(duration) if duration else None,
-                        read_timeout=120,
-                        write_timeout=120,
+                        read_timeout=600,
+                        write_timeout=600,
                     )
             else:
                 await context.bot.send_chat_action(
@@ -1862,8 +1860,8 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                         video=video_file,
                         caption=f"📹 {title}",
                         supports_streaming=True,
-                        read_timeout=120,
-                        write_timeout=120,
+                        read_timeout=600,
+                        write_timeout=600,
                     )
 
             try:

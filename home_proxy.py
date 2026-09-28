@@ -128,7 +128,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             with open(filepath, "rb") as f:
-                shutil.copyfileobj(f, self.wfile)
+                shutil.copyfileobj(f, self.wfile, length=128 * 1024)
             return
 
         self._send_json(404, {"error": "Not found"})

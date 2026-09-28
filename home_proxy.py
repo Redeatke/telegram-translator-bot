@@ -182,20 +182,38 @@ class RelayHandler(BaseHTTPRequestHandler):
         is_audio = str(quality).lower() in ("audio", "mp3")
 
         if is_audio:
-            ydl_opts = {
-                "outtmpl": output_template,
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-                "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                "socket_timeout": 20,
-                "retries": 3,
-                "quiet": True,
-                "nocheckcertificate": True,
-            }
+            ydl_opts_list = [
+                {
+                    "outtmpl": output_template,
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": 20,
+                    "retries": 3,
+                    "quiet": True,
+                    "nocheckcertificate": True,
+                },
+                {
+                    "outtmpl": output_template,
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                    "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": 20,
+                    "retries": 3,
+                    "quiet": True,
+                    "nocheckcertificate": True,
+                },
+            ]
         else:
             try:
                 q_val = int(quality)
@@ -207,47 +225,79 @@ class RelayHandler(BaseHTTPRequestHandler):
                 f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
             )
 
-            ydl_opts = {
-                "outtmpl": output_template,
-                "merge_output_format": "mp4",
-                "format": fast_format,
-                "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                "socket_timeout": 20,
-                "retries": 3,
-                "quiet": True,
-                "nocheckcertificate": True,
-            }
+            ydl_opts_list = [
+                {
+                    "outtmpl": output_template,
+                    "merge_output_format": "mp4",
+                    "format": fast_format,
+                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": 20,
+                    "retries": 3,
+                    "quiet": True,
+                    "nocheckcertificate": True,
+                },
+                {
+                    "outtmpl": output_template,
+                    "merge_output_format": "mp4",
+                    "format": fast_format,
+                    "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": 20,
+                    "retries": 3,
+                    "quiet": True,
+                    "nocheckcertificate": True,
+                },
+                {
+                    "outtmpl": output_template,
+                    "merge_output_format": "mp4",
+                    "format": f"best[height<={q_val}]/best",
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": 20,
+                    "retries": 3,
+                    "quiet": True,
+                    "nocheckcertificate": True,
+                },
+            ]
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
+        last_err = None
+        for i, ydl_opts in enumerate(ydl_opts_list, 1):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    filepath = ydl.prepare_filename(info)
 
-            # Find the actual file (ext may differ after merge or audio extraction)
-            if not os.path.exists(filepath):
-                base = os.path.splitext(filepath)[0]
-                for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
-                    if os.path.exists(base + ext):
-                        filepath = base + ext
-                        break
+                    # Find the actual file (ext may differ after merge or audio extraction)
+                    if not os.path.exists(filepath):
+                        base = os.path.splitext(filepath)[0]
+                        for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
+                            if os.path.exists(base + ext):
+                                filepath = base + ext
+                                break
 
-            if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-                raise RuntimeError("Download produced no output file")
+                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                        filename = os.path.basename(filepath)
+                        file_size = os.path.getsize(filepath)
 
-            filename = os.path.basename(filepath)
-            file_size = os.path.getsize(filepath)
+                        # Track for cleanup
+                        _temp_files[filepath] = time.time()
 
-            # Track for cleanup
-            _temp_files[filepath] = time.time()
+                        logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
 
-            logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
+                        return {
+                            "title": info.get("title", "Video"),
+                            "duration": info.get("duration", 0),
+                            "filename": filename,
+                            "file_size": file_size,
+                            "download_url": f"/file/{filename}",
+                        }
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Relay download strategy {i} failed: {e}")
+                if i < len(ydl_opts_list):
+                    time.sleep(1)
 
-            return {
-                "title": info.get("title", "Video"),
-                "duration": info.get("duration", 0),
-                "filename": filename,
-                "file_size": file_size,
-                "download_url": f"/file/{filename}",
-            }
+        raise RuntimeError(f"Relay download failed across all strategies: {last_err}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

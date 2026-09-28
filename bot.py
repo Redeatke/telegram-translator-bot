@@ -8,6 +8,7 @@ import uuid
 import time
 import json
 import base64
+import threading
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
@@ -306,6 +307,36 @@ def toggle_download_mode(chat_id: int) -> bool:
 
 # Load chat configs on module startup
 load_chat_configs()
+
+# ─── High Performance In-Memory LRU Media / Card Cache ─────────────────────────
+
+class MediaMemoryCache:
+    """Thread-safe bounded in-memory LRU cache with TTL expiration."""
+    def __init__(self, max_items: int = 150, ttl_seconds: int = 86400):
+        self.max_items = max_items
+        self.ttl = ttl_seconds
+        self._cache = {}  # key -> (timestamp, data)
+        self._lock = threading.Lock()
+
+    def get(self, key: str):
+        with self._lock:
+            if key in self._cache:
+                ts, val = self._cache[key]
+                if time.time() - ts < self.ttl:
+                    return val
+                del self._cache[key]
+            return None
+
+    def set(self, key: str, val):
+        with self._lock:
+            if len(self._cache) >= self.max_items:
+                # Evict oldest 20%
+                oldest_keys = sorted(self._cache.keys(), key=lambda k: self._cache[k][0])[:max(1, len(self._cache) // 5)]
+                for k in oldest_keys:
+                    self._cache.pop(k, None)
+            self._cache[key] = (time.time(), val)
+
+media_cache = MediaMemoryCache()
 
 # Cache for pending download buttons: { short_id: { "url": str, "platform": str, "time": float } }
 pending_downloads = {}
@@ -1879,6 +1910,113 @@ async def is_youtube_live(url: str) -> bool:
     return False
 
 
+async def generate_youtube_summary(yt_url: str) -> str:
+    """Extract YouTube video info and generate a structured AI summary with Gemini."""
+    cache_key = f"yt:summary:{yt_url}"
+    cached = media_cache.get(cache_key)
+    if cached:
+        logger.info(f"Serving YouTube AI summary from cache for {yt_url}")
+        return cached
+
+    loop = asyncio.get_running_loop()
+
+    def _extract_meta():
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "socket_timeout": 15,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(yt_url, download=False)
+
+    info = await loop.run_in_executor(None, _extract_meta)
+    title = info.get("title") or "YouTube Video"
+    uploader = info.get("uploader") or info.get("channel") or "Unknown Creator"
+    duration = info.get("duration") or 0
+    description = (info.get("description") or "").strip()
+    tags = ", ".join(info.get("tags") or [])
+
+    duration_str = f"{duration // 60}m {duration % 60}s" if duration else "Video"
+    desc_snippet = description[:1500] if description else "No description provided."
+
+    if not has_ai or not ai_client:
+        return (
+            f"📹 <b>{html.escape(title)}</b>\n"
+            f"👤 <i>Channel: {html.escape(uploader)}</i> ({duration_str})\n\n"
+            f"📝 <b>Description Preview:</b>\n<i>{html.escape(desc_snippet[:400])}</i>\n\n"
+            f"🔗 <a href='{yt_url}'>Watch Video</a>"
+        )
+
+    prompt = (
+        f"You are a helpful and concise video summarizer for Telegram. "
+        f"Generate a clear, engaging, structured summary of the YouTube video below:\n\n"
+        f"Title: {title}\n"
+        f"Creator: {uploader}\n"
+        f"Duration: {duration_str}\n"
+        f"Tags: {tags}\n"
+        f"Description:\n{desc_snippet}\n\n"
+        f"Formatting guidelines:\n"
+        f"- Output strictly formatted using Telegram HTML (e.g. <b>, <i>, <code>).\n"
+        f"- Structure:\n"
+        f"  1. 📌 <b>Overview:</b> 1-2 sentence core topic/hook.\n"
+        f"  2. 💡 <b>Key Takeaways:</b> 3-5 concise bullet points.\n"
+        f"  3. ⏱️ <b>Duration:</b> {duration_str} | <b>Creator:</b> {uploader}\n"
+        f"- Do NOT use markdown code blocks or ```html. Output raw HTML directly."
+    )
+
+    response = await loop.run_in_executor(
+        None,
+        lambda: ai_client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a professional video summarizer. Output clean Telegram HTML directly."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=1024,
+        )
+    )
+
+    summary_text = response.choices[0].message.content.strip()
+    summary_text = re.sub(r"^```(?:html)?\s*", "", summary_text)
+    summary_text = re.sub(r"\s*```$", "", summary_text)
+
+    final_msg = (
+        f"📹 <b><a href='{yt_url}'>{html.escape(title)}</a></b>\n\n"
+        f"{summary_text}\n\n"
+        f"🔗 <a href='{yt_url}'>Watch on YouTube</a>"
+    )
+
+    media_cache.set(cache_key, final_msg)
+    return final_msg
+
+
+async def execute_youtube_summary(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+    """Generate and send YouTube video summary."""
+    if not status_msg:
+        status_msg = await target_message.reply_text("⏳ Generating AI summary for this video...")
+    else:
+        try:
+            await status_msg.edit_text("⏳ Generating AI summary for this video...")
+        except Exception:
+            pass
+
+    try:
+        summary = await generate_youtube_summary(yt_url)
+        await status_msg.edit_text(
+            summary,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate YouTube summary for {yt_url}: {e}")
+        try:
+            await status_msg.edit_text(fmt_error("Could not generate summary for this video."))
+        except Exception:
+            pass
+
+
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect YouTube links in messages."""
     if not update.message or not update.message.text:
@@ -1912,19 +2050,22 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
-    # For standard videos, offer quality choices + MP3 option
+    # For standard videos, offer quality choices + MP3 + AI Summary options
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
             InlineKeyboardButton("⬇️ 1080p", callback_data=f"ytdl:1080:{yt_url}"),
             InlineKeyboardButton("🎵 MP3", callback_data=f"ytdl:audio:{yt_url}"),
+        ],
+        [
+            InlineKeyboardButton("📝 AI Summary", callback_data=f"ytdl:summary:{yt_url}"),
         ]
     ])
 
     caption = (
         f"📹 <b>YouTube Link Detected</b>\n"
         f"🔗 {yt_url}\n\n"
-        f"<i>Choose a format to download (max 30 min / {MAX_UPLOAD_SIZE_MB}MB upload limit):</i>"
+        f"<i>Choose a format to download or summarize:</i>"
     )
 
     thumbnail_url = None
@@ -1959,7 +2100,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_youtube_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'Download Video / Audio' inline keyboard button presses."""
+    """Handle 'Download Video / Audio / Summary' inline keyboard button presses."""
     query = update.callback_query
     await query.answer()
 
@@ -1968,6 +2109,12 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
         return
 
     quality_str, _, yt_url = data[5:].partition(":")
+    if quality_str == "summary":
+        logger.info(f"User clicked YouTube AI Summary button for: {yt_url}")
+        status_msg = await query.message.reply_text("⏳ Generating AI summary...")
+        await execute_youtube_summary(query.message, yt_url, context, status_msg=status_msg)
+        return
+
     if quality_str in ("audio", "mp3"):
         quality = "audio"
         logger.info(f"User clicked YouTube download button (MP3 audio) for: {yt_url}")
@@ -2915,7 +3062,11 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
                 "url": canonical_url,
             }
 
-            card_png = card.generate_reddit_card(reddit_data)
+            card_key = f"reddit:card:{canonical_url}"
+            card_png = media_cache.get(card_key)
+            if not card_png:
+                card_png = card.generate_reddit_card(reddit_data)
+                media_cache.set(card_key, card_png)
 
             await update.message.reply_photo(
                 photo=card_png,
@@ -3219,25 +3370,31 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                 card_text = f"Quoting {q_author} (@{q_screen}):\n{q_text}"
     card_data["text"] = card_text
 
-    avatar_bytes = None
-    if tweet_data.get("author_avatar_url"):
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
-                if av_resp.status_code == 200:
-                    avatar_bytes = av_resp.content
-        except Exception as e:
-            logger.warning(f"Failed to fetch avatar for @{username}: {e}")
+    card_key = f"twitter:card:{tweet_id}"
+    card_png = media_cache.get(card_key)
+    if not card_png:
+        av_key = f"avatar:{tweet_data.get('author_avatar_url')}"
+        avatar_bytes = media_cache.get(av_key) if tweet_data.get("author_avatar_url") else None
+        if not avatar_bytes and tweet_data.get("author_avatar_url"):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    av_resp = await client.get(tweet_data["author_avatar_url"], headers=headers)
+                    if av_resp.status_code == 200:
+                        avatar_bytes = av_resp.content
+                        media_cache.set(av_key, avatar_bytes)
+            except Exception as e:
+                logger.warning(f"Failed to fetch avatar for @{username}: {e}")
 
-    card_png = None
-    try:
-        loop = asyncio.get_running_loop()
-        card_png = await loop.run_in_executor(
-            None,
-            lambda: card.generate_twitter_card(card_data, avatar_bytes)
-        )
-    except Exception as e:
-        logger.error(f"Failed to render tweet card: {e}")
+        try:
+            loop = asyncio.get_running_loop()
+            card_png = await loop.run_in_executor(
+                None,
+                lambda: card.generate_twitter_card(card_data, avatar_bytes)
+            )
+            if card_png:
+                media_cache.set(card_key, card_png)
+        except Exception as e:
+            logger.error(f"Failed to render tweet card: {e}")
 
     if card_png:
         try:

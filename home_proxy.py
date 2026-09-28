@@ -43,6 +43,7 @@ PORT = int(os.getenv("RELAY_PORT", "8899"))
 AUTH_TOKEN = os.getenv("RELAY_AUTH", "")  # Optional: set to require auth
 MAX_DURATION = 1800  # 30 min max video
 CLEANUP_AFTER = 300  # Delete temp files after 5 min
+CONCURRENT_FRAGMENTS = int(os.getenv("CONCURRENT_FRAGMENTS", "5"))
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -187,7 +188,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
                 }],
-                "concurrent_fragment_downloads": 4,
+                "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                 "socket_timeout": 20,
                 "retries": 3,
                 "quiet": True,
@@ -208,7 +209,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "outtmpl": output_template,
                 "merge_output_format": "mp4",
                 "format": fast_format,
-                "concurrent_fragment_downloads": 4,
+                "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                 "socket_timeout": 20,
                 "retries": 3,
                 "quiet": True,

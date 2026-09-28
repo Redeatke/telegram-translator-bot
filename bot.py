@@ -176,6 +176,10 @@ elif YOUTUBE_PROXY:
 else:
     logger.info("No YouTube proxy/relay configured.")
 
+# ─── Telegram Bot API Server Configuration (Local / Custom Bot API for up to 2GB uploads) ───
+LOCAL_BOT_API_URL = os.getenv("TELEGRAM_API_URL", "").strip() or os.getenv("LOCAL_BOT_API_URL", "").strip()
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "2000" if LOCAL_BOT_API_URL else "50"))
+
 # ─── User State ───────────────────────────────────────────────────────────────
 
 # In-memory user configs: { user_id: { "engine": "free" | "ai", "target": "en" } }
@@ -1793,12 +1797,13 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                 )
                 return
 
-            # Check file size (Telegram limit: 50 MB for bots)
+            # Check file size limit (Standard Telegram limit: 50 MB, Local Bot API: up to 2000 MB)
             file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:
+            max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+            if file_size > max_bytes:
                 mb_size = file_size / (1024 * 1024)
                 await status_msg.edit_text(
-                    fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is 50 MB.")
+                    fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is {MAX_UPLOAD_SIZE_MB} MB.")
                 )
                 return
 
@@ -1919,7 +1924,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     caption = (
         f"📹 <b>YouTube Link Detected</b>\n"
         f"🔗 {yt_url}\n\n"
-        f"<i>Choose a format to download (max 30 min / 50MB upload limit):</i>"
+        f"<i>Choose a format to download (max 30 min / {MAX_UPLOAD_SIZE_MB}MB upload limit):</i>"
     )
 
     thumbnail_url = None
@@ -3589,13 +3594,22 @@ def main() -> None:
 
     request = HTTPXRequest(**request_kwargs)
 
-    application = (
+    builder = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .request(request)
         .post_init(post_init)
-        .build()
     )
+
+    if LOCAL_BOT_API_URL:
+        base_url = LOCAL_BOT_API_URL.rstrip("/")
+        if not base_url.endswith("/bot"):
+            base_url = f"{base_url}/bot"
+        base_file_url = base_url.replace("/bot", "/file/bot")
+        logger.info(f"Using custom Local Telegram Bot API: {base_url} (file url: {base_file_url})")
+        builder = builder.base_url(base_url).base_file_url(base_file_url)
+
+    application = builder.build()
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start_command))

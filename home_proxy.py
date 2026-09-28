@@ -116,6 +116,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "File not found"})
                 return
 
+            file_size = os.path.getsize(filepath)
+
             # Determine content type based on extension
             _, ext = os.path.splitext(filepath)
             content_type = "audio/mpeg" if ext.lower() == ".mp3" else "video/mp4"

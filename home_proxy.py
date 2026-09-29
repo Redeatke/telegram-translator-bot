@@ -285,11 +285,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 q_val = 720
 
+            # Prioritize single pre-muxed mp4 (itag 22/18) for instant downloads without ffmpeg CPU bottleneck
             fast_format = (
-                f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={q_val}]+bestaudio/"
                 f"best[height<={q_val}][ext=mp4]/"
                 f"best[height<={q_val}]/"
+                f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={q_val}]+bestaudio/"
                 f"best"
             )
 

@@ -1630,16 +1630,8 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality=720) -> 
         }
 
 
-async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict:
-    """Download a YouTube video using optimized yt-dlp player clients with pytubefix fallback. Returns dict with filepath, title, duration."""
-
-    # Try home relay first if configured (residential IP bypass)
-    if YOUTUBE_RELAY_URL:
-        try:
-            return await download_youtube_via_relay(url, output_dir, quality)
-        except Exception as e:
-            logger.warning(f"Relay download failed, falling back to local yt-dlp: {e}")
-
+async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dict:
+    """Download a YouTube video directly on the local host with optimized mobile clients."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
 
@@ -1752,11 +1744,12 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
             except (ValueError, TypeError):
                 q_val = 720
 
+            # Prioritize single pre-muxed mp4 (itag 22/18) for instant 5-second downloads without ffmpeg CPU load
             fast_format = (
-                f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
-                f'bestvideo[height<={q_val}]+bestaudio/'
                 f'best[height<={q_val}][ext=mp4]/'
                 f'best[height<={q_val}]/'
+                f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
+                f'bestvideo[height<={q_val}]+bestaudio/'
                 f'best'
             )
             ydl_opts_list = [
@@ -1856,6 +1849,28 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
         )
     except asyncio.TimeoutError:
         raise Exception("YouTube download timed out after 5 minutes.")
+
+
+async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict:
+    """Download a YouTube video. Tries high-speed direct download on the hosting server first;
+    falls back to residential home relay if blocked."""
+    # Step 1: Direct fast download on host server (e.g. Northflank 1Gbps connection)
+    try:
+        logger.info(f"Attempting high-speed direct YouTube download on host: {url} (quality={quality})")
+        return await _download_youtube_local(url, output_dir, quality=quality)
+    except Exception as direct_err:
+        logger.warning(f"Direct download attempt failed ({direct_err}).")
+
+        # Step 2: Fallback to residential relay (Termux / Home PC) if configured
+        if YOUTUBE_RELAY_URL:
+            try:
+                logger.info(f"Falling back to home relay: {url} via {YOUTUBE_RELAY_URL}")
+                return await download_youtube_via_relay(url, output_dir, quality)
+            except Exception as relay_err:
+                logger.error(f"Home relay fallback also failed: {relay_err}")
+                raise Exception(f"Download failed directly ({direct_err}) and via relay ({relay_err})")
+
+        raise direct_err
 
 
 # Download queue manager: limits concurrent heavy downloads to prevent server overload

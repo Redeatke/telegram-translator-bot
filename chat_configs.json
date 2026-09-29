@@ -1,1 +1,32 @@
-{}
+{
+  "360290136": {
+    "youtube": true,
+    "twitter": true,
+    "twitch": true,
+    "tiktok": true,
+    "instagram": true,
+    "threads": true,
+    "reddit": true,
+    "auto_download": true
+  },
+  "428122265": {
+    "youtube": true,
+    "twitter": true,
+    "twitch": true,
+    "tiktok": true,
+    "instagram": true,
+    "threads": true,
+    "reddit": true,
+    "auto_download": true
+  },
+  "-1002421798840": {
+    "youtube": true,
+    "twitter": true,
+    "twitch": true,
+    "tiktok": true,
+    "instagram": true,
+    "threads": true,
+    "reddit": true,
+    "auto_download": true
+  }
+}

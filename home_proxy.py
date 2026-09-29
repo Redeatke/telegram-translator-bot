@@ -33,7 +33,7 @@ import shutil
 import logging
 import tempfile
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -53,10 +53,14 @@ CLEANUP_AFTER = 300  # Delete temp files after 5 min
 # Detect Termux environment for resource-constrained settings
 IS_TERMUX = bool(os.getenv("TERMUX_VERSION") or (os.getenv("PREFIX", "").startswith("/data/data/com.termux")))
 
-CONCURRENT_FRAGMENTS = int(os.getenv("CONCURRENT_FRAGMENTS", "2" if IS_TERMUX else "5"))
+CONCURRENT_FRAGMENTS = int(os.getenv("CONCURRENT_FRAGMENTS", "2" if IS_TERMUX else "4"))
 
-# Per-strategy timeout: kill a single yt-dlp attempt if it hangs (PO token gen, etc.)
-STRATEGY_TIMEOUT = int(os.getenv("STRATEGY_TIMEOUT", "60" if IS_TERMUX else "120"))
+# Relay concurrency limit: prevent CPU/RAM crashes or 429 IP bans on Termux/home PC
+MAX_CONCURRENT_RELAY_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1" if IS_TERMUX else "2"))
+_relay_download_semaphore = threading.Semaphore(MAX_CONCURRENT_RELAY_DOWNLOADS)
+
+# Per-strategy timeout: allow enough time for real download + ffmpeg muxing
+STRATEGY_TIMEOUT = int(os.getenv("STRATEGY_TIMEOUT", "120" if IS_TERMUX else "180"))
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -182,12 +186,20 @@ class RelayHandler(BaseHTTPRequestHandler):
 
             logger.info(f"Download request: {url} (quality={quality})")
 
+            # Queue downloads so concurrent requests don't crash Termux or get IP banned
+            acquired = _relay_download_semaphore.acquire(timeout=600)
+            if not acquired:
+                self._send_json(503, {"error": "Relay queue timeout: server is busy with other downloads."})
+                return
+
             try:
                 result = self._download_video(url, quality)
                 self._send_json(200, result)
             except Exception as e:
                 logger.error(f"Download failed: {e}")
                 self._send_json(500, {"error": str(e)})
+            finally:
+                _relay_download_semaphore.release()
             return
 
         self._send_json(404, {"error": "Not found"})
@@ -213,6 +225,41 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         if is_audio:
             ydl_opts_list = [
+                # Strategy 1: Mobile clients (fastest, no PO token or web JS challenge needed)
+                {
+                    "outtmpl": output_template,
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                    "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": _sock_timeout,
+                    "retries": 1,
+                    "extractor_retries": 0,
+                    "quiet": _quiet,
+                    "nocheckcertificate": True,
+                },
+                # Strategy 2: TV & Android Creator
+                {
+                    "outtmpl": output_template,
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                    "extractor_args": {"youtube": {"player_client": ["tv", "android_creator"]}},
+                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                    "socket_timeout": _sock_timeout,
+                    "retries": 1,
+                    "extractor_retries": 0,
+                    "quiet": _quiet,
+                    "nocheckcertificate": True,
+                },
+                # Strategy 3: Web fallback with challenge solver
                 {
                     "outtmpl": output_template,
                     "format": "bestaudio/best",
@@ -222,26 +269,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                         "preferredquality": "192",
                     }],
                     "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
+                    "remote_components": ["ejs:github"],
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": _sock_timeout,
-                    "retries": 3,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-                {
-                    "outtmpl": output_template,
-                    "format": "bestaudio/best",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }],
-                    "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
-                    "js_runtimes": {"node": {}, "deno": {}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 3,
+                    "retries": 1,
+                    "extractor_retries": 0,
                     "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
@@ -253,43 +286,52 @@ class RelayHandler(BaseHTTPRequestHandler):
                 q_val = 720
 
             fast_format = (
-                f"best[ext=mp4][height<={q_val}]/"
-                f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
+                f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={q_val}]+bestaudio/"
+                f"best[height<={q_val}][ext=mp4]/"
+                f"best[height<={q_val}]/"
+                f"best"
             )
 
             ydl_opts_list = [
+                # Strategy 1: Mobile clients (Android + iOS) - bypasses web 429 & PO token requirements
                 {
                     "outtmpl": output_template,
                     "merge_output_format": "mp4",
                     "format": fast_format,
-                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
-                    "js_runtimes": {"node": {}, "deno": {}},
+                    "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": _sock_timeout,
-                    "retries": 3,
+                    "retries": 1,
+                    "extractor_retries": 0,
                     "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
+                # Strategy 2: TV & Android Creator
                 {
                     "outtmpl": output_template,
                     "merge_output_format": "mp4",
                     "format": fast_format,
-                    "extractor_args": {"youtube": {"player_client": ["android", "tv"]}},
-                    "js_runtimes": {"node": {}, "deno": {}},
+                    "extractor_args": {"youtube": {"player_client": ["tv", "android_creator"]}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": _sock_timeout,
-                    "retries": 3,
+                    "retries": 1,
+                    "extractor_retries": 0,
                     "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
+                # Strategy 3: Web / mweb with remote challenge solver
                 {
                     "outtmpl": output_template,
                     "merge_output_format": "mp4",
                     "format": f"best[height<={q_val}]/best",
+                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
+                    "remote_components": ["ejs:github"],
                     "js_runtimes": {"node": {}, "deno": {}},
                     "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                     "socket_timeout": _sock_timeout,
-                    "retries": 3,
+                    "retries": 1,
+                    "extractor_retries": 0,
                     "quiet": _quiet,
                     "nocheckcertificate": True,
                 },
@@ -326,20 +368,26 @@ class RelayHandler(BaseHTTPRequestHandler):
         last_err = None
         for i, ydl_opts in enumerate(ydl_opts_list, 1):
             try:
+                clients = ydl_opts.get('extractor_args', {}).get('youtube', {}).get('player_client', '?')
                 logger.info(f"Trying strategy {i}/{len(ydl_opts_list)} "
-                            f"(clients={ydl_opts.get('extractor_args', {}).get('youtube', {}).get('player_client', '?')}, "
-                            f"timeout={STRATEGY_TIMEOUT}s)...")
+                            f"(clients={clients}, timeout={STRATEGY_TIMEOUT}s)...")
 
-                # Run with a hard per-strategy timeout to prevent PO token hangs
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     fut = pool.submit(_run_strategy, ydl_opts)
-                    result = fut.result(timeout=STRATEGY_TIMEOUT)
-                    if result:
-                        return result
+                    try:
+                        result = fut.result(timeout=STRATEGY_TIMEOUT)
+                        if result:
+                            return result
+                    except concurrent.futures.TimeoutError:
+                        # If download actually finished right around the deadline, use it
+                        if fut.done() and not fut.exception():
+                            res = fut.result()
+                            if res:
+                                logger.info(f"Strategy {i} completed at timeout boundary, returning file.")
+                                return res
+                        last_err = Exception(f"Strategy {i} timed out after {STRATEGY_TIMEOUT}s")
+                        logger.warning(f"Relay strategy {i} TIMED OUT after {STRATEGY_TIMEOUT}s for {url}")
 
-            except concurrent.futures.TimeoutError:
-                last_err = Exception(f"Strategy {i} timed out after {STRATEGY_TIMEOUT}s (likely PO token generation hang)")
-                logger.warning(f"Relay strategy {i} TIMED OUT after {STRATEGY_TIMEOUT}s for {url}")
             except Exception as e:
                 last_err = e
                 logger.warning(f"Relay download strategy {i} failed: {type(e).__name__}: {e}")
@@ -380,8 +428,8 @@ class RelayHandler(BaseHTTPRequestHandler):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    HTTPServer.allow_reuse_address = True
-    server = HTTPServer((HOST, PORT), RelayHandler)
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = ThreadingHTTPServer((HOST, PORT), RelayHandler)
 
     print()
     print("  =================================================")

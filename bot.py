@@ -1647,10 +1647,8 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
 
     # Adapt resource usage to the environment
     _concurrent_frags = 2 if IS_TERMUX else 4
-    _sock_timeout = 10 if IS_TERMUX else 15
-    # Per-strategy timeout: on Termux, cap each attempt at 45s so we fail
-    # fast instead of letting PO token generation hang for minutes.
-    _strategy_timeout = 45 if IS_TERMUX else 90
+    _sock_timeout = 15 if IS_TERMUX else 20
+    _strategy_timeout = 60 if IS_TERMUX else 120
 
     def _run_single_strategy(opts, url, strategy_num):
         """Run a single yt-dlp strategy with a hard per-strategy timeout."""
@@ -1673,12 +1671,16 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                     }
                 return None
 
-        # Use a dedicated thread with a hard timeout to avoid PO token hangs
+        # Use a dedicated thread with a timeout guard
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             fut = pool.submit(_inner)
             try:
                 return fut.result(timeout=_strategy_timeout)
             except concurrent.futures.TimeoutError:
+                if fut.done() and not fut.exception():
+                    res = fut.result()
+                    if res:
+                        return res
                 logger.warning(f"yt-dlp strategy {strategy_num} timed out after {_strategy_timeout}s for {url}")
                 raise Exception(f"Strategy {strategy_num} timed out after {_strategy_timeout}s")
 
@@ -1691,6 +1693,41 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
 
         if is_audio:
             ydl_opts_list = [
+                # Strategy 1: Mobile clients (Android + iOS) - fastest, avoids 429 & PO token walls
+                {
+                    'outtmpl': output_template,
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
+                    'retries': 1,
+                    'extractor_retries': 0,
+                    'quiet': not os.getenv('YT_DEBUG'),
+                    'verbose': bool(os.getenv('YT_DEBUG')),
+                    'nocheckcertificate': True,
+                },
+                # Strategy 2: TV & Android Creator
+                {
+                    'outtmpl': output_template,
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'extractor_args': {'youtube': {'player_client': ['tv', 'android_creator']}},
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
+                    'retries': 1,
+                    'extractor_retries': 0,
+                    'quiet': True,
+                },
+                # Strategy 3: Web / mweb with remote challenge solver
                 {
                     'outtmpl': output_template,
                     'format': 'bestaudio/best',
@@ -1700,27 +1737,12 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                         'preferredquality': '192',
                     }],
                     'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+                    'remote_components': ['ejs:github'],
                     'js_runtimes': {'deno': {}, 'node': {}},
                     'concurrent_fragment_downloads': _concurrent_frags,
                     'socket_timeout': _sock_timeout,
-                    'retries': 3,
-                    'quiet': not os.getenv('YT_DEBUG'),
-                    'verbose': bool(os.getenv('YT_DEBUG')),
-                    'nocheckcertificate': True,
-                },
-                {
-                    'outtmpl': output_template,
-                    'format': 'bestaudio/best',
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                    'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
-                    'js_runtimes': {'deno': {}, 'node': {}},
-                    'concurrent_fragment_downloads': _concurrent_frags,
-                    'socket_timeout': _sock_timeout,
-                    'retries': 3,
+                    'retries': 1,
+                    'extractor_retries': 0,
                     'quiet': True,
                 },
             ]
@@ -1731,41 +1753,50 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
                 q_val = 720
 
             fast_format = (
-                f'best[ext=mp4][height<={q_val}]/'
-                f'bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best'
+                f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
+                f'bestvideo[height<={q_val}]+bestaudio/'
+                f'best[height<={q_val}][ext=mp4]/'
+                f'best[height<={q_val}]/'
+                f'best'
             )
             ydl_opts_list = [
+                # Strategy 1: Mobile clients (Android + iOS) - bypasses web 429 & PO token requirements
                 {
                     'outtmpl': output_template,
                     'merge_output_format': 'mp4',
                     'format': fast_format,
-                    'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
                     'concurrent_fragment_downloads': _concurrent_frags,
                     'socket_timeout': _sock_timeout,
-                    'retries': 3,
+                    'retries': 1,
+                    'extractor_retries': 0,
                     'quiet': not os.getenv('YT_DEBUG'),
                     'verbose': bool(os.getenv('YT_DEBUG')),
                     'nocheckcertificate': True,
                 },
+                # Strategy 2: TV & Android Creator
                 {
                     'outtmpl': output_template,
                     'merge_output_format': 'mp4',
                     'format': fast_format,
-                    'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
-                    'js_runtimes': {'deno': {}, 'node': {}},
+                    'extractor_args': {'youtube': {'player_client': ['tv', 'android_creator']}},
                     'concurrent_fragment_downloads': _concurrent_frags,
                     'socket_timeout': _sock_timeout,
-                    'retries': 3,
+                    'retries': 1,
+                    'extractor_retries': 0,
                     'quiet': True,
                 },
+                # Strategy 3: Web / mweb with remote challenge solver
                 {
                     'outtmpl': output_template,
                     'merge_output_format': 'mp4',
                     'format': f'best[height<={q_val}]/best',
+                    'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+                    'remote_components': ['ejs:github'],
                     'js_runtimes': {'deno': {}, 'node': {}},
                     'socket_timeout': _sock_timeout,
-                    'retries': 3,
+                    'retries': 1,
+                    'extractor_retries': 0,
                     'quiet': True,
                 },
             ]
@@ -1776,8 +1807,7 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
             for opts in ydl_opts_list:
                 opts['proxy'] = YOUTUBE_PROXY
 
-        # Cookies are tried last, not first: once YouTube flags an account, its
-        # cookies stop being merely stale and start actively hurting requests
+        # Cookies are tried last as fallback
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
             logger.info(f"Cookies file available as last-resort strategy: {YOUTUBE_COOKIES_FILE}")
             cookie_retry = dict(ydl_opts_list[0])
@@ -1786,14 +1816,15 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
 
         for i, opts in enumerate(ydl_opts_list, 1):
             try:
-                logger.info(f"Trying yt-dlp strategy {i}/{len(ydl_opts_list)} for {url}...")
+                clients = opts.get('extractor_args', {}).get('youtube', {}).get('player_client', '?')
+                logger.info(f"Trying yt-dlp strategy {i}/{len(ydl_opts_list)} (clients={clients}) for {url}...")
                 result = _run_single_strategy(opts, url, i)
                 if result:
                     return result
             except Exception as e:
                 logger.warning(f"yt-dlp strategy {i} failed for {url}: {e}")
                 if i < len(ydl_opts_list):
-                    time.sleep(1)  # Brief delay between strategies to avoid rate limiting
+                    time.sleep(1)
 
         # Fallback to pytubefix if available
         if has_pytubefix:
@@ -1827,19 +1858,42 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
         raise Exception("YouTube download timed out after 5 minutes.")
 
 
+# Download queue manager: limits concurrent heavy downloads to prevent server overload
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+_download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+_queued_downloads_count = 0
 
 
 async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=720) -> None:
-    """Execute download and upload for YouTube video or audio."""
+    """Execute download and upload for YouTube video or audio with queue management."""
+    global _queued_downloads_count
     is_audio = str(quality).lower() in ("audio", "mp3")
     label = "audio (MP3)" if is_audio else f"{quality}p"
-    if not status_msg:
-        status_msg = await target_message.reply_text(f"⏳ Downloading YouTube {label}...")
-    else:
-        try:
-            await status_msg.edit_text(f"⏳ Downloading YouTube {label}...")
-        except Exception:
-            pass  # e.g. text is already identical to the current status message
+
+    # If all download slots are currently occupied, notify user of queue position
+    if _download_semaphore.locked():
+        _queued_downloads_count += 1
+        pos = _queued_downloads_count
+        q_text = f"⏳ In download queue (position #{pos}). Waiting for other downloads to finish..."
+        if not status_msg:
+            status_msg = await target_message.reply_text(q_text)
+        else:
+            try:
+                await status_msg.edit_text(q_text)
+            except Exception:
+                pass
+
+    async with _download_semaphore:
+        if _queued_downloads_count > 0:
+            _queued_downloads_count = max(0, _queued_downloads_count - 1)
+
+        if not status_msg:
+            status_msg = await target_message.reply_text(f"⏳ Downloading YouTube {label}...")
+        else:
+            try:
+                await status_msg.edit_text(f"⏳ Downloading YouTube {label}...")
+            except Exception:
+                pass
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3785,6 +3839,7 @@ def main() -> None:
         .token(TELEGRAM_BOT_TOKEN)
         .request(request)
         .post_init(post_init)
+        .concurrent_updates(True)
     )
 
     if LOCAL_BOT_API_URL:
@@ -3831,52 +3886,59 @@ def main() -> None:
         setcookies_command
     ))
 
-    # Register Settings & Media Download Button callback handlers
-    application.add_handler(CallbackQueryHandler(handle_downloads_callback, pattern="^dltog:"))
-    application.add_handler(CallbackQueryHandler(handle_pending_download_button, pattern="^dlmed:"))
-    application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:"))
+    # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)
+    application.add_handler(CallbackQueryHandler(handle_downloads_callback, pattern="^dltog:", block=False))
+    application.add_handler(CallbackQueryHandler(handle_pending_download_button, pattern="^dlmed:", block=False))
+    application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:", block=False))
 
     # Register Bot Join Greeting handler
     application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # Register platform media handlers (before general text handler so they take priority)
+    # Register platform media handlers (non-blocking so long downloads never freeze the bot)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_URL_PATTERN),
-        handle_youtube_message
+        handle_youtube_message,
+        block=False
     ))
 
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(TWITTER_URL_PATTERN),
-        handle_twitter_message
+        handle_twitter_message,
+        block=False
     ))
 
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(TWITCH_CLIP_PATTERN),
-        handle_twitch_clip_message
+        handle_twitch_clip_message,
+        block=False
     ))
 
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(TIKTOK_URL_PATTERN),
-        handle_tiktok_message
+        handle_tiktok_message,
+        block=False
     ))
 
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(INSTAGRAM_URL_PATTERN),
-        handle_instagram_message
+        handle_instagram_message,
+        block=False
     ))
 
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(THREADS_URL_PATTERN),
-        handle_threads_message
+        handle_threads_message,
+        block=False
     ))
 
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(REDDIT_URL_PATTERN),
-        handle_reddit_message
+        handle_reddit_message,
+        block=False
     ))
 
     # Register text message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
 
     # Register global error handler (catches unexpected crashes and sends patching notice)
     application.add_error_handler(global_error_handler)

@@ -42,6 +42,13 @@ try:
 except ImportError:
     has_pytubefix = False
 
+try:
+    import yt_dlp
+    import yt_dlp.plugins
+    yt_dlp.plugins.load_plugins = lambda *a, **k: None
+except ImportError:
+    pass
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 HOST = "0.0.0.0"
@@ -285,12 +292,13 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "outtmpl": output_template,
                 "format": "bestaudio/best",
                 "compat_opts": ["no-plugins"],
+                "source_address": "0.0.0.0",
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
                 }],
-                "extractor_args": {"youtube": {"player_client": ["android"]}},
+                "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
                 "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
                 "socket_timeout": _sock_timeout,
                 "retries": 1,
@@ -324,8 +332,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             "merge_output_format": "mp4",
             "format": fast_format,
             "compat_opts": ["no-plugins"],
+            "source_address": "0.0.0.0",
             "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac"]},
-            "extractor_args": {"youtube": {"player_client": ["android"]}},
+            "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
             "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
             "socket_timeout": _sock_timeout,
             "retries": 1,

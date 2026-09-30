@@ -27,6 +27,8 @@ from deep_translator import GoogleTranslator
 from openai import OpenAI
 from langdetect import detect
 import yt_dlp
+import yt_dlp.plugins
+yt_dlp.plugins.load_plugins = lambda *a, **k: None
 from yt_dlp.extractor.instagram import InstagramBaseIE
 import card
 
@@ -1696,12 +1698,13 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 'outtmpl': output_template,
                 'format': 'bestaudio/best',
                 'compat_opts': ['no-plugins'],
+                'source_address': '0.0.0.0',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                'extractor_args': {'youtube': {'player_client': ['android']}},
+                'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
                 'concurrent_fragment_downloads': _concurrent_frags,
                 'socket_timeout': _sock_timeout,
                 'retries': 1,
@@ -1741,8 +1744,9 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             'merge_output_format': 'mp4',
             'format': fast_format,
             'compat_opts': ['no-plugins'],
+            'source_address': '0.0.0.0',
             'postprocessor_args': {'merger': ['-c:v', 'copy', '-c:a', 'aac']},
-            'extractor_args': {'youtube': {'player_client': ['android']}},
+            'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
             'concurrent_fragment_downloads': _concurrent_frags,
             'socket_timeout': _sock_timeout,
             'retries': 1,

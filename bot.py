@@ -11,7 +11,7 @@ import base64
 import threading
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -63,14 +63,7 @@ except ImportError:
 # Detect Termux environment for resource-constrained settings
 IS_TERMUX = bool(os.getenv("TERMUX_VERSION") or (os.getenv("PREFIX", "").startswith("/data/data/com.termux")))
 
-# Disable bgutil external Deno/Node script provider which hangs for 45s in containers
-try:
-    from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
-    getpot_bgutil_script.BgUtilScriptDenoPTP._is_supported = lambda *a, **k: False
-    getpot_bgutil_script.BgUtilScriptNodePTP._is_supported = lambda *a, **k: False
-    getpot_bgutil.BgUtilPTPBase._is_supported = lambda *a, **k: False
-except ImportError:
-    pass
+# Note: yt-dlp external script plugins are disabled via compat_opts=['no-plugins'] to prevent slow Deno/Node subprocess hangs
 
 # Load environment variables
 load_dotenv(override=True)
@@ -1702,6 +1695,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             ydl_opts = {
                 'outtmpl': output_template,
                 'format': 'bestaudio/best',
+                'compat_opts': ['no-plugins'],
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
@@ -1744,6 +1738,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             'outtmpl': output_template,
             'merge_output_format': 'mp4',
             'format': fast_format,
+            'compat_opts': ['no-plugins'],
             'extractor_args': {'youtube': {'player_client': ['android']}},
             'concurrent_fragment_downloads': _concurrent_frags,
             'socket_timeout': _sock_timeout,
@@ -1818,99 +1813,130 @@ async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _queued_downloads_count = 0
+_active_yt_downloads = set()
 
 
 async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=720) -> None:
-    """Execute download and upload for YouTube video or audio with queue management."""
-    global _queued_downloads_count
+    """Execute download and upload for YouTube video or audio with queue management and memory streaming."""
+    global _queued_downloads_count, _active_yt_downloads
     is_audio = str(quality).lower() in ("audio", "mp3")
     label = "audio (MP3)" if is_audio else f"{quality}p"
+    key = (target_message.chat_id, yt_url, str(quality))
 
-    # If all download slots are currently occupied, notify user of queue position
-    if _download_semaphore.locked():
-        _queued_downloads_count += 1
-        pos = _queued_downloads_count
-        q_text = f"⏳ In download queue (position #{pos}). Waiting for other downloads to finish..."
-        if not status_msg:
-            status_msg = await target_message.reply_text(q_text)
-        else:
-            try:
-                await status_msg.edit_text(q_text)
-            except Exception:
-                pass
-
-    async with _download_semaphore:
-        if _queued_downloads_count > 0:
-            _queued_downloads_count = max(0, _queued_downloads_count - 1)
-
-        if not status_msg:
-            status_msg = await target_message.reply_text(f"⏳ Downloading YouTube {label}...")
-        else:
-            try:
-                await status_msg.edit_text(f"⏳ Downloading YouTube {label}...")
-            except Exception:
-                pass
+    if key in _active_yt_downloads:
+        return
+    _active_yt_downloads.add(key)
 
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            result = await download_youtube_video(yt_url, tmp_dir, quality=quality)
-            filepath = result['filepath']
-            title = result['title']
-            duration = result.get('duration', 0)
-
-            # Check duration limit (30 mins = 1800s)
-            if duration and duration > MAX_VIDEO_DURATION:
-                mins = duration // 60
-                secs = duration % 60
-                await status_msg.edit_text(
-                    fmt_warning(f"Media is too long ({mins}m {secs}s). Max allowed duration is 30 minutes.")
-                )
-                return
-
-            # Check file size limit (Standard Telegram limit: 50 MB, Local Bot API: up to 2000 MB)
-            file_size = os.path.getsize(filepath)
-            max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-            if file_size > max_bytes:
-                mb_size = file_size / (1024 * 1024)
-                await status_msg.edit_text(
-                    fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is {MAX_UPLOAD_SIZE_MB} MB.")
-                )
-                return
-
-            await status_msg.edit_text("📤 Uploading to Telegram...")
-
-            if is_audio:
-                await context.bot.send_chat_action(
-                    chat_id=target_message.chat_id, action="upload_document"
-                )
-                with open(filepath, 'rb') as audio_file:
-                    await target_message.reply_audio(
-                        audio=audio_file,
-                        title=title,
-                        caption=f"🎵 {title}",
-                        duration=int(duration) if duration else None,
-                        read_timeout=600,
-                        write_timeout=600,
-                    )
+        # If all download slots are currently occupied, notify user of queue position
+        if _download_semaphore.locked():
+            _queued_downloads_count += 1
+            pos = _queued_downloads_count
+            q_text = f"⏳ In download queue (position #{pos}). Waiting for other downloads to finish..."
+            if not status_msg:
+                status_msg = await target_message.reply_text(q_text)
             else:
-                await context.bot.send_chat_action(
-                    chat_id=target_message.chat_id, action="upload_video"
-                )
-                with open(filepath, 'rb') as video_file:
-                    await target_message.reply_video(
-                        video=video_file,
-                        caption=f"📹 {title}",
-                        supports_streaming=True,
-                        read_timeout=600,
-                        write_timeout=600,
+                try:
+                    await status_msg.edit_text(q_text)
+                except Exception:
+                    pass
+
+        async with _download_semaphore:
+            if _queued_downloads_count > 0:
+                _queued_downloads_count = max(0, _queued_downloads_count - 1)
+
+            if not status_msg:
+                status_msg = await target_message.reply_text(f"⏳ Downloading YouTube {label}...")
+            else:
+                try:
+                    await status_msg.edit_text(f"⏳ Downloading YouTube {label}...")
+                except Exception:
+                    pass
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                result = await download_youtube_video(yt_url, tmp_dir, quality=quality)
+                filepath = result['filepath']
+                title = result['title']
+                duration = result.get('duration', 0)
+
+                # Check duration limit (30 mins = 1800s)
+                if duration and duration > MAX_VIDEO_DURATION:
+                    mins = duration // 60
+                    secs = duration % 60
+                    await status_msg.edit_text(
+                        fmt_warning(f"Media is too long ({mins}m {secs}s). Max allowed duration is 30 minutes.")
                     )
+                    return
 
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+                # Check file size limit (Standard Telegram limit: 50 MB, Local Bot API: up to 2000 MB)
+                file_size = os.path.getsize(filepath)
+                mb_size = file_size / (1024 * 1024)
+                max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+                if file_size > max_bytes:
+                    await status_msg.edit_text(
+                        fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is {MAX_UPLOAD_SIZE_MB} MB.")
+                    )
+                    return
 
-            logger.info(f"YouTube {'audio' if is_audio else 'video'} sent successfully: {title}")
+                upload_note = " (large file, may take a moment)" if mb_size > 40 else ""
+                await status_msg.edit_text(f"📤 Uploading to Telegram ({mb_size:.1f} MB){upload_note}...")
+
+                if is_audio:
+                    await context.bot.send_chat_action(
+                        chat_id=target_message.chat_id, action="upload_document"
+                    )
+                    try:
+                        with open(filepath, 'rb') as audio_file:
+                            input_audio = InputFile(audio_file, filename=os.path.basename(filepath), read_file_handle=False)
+                            await target_message.reply_audio(
+                                audio=input_audio,
+                                title=title,
+                                caption=f"🎵 {title}",
+                                duration=int(duration) if duration else None,
+                                read_timeout=300,
+                                write_timeout=300,
+                            )
+                    except Exception as upload_err:
+                        logger.warning(f"reply_audio failed ({upload_err}), attempting reply_document fallback...")
+                        with open(filepath, 'rb') as audio_file:
+                            input_doc = InputFile(audio_file, filename=os.path.basename(filepath), read_file_handle=False)
+                            await target_message.reply_document(
+                                document=input_doc,
+                                caption=f"🎵 {title}",
+                                read_timeout=300,
+                                write_timeout=300,
+                            )
+                else:
+                    await context.bot.send_chat_action(
+                        chat_id=target_message.chat_id, action="upload_video"
+                    )
+                    try:
+                        with open(filepath, 'rb') as video_file:
+                            input_video = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
+                            await target_message.reply_video(
+                                video=input_video,
+                                caption=f"📹 {title}",
+                                supports_streaming=True,
+                                read_timeout=300,
+                                write_timeout=300,
+                            )
+                    except Exception as upload_err:
+                        logger.warning(f"reply_video failed ({upload_err}), attempting reply_document fallback...")
+                        with open(filepath, 'rb') as video_file:
+                            input_doc = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
+                            await target_message.reply_document(
+                                document=input_doc,
+                                caption=f"📹 {title}",
+                                read_timeout=300,
+                                write_timeout=300,
+                            )
+
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+                logger.info(f"YouTube {'audio' if is_audio else 'video'} sent successfully: {title}")
 
     except yt_dlp.utils.DownloadError as e:
         error_str = str(e)
@@ -1927,11 +1953,26 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
         else:
             await status_msg.edit_text(fmt_error("Couldn't download this video."))
     except Exception as e:
+        error_str = str(e)
         logger.error(f"YouTube download failed for {yt_url}: {type(e).__name__}: {e}")
-        try:
-            await status_msg.edit_text(fmt_error("Something went wrong downloading this video."))
-        except Exception:
-            pass
+        error_lower = error_str.lower()
+        if 'too large' in error_lower or '413' in error_lower or 'file is too big' in error_lower:
+            try:
+                await status_msg.edit_text(fmt_warning(f"This file exceeds Telegram's upload limits for this server."))
+            except Exception:
+                pass
+        elif 'timed out' in error_lower:
+            try:
+                await status_msg.edit_text(fmt_warning("The request or upload timed out. Please try again."))
+            except Exception:
+                pass
+        else:
+            try:
+                await status_msg.edit_text(fmt_error("Something went wrong processing this video."))
+            except Exception:
+                pass
+    finally:
+        _active_yt_downloads.discard(key)
 
 
 async def is_youtube_live(url: str) -> bool:
@@ -2164,6 +2205,14 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
         quality = 720
         logger.info(f"User clicked YouTube download button (720p) for: {yt_url}")
 
+    key = (query.message.chat_id, yt_url, str(quality))
+    if key in _active_yt_downloads:
+        try:
+            await query.answer("⏳ This download is already in progress! Please wait a moment...", show_alert=True)
+        except Exception:
+            pass
+        return
+
     status_msg = await query.message.reply_text("⏳ Starting YouTube download...")
     await execute_youtube_download(query.message, yt_url, context, status_msg=status_msg, quality=quality)
 
@@ -2279,8 +2328,9 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
             await status_msg.edit_text("📤 Uploading clip to Telegram...")
 
             with open(filepath, "rb") as video_file:
+                input_video = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
                 await update.message.reply_video(
-                    video=video_file,
+                    video=input_video,
                     caption=caption,
                     parse_mode="HTML",
                     duration=duration,

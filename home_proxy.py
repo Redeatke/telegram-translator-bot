@@ -68,14 +68,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("yt_relay")
 
-# Disable bgutil external Deno/Node script provider which hangs on Termux/containers
-try:
-    from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
-    getpot_bgutil_script.BgUtilScriptDenoPTP._is_supported = lambda *a, **k: False
-    getpot_bgutil_script.BgUtilScriptNodePTP._is_supported = lambda *a, **k: False
-    getpot_bgutil.BgUtilPTPBase._is_supported = lambda *a, **k: False
-except ImportError:
-    pass
+# Note: yt-dlp external script plugins are disabled via compat_opts=['no-plugins'] to prevent slow Deno/Node subprocess hangs
 
 # ─── Temp file cleanup ───────────────────────────────────────────────────────
 
@@ -291,6 +284,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             ydl_opts = {
                 "outtmpl": output_template,
                 "format": "bestaudio/best",
+                "compat_opts": ["no-plugins"],
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
@@ -327,6 +321,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             "outtmpl": output_template,
             "merge_output_format": "mp4",
             "format": fast_format,
+            "compat_opts": ["no-plugins"],
             "extractor_args": {"youtube": {"player_client": ["android"]}},
             "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
             "socket_timeout": _sock_timeout,

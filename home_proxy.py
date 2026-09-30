@@ -263,12 +263,23 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         if is_audio:
             logger.info(f"Downloading YouTube audio: {url}...")
-            # Pytubefix is fastest for audio
+            # Pytubefix fast audio engine (strictly selects original/default audio track)
             if has_pytubefix:
                 try:
                     logger.info(f"Trying pytubefix fast audio engine for {url}...")
                     yt = PytubeFixYouTube(url)
-                    stream = yt.streams.filter(only_audio=True).first()
+                    audio_streams = yt.streams.filter(only_audio=True)
+                    stream = None
+                    if audio_streams:
+                        orig_candidates = [s for s in audio_streams if getattr(s, 'is_default_audio_track', False)]
+                        if not orig_candidates:
+                            orig_candidates = [s for s in audio_streams if 'original' in str(getattr(s, 'audio_track_name_regionalized', '') or '').lower()]
+                        if not orig_candidates:
+                            orig_candidates = [s for s in audio_streams if str(getattr(s, 'audio_track_language_id', '') or '').lower().startswith('en')]
+                        candidates = orig_candidates if orig_candidates else list(audio_streams)
+                        candidates.sort(key=lambda s: int(str(s.abr or 0).replace('kbps', '') or 0) if str(s.abr or 0).replace('kbps', '').isdigit() else 0, reverse=True)
+                        stream = candidates[0]
+
                     if stream:
                         out_name = f"ytrelay_{file_id}.mp3"
                         fp = stream.download(output_path=tmp_dir, filename=out_name)
@@ -287,10 +298,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 except Exception as pe:
                     logger.warning(f"pytubefix audio failed: {pe}, using yt-dlp...")
 
-            # Dedicated single yt-dlp audio strategy
+            # Dedicated single yt-dlp audio strategy (strictly selects original audio track)
             ydl_opts = {
                 "outtmpl": output_template,
-                "format": "bestaudio/best",
+                "format": "bestaudio[format_note*=original]/bestaudio[language=original]/bestaudio[language=en]/bestaudio/best",
+                "format_sort": ["lang:original", "ext:m4a:10", "quality"],
+                "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
                 "compat_opts": ["no-plugins"],
                 "source_address": "0.0.0.0",
                 "postprocessors": [{
@@ -319,6 +332,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
         fast_format = (
+            f"bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[format_note*=original][acodec^=mp4a]/"
             f"bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
             f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={q_val}]+bestaudio/"
@@ -331,6 +345,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             "outtmpl": output_template,
             "merge_output_format": "mp4",
             "format": fast_format,
+            "format_sort": ["lang:original", "res", "fps"],
+            "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
             "compat_opts": ["no-plugins"],
             "source_address": "0.0.0.0",
             "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac"]},

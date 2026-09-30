@@ -1676,12 +1676,22 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
         # ─── OPTION A: MP3 Audio Download (Dedicated Single Strategy) ───
         if is_audio:
             logger.info(f"Downloading YouTube audio: {url}...")
-            # Pytubefix is lightning fast for audio (~5-7s on Northflank)
+            # Pytubefix fast audio engine (strictly selects original/default audio track)
             if has_pytubefix:
                 try:
                     logger.info(f"Using pytubefix fast audio engine for {url}...")
                     yt = PytubeFixYouTube(url)
-                    stream = yt.streams.filter(only_audio=True).first()
+                    audio_streams = yt.streams.filter(only_audio=True)
+                    stream = None
+                    if audio_streams:
+                        orig_candidates = [s for s in audio_streams if getattr(s, 'is_default_audio_track', False)]
+                        if not orig_candidates:
+                            orig_candidates = [s for s in audio_streams if 'original' in str(getattr(s, 'audio_track_name_regionalized', '') or '').lower()]
+                        if not orig_candidates:
+                            orig_candidates = [s for s in audio_streams if str(getattr(s, 'audio_track_language_id', '') or '').lower().startswith('en')]
+                        candidates = orig_candidates if orig_candidates else list(audio_streams)
+                        candidates.sort(key=lambda s: int(str(s.abr or 0).replace('kbps', '') or 0) if str(s.abr or 0).replace('kbps', '').isdigit() else 0, reverse=True)
+                        stream = candidates[0]
                     if stream:
                         fp = stream.download(output_path=output_dir, filename=f"{filename}.mp3")
                         if os.path.exists(fp) and os.path.getsize(fp) > 0:
@@ -1693,10 +1703,12 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 except Exception as pe:
                     logger.warning(f"pytubefix audio engine failed: {pe}, falling back to yt-dlp...")
 
-            # Fallback yt-dlp audio strategy (clean, mobile client, no Deno timeouts)
+            # Fallback yt-dlp audio strategy (clean, mobile client, strictly selects original audio)
             ydl_opts = {
                 'outtmpl': output_template,
-                'format': 'bestaudio/best',
+                'format': 'bestaudio[format_note*=original]/bestaudio[language=original]/bestaudio[language=en]/bestaudio/best',
+                'format_sort': ['lang:original', 'ext:m4a:10', 'quality'],
+                'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
                 'compat_opts': ['no-plugins'],
                 'source_address': '0.0.0.0',
                 'postprocessors': [{
@@ -1731,6 +1743,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
         logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
         # Prioritize H.264 video + AAC audio; automatically muxes to standard AAC so audio plays on iOS/Android/Telegram
         fast_format = (
+            f'bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[format_note*=original][acodec^=mp4a]/'
             f'bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[acodec^=mp4a]/'
             f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
             f'bestvideo[height<={q_val}]+bestaudio/'
@@ -1743,6 +1756,8 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             'outtmpl': output_template,
             'merge_output_format': 'mp4',
             'format': fast_format,
+            'format_sort': ['lang:original', 'res', 'fps'],
+            'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
             'compat_opts': ['no-plugins'],
             'source_address': '0.0.0.0',
             'postprocessor_args': {'merger': ['-c:v', 'copy', '-c:a', 'aac']},
@@ -1997,113 +2012,6 @@ async def is_youtube_live(url: str) -> bool:
     return False
 
 
-async def generate_youtube_summary(yt_url: str) -> str:
-    """Extract YouTube video info and generate a structured AI summary with Gemini."""
-    cache_key = f"yt:summary:{yt_url}"
-    cached = media_cache.get(cache_key)
-    if cached:
-        logger.info(f"Serving YouTube AI summary from cache for {yt_url}")
-        return cached
-
-    loop = asyncio.get_running_loop()
-
-    def _extract_meta():
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "socket_timeout": 15,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(yt_url, download=False)
-
-    info = await loop.run_in_executor(None, _extract_meta)
-    title = info.get("title") or "YouTube Video"
-    uploader = info.get("uploader") or info.get("channel") or "Unknown Creator"
-    duration = info.get("duration") or 0
-    description = (info.get("description") or "").strip()
-    tags = ", ".join(info.get("tags") or [])
-
-    duration_str = f"{duration // 60}m {duration % 60}s" if duration else "Video"
-    desc_snippet = description[:1500] if description else "No description provided."
-
-    if not has_ai or not ai_client:
-        return (
-            f"📹 <b>{html.escape(title)}</b>\n"
-            f"👤 <i>Channel: {html.escape(uploader)}</i> ({duration_str})\n\n"
-            f"📝 <b>Description Preview:</b>\n<i>{html.escape(desc_snippet[:400])}</i>\n\n"
-            f"🔗 <a href='{yt_url}'>Watch Video</a>"
-        )
-
-    prompt = (
-        f"You are a helpful and concise video summarizer for Telegram. "
-        f"Generate a clear, engaging, structured summary of the YouTube video below:\n\n"
-        f"Title: {title}\n"
-        f"Creator: {uploader}\n"
-        f"Duration: {duration_str}\n"
-        f"Tags: {tags}\n"
-        f"Description:\n{desc_snippet}\n\n"
-        f"Formatting guidelines:\n"
-        f"- Output strictly formatted using Telegram HTML (e.g. <b>, <i>, <code>).\n"
-        f"- Structure:\n"
-        f"  1. 📌 <b>Overview:</b> 1-2 sentence core topic/hook.\n"
-        f"  2. 💡 <b>Key Takeaways:</b> 3-5 concise bullet points.\n"
-        f"  3. ⏱️ <b>Duration:</b> {duration_str} | <b>Creator:</b> {uploader}\n"
-        f"- Do NOT use markdown code blocks or ```html. Output raw HTML directly."
-    )
-
-    response = await loop.run_in_executor(
-        None,
-        lambda: ai_client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a professional video summarizer. Output clean Telegram HTML directly."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=1024,
-        )
-    )
-
-    summary_text = response.choices[0].message.content.strip()
-    summary_text = re.sub(r"^```(?:html)?\s*", "", summary_text)
-    summary_text = re.sub(r"\s*```$", "", summary_text)
-
-    final_msg = (
-        f"📹 <b><a href='{yt_url}'>{html.escape(title)}</a></b>\n\n"
-        f"{summary_text}\n\n"
-        f"🔗 <a href='{yt_url}'>Watch on YouTube</a>"
-    )
-
-    media_cache.set(cache_key, final_msg)
-    return final_msg
-
-
-async def execute_youtube_summary(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
-    """Generate and send YouTube video summary."""
-    if not status_msg:
-        status_msg = await target_message.reply_text("⏳ Generating AI summary for this video...")
-    else:
-        try:
-            await status_msg.edit_text("⏳ Generating AI summary for this video...")
-        except Exception:
-            pass
-
-    try:
-        summary = await generate_youtube_summary(yt_url)
-        await status_msg.edit_text(
-            summary,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        logger.error(f"Failed to generate YouTube summary for {yt_url}: {e}")
-        try:
-            await status_msg.edit_text(fmt_error("Could not generate summary for this video."))
-        except Exception:
-            pass
-
-
 async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect YouTube links in messages."""
     if not update.message or not update.message.text:
@@ -2137,22 +2045,19 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
-    # For standard videos, offer quality choices + MP3 + AI Summary options
+    # For standard videos, offer quality choices + MP3
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
             InlineKeyboardButton("⬇️ 1080p", callback_data=f"ytdl:1080:{yt_url}"),
             InlineKeyboardButton("🎵 MP3", callback_data=f"ytdl:audio:{yt_url}"),
-        ],
-        [
-            InlineKeyboardButton("📝 AI Summary", callback_data=f"ytdl:summary:{yt_url}"),
         ]
     ])
 
     caption = (
         f"📹 <b>YouTube Link Detected</b>\n"
         f"🔗 {yt_url}\n\n"
-        f"<i>Choose a format to download or summarize:</i>"
+        f"<i>Choose a format to download:</i>"
     )
 
     thumbnail_url = None
@@ -2187,7 +2092,7 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_youtube_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'Download Video / Audio / Summary' inline keyboard button presses."""
+    """Handle 'Download Video / Audio' inline keyboard button presses."""
     query = update.callback_query
     await query.answer()
 
@@ -2197,9 +2102,7 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
 
     quality_str, _, yt_url = data[5:].partition(":")
     if quality_str == "summary":
-        logger.info(f"User clicked YouTube AI Summary button for: {yt_url}")
-        status_msg = await query.message.reply_text("⏳ Generating AI summary...")
-        await execute_youtube_summary(query.message, yt_url, context, status_msg=status_msg)
+        await query.answer("AI Summary feature has been removed.", show_alert=True)
         return
 
     if quality_str in ("audio", "mp3"):

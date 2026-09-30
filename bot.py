@@ -63,17 +63,12 @@ except ImportError:
 # Detect Termux environment for resource-constrained settings
 IS_TERMUX = bool(os.getenv("TERMUX_VERSION") or (os.getenv("PREFIX", "").startswith("/data/data/com.termux")))
 
-# The bgutil PO Token provider's default timeouts (15s to check the script's
-# version, 20s to actually generate a token) are tuned for a fast local
-# machine. On a slow/CPU-throttled host, Deno's first-run TS compile alone
-# can exceed 15s, which raises an uncaught subprocess.TimeoutExpired that
-# aborts the whole yt-dlp strategy instead of just skipping the PO token.
-# On Termux use a shorter timeout to fail fast; elsewhere give more headroom.
-_PO_TOKEN_TIMEOUT = 20.0 if IS_TERMUX else 45.0
+# Disable bgutil external Deno/Node script provider which hangs for 45s in containers
 try:
     from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
-    getpot_bgutil.BgUtilPTPBase._GETPOT_TIMEOUT = _PO_TOKEN_TIMEOUT
-    getpot_bgutil_script.BgUtilScriptPTPBase._GET_SCRIPT_VSN_TIMEOUT = _PO_TOKEN_TIMEOUT
+    getpot_bgutil_script.BgUtilScriptDenoPTP._is_supported = lambda *a, **k: False
+    getpot_bgutil_script.BgUtilScriptNodePTP._is_supported = lambda *a, **k: False
+    getpot_bgutil.BgUtilPTPBase._is_supported = lambda *a, **k: False
 except ImportError:
     pass
 
@@ -1683,164 +1678,110 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
 
         is_audio = str(quality).lower() in ("audio", "mp3")
 
+        # ─── OPTION A: MP3 Audio Download (Dedicated Single Strategy) ───
         if is_audio:
-            ydl_opts_list = [
-                # Strategy 1: Mobile clients (Android + iOS) - fastest, avoids 429 & PO token walls
-                {
-                    'outtmpl': output_template,
-                    'format': 'bestaudio/best',
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                    'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
-                    'concurrent_fragment_downloads': _concurrent_frags,
-                    'socket_timeout': _sock_timeout,
-                    'retries': 1,
-                    'extractor_retries': 0,
-                    'quiet': not os.getenv('YT_DEBUG'),
-                    'verbose': bool(os.getenv('YT_DEBUG')),
-                    'nocheckcertificate': True,
-                },
-                # Strategy 2: TV & Android Creator
-                {
-                    'outtmpl': output_template,
-                    'format': 'bestaudio/best',
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                    'extractor_args': {'youtube': {'player_client': ['tv', 'android_creator']}},
-                    'concurrent_fragment_downloads': _concurrent_frags,
-                    'socket_timeout': _sock_timeout,
-                    'retries': 1,
-                    'extractor_retries': 0,
-                    'quiet': True,
-                },
-                # Strategy 3: Web / mweb with remote challenge solver
-                {
-                    'outtmpl': output_template,
-                    'format': 'bestaudio/best',
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                    'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-                    'remote_components': ['ejs:github'],
-                    'js_runtimes': {'deno': {}, 'node': {}},
-                    'concurrent_fragment_downloads': _concurrent_frags,
-                    'socket_timeout': _sock_timeout,
-                    'retries': 1,
-                    'extractor_retries': 0,
-                    'quiet': True,
-                },
-            ]
-        else:
-            try:
-                q_val = int(quality)
-            except (ValueError, TypeError):
-                q_val = 720
+            logger.info(f"Downloading YouTube audio: {url}...")
+            # Pytubefix is lightning fast for audio (~5-7s on Northflank)
+            if has_pytubefix:
+                try:
+                    logger.info(f"Using pytubefix fast audio engine for {url}...")
+                    yt = PytubeFixYouTube(url)
+                    stream = yt.streams.filter(only_audio=True).first()
+                    if stream:
+                        fp = stream.download(output_path=output_dir, filename=f"{filename}.mp3")
+                        if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                            return {
+                                'filepath': fp,
+                                'title': yt.title or 'Audio',
+                                'duration': yt.length or 0,
+                            }
+                except Exception as pe:
+                    logger.warning(f"pytubefix audio engine failed: {pe}, falling back to yt-dlp...")
 
-            # Prioritize single pre-muxed mp4 (itag 22/18) for instant 5-second downloads without ffmpeg CPU load
-            fast_format = (
-                f'best[height<={q_val}][ext=mp4]/'
-                f'best[height<={q_val}]/'
-                f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
-                f'bestvideo[height<={q_val}]+bestaudio/'
-                f'best'
-            )
-            ydl_opts_list = [
-                # Strategy 1: Mobile clients (Android + iOS) - bypasses web 429 & PO token requirements
-                {
-                    'outtmpl': output_template,
-                    'merge_output_format': 'mp4',
-                    'format': fast_format,
-                    'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
-                    'concurrent_fragment_downloads': _concurrent_frags,
-                    'socket_timeout': _sock_timeout,
-                    'retries': 1,
-                    'extractor_retries': 0,
-                    'quiet': not os.getenv('YT_DEBUG'),
-                    'verbose': bool(os.getenv('YT_DEBUG')),
-                    'nocheckcertificate': True,
-                },
-                # Strategy 2: TV & Android Creator
-                {
-                    'outtmpl': output_template,
-                    'merge_output_format': 'mp4',
-                    'format': fast_format,
-                    'extractor_args': {'youtube': {'player_client': ['tv', 'android_creator']}},
-                    'concurrent_fragment_downloads': _concurrent_frags,
-                    'socket_timeout': _sock_timeout,
-                    'retries': 1,
-                    'extractor_retries': 0,
-                    'quiet': True,
-                },
-                # Strategy 3: Web / mweb with remote challenge solver
-                {
-                    'outtmpl': output_template,
-                    'merge_output_format': 'mp4',
-                    'format': f'best[height<={q_val}]/best',
-                    'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-                    'remote_components': ['ejs:github'],
-                    'js_runtimes': {'deno': {}, 'node': {}},
-                    'socket_timeout': _sock_timeout,
-                    'retries': 1,
-                    'extractor_retries': 0,
-                    'quiet': True,
-                },
-            ]
+            # Fallback yt-dlp audio strategy (clean, mobile client, no Deno timeouts)
+            ydl_opts = {
+                'outtmpl': output_template,
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'extractor_args': {'youtube': {'player_client': ['android']}},
+                'concurrent_fragment_downloads': _concurrent_frags,
+                'socket_timeout': _sock_timeout,
+                'retries': 1,
+                'extractor_retries': 0,
+                'quiet': not os.getenv('YT_DEBUG'),
+                'nocheckcertificate': True,
+            }
+            if YOUTUBE_PROXY:
+                ydl_opts['proxy'] = YOUTUBE_PROXY
+            if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+                ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
 
-        # Inject residential proxy into all strategies if configured
+            result = _run_single_strategy(ydl_opts, url, 1)
+            if result:
+                return result
+            raise Exception("Failed to download YouTube audio.")
+
+        # ─── OPTION B: Video Download (Dedicated Single Strategy) ───
+        try:
+            q_val = int(quality)
+        except (ValueError, TypeError):
+            q_val = 720
+
+        logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
+        # Prioritize single pre-muxed mp4 (itag 22/18) for instant 5-second downloads without ffmpeg CPU load
+        fast_format = (
+            f'best[height<={q_val}][ext=mp4]/'
+            f'best[height<={q_val}]/'
+            f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
+            f'bestvideo[height<={q_val}]+bestaudio/'
+            f'best'
+        )
+        ydl_opts = {
+            'outtmpl': output_template,
+            'merge_output_format': 'mp4',
+            'format': fast_format,
+            'extractor_args': {'youtube': {'player_client': ['android']}},
+            'concurrent_fragment_downloads': _concurrent_frags,
+            'socket_timeout': _sock_timeout,
+            'retries': 1,
+            'extractor_retries': 0,
+            'quiet': not os.getenv('YT_DEBUG'),
+            'verbose': bool(os.getenv('YT_DEBUG')),
+            'nocheckcertificate': True,
+        }
         if YOUTUBE_PROXY:
-            logger.info(f"Using YouTube proxy for all strategies: {YOUTUBE_PROXY}")
-            for opts in ydl_opts_list:
-                opts['proxy'] = YOUTUBE_PROXY
-
-        # Cookies are tried last as fallback
+            ydl_opts['proxy'] = YOUTUBE_PROXY
         if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-            logger.info(f"Cookies file available as last-resort strategy: {YOUTUBE_COOKIES_FILE}")
-            cookie_retry = dict(ydl_opts_list[0])
-            cookie_retry['cookiefile'] = YOUTUBE_COOKIES_FILE
-            ydl_opts_list.append(cookie_retry)
+            ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
 
-        for i, opts in enumerate(ydl_opts_list, 1):
-            try:
-                clients = opts.get('extractor_args', {}).get('youtube', {}).get('player_client', '?')
-                logger.info(f"Trying yt-dlp strategy {i}/{len(ydl_opts_list)} (clients={clients}) for {url}...")
-                result = _run_single_strategy(opts, url, i)
-                if result:
-                    return result
-            except Exception as e:
-                logger.warning(f"yt-dlp strategy {i} failed for {url}: {e}")
-                if i < len(ydl_opts_list):
-                    time.sleep(1)
+        try:
+            result = _run_single_strategy(ydl_opts, url, 1)
+            if result:
+                return result
+        except Exception as e:
+            logger.warning(f"yt-dlp video download failed: {e}")
 
-        # Fallback to pytubefix if available
+        # Fallback to pytubefix for video
         if has_pytubefix:
             try:
-                logger.info(f"Trying pytubefix fallback for {url}...")
+                logger.info(f"Trying pytubefix video fallback for {url}...")
                 yt = PytubeFixYouTube(url)
-                if is_audio:
-                    stream = yt.streams.filter(only_audio=True).first()
-                else:
-                    stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution()
-                    if not stream:
-                        stream = yt.streams.filter(file_extension='mp4').first()
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(file_extension='mp4').first()
                 if stream:
-                    fp = stream.download(output_path=output_dir, filename=f"{filename}.{'mp3' if is_audio else 'mp4'}")
+                    fp = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
                     return {
                         'filepath': fp,
-                        'title': yt.title or 'Media',
+                        'title': yt.title or 'Video',
                         'duration': yt.length or 0,
                     }
-            except Exception as e:
-                logger.warning(f"pytubefix fallback failed for {url}: {e}")
+            except Exception as pe:
+                logger.warning(f"pytubefix video fallback failed: {pe}")
 
-        raise Exception("Failed to download YouTube video after trying all available engines.")
+        raise Exception("Failed to download YouTube video after trying available engines.")
 
     try:
         return await asyncio.wait_for(

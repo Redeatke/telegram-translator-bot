@@ -68,14 +68,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("yt_relay")
 
-# Tame bgutil PO Token provider timeouts so they fail fast on Termux
-# instead of hanging for 45+ seconds per strategy waiting for Deno/Node.
+# Disable bgutil external Deno/Node script provider which hangs on Termux/containers
 try:
     from yt_dlp_plugins.extractor import getpot_bgutil, getpot_bgutil_script
-    _po_timeout = 15.0 if IS_TERMUX else 30.0
-    getpot_bgutil.BgUtilPTPBase._GETPOT_TIMEOUT = _po_timeout
-    getpot_bgutil_script.BgUtilScriptPTPBase._GET_SCRIPT_VSN_TIMEOUT = _po_timeout
-    logger.info(f"PO token timeout set to {_po_timeout}s")
+    getpot_bgutil_script.BgUtilScriptDenoPTP._is_supported = lambda *a, **k: False
+    getpot_bgutil_script.BgUtilScriptNodePTP._is_supported = lambda *a, **k: False
+    getpot_bgutil.BgUtilPTPBase._is_supported = lambda *a, **k: False
 except ImportError:
     pass
 
@@ -223,207 +221,153 @@ class RelayHandler(BaseHTTPRequestHandler):
         _quiet = not IS_TERMUX
         _sock_timeout = 15 if IS_TERMUX else 20
 
+        def _run_strategy_with_timeout(ydl_opts):
+            def _inner():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    filepath = ydl.prepare_filename(info)
+
+                    if not os.path.exists(filepath):
+                        base = os.path.splitext(filepath)[0]
+                        for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
+                            if os.path.exists(base + ext):
+                                filepath = base + ext
+                                break
+
+                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                        filename = os.path.basename(filepath)
+                        file_size = os.path.getsize(filepath)
+                        _temp_files[filepath] = time.time()
+                        logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
+                        return {
+                            "title": info.get("title", "Media"),
+                            "duration": info.get("duration", 0),
+                            "filename": filename,
+                            "file_size": file_size,
+                            "download_url": f"/file/{filename}",
+                        }
+                return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_inner)
+                try:
+                    return fut.result(timeout=STRATEGY_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    if fut.done() and not fut.exception():
+                        return fut.result()
+                    logger.warning(f"yt-dlp download timed out after {STRATEGY_TIMEOUT}s for {url}")
+                    return None
+                except Exception as e:
+                    logger.warning(f"yt-dlp strategy error: {e}")
+                    return None
+
         if is_audio:
-            ydl_opts_list = [
-                # Strategy 1: Mobile clients (fastest, no PO token or web JS challenge needed)
-                {
-                    "outtmpl": output_template,
-                    "format": "bestaudio/best",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }],
-                    "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 1,
-                    "extractor_retries": 0,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-                # Strategy 2: TV & Android Creator
-                {
-                    "outtmpl": output_template,
-                    "format": "bestaudio/best",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }],
-                    "extractor_args": {"youtube": {"player_client": ["tv", "android_creator"]}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 1,
-                    "extractor_retries": 0,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-                # Strategy 3: Web fallback with challenge solver
-                {
-                    "outtmpl": output_template,
-                    "format": "bestaudio/best",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }],
-                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
-                    "remote_components": ["ejs:github"],
-                    "js_runtimes": {"node": {}, "deno": {}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 1,
-                    "extractor_retries": 0,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-            ]
-        else:
-            try:
-                q_val = int(quality)
-            except (ValueError, TypeError):
-                q_val = 720
+            logger.info(f"Downloading YouTube audio: {url}...")
+            # Pytubefix is fastest for audio
+            if has_pytubefix:
+                try:
+                    logger.info(f"Trying pytubefix fast audio engine for {url}...")
+                    yt = PytubeFixYouTube(url)
+                    stream = yt.streams.filter(only_audio=True).first()
+                    if stream:
+                        out_name = f"ytrelay_{file_id}.mp3"
+                        fp = stream.download(output_path=tmp_dir, filename=out_name)
+                        if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                            file_size = os.path.getsize(fp)
+                            filename = os.path.basename(fp)
+                            _temp_files[fp] = time.time()
+                            logger.info(f"Downloaded audio via pytubefix: {yt.title} ({file_size} bytes)")
+                            return {
+                                "title": yt.title or "Audio",
+                                "duration": yt.length or 0,
+                                "filename": filename,
+                                "file_size": file_size,
+                                "download_url": f"/file/{filename}",
+                            }
+                except Exception as pe:
+                    logger.warning(f"pytubefix audio failed: {pe}, using yt-dlp...")
 
-            # Prioritize single pre-muxed mp4 (itag 22/18) for instant downloads without ffmpeg CPU bottleneck
-            fast_format = (
-                f"best[height<={q_val}][ext=mp4]/"
-                f"best[height<={q_val}]/"
-                f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={q_val}]+bestaudio/"
-                f"best"
-            )
+            # Dedicated single yt-dlp audio strategy
+            ydl_opts = {
+                "outtmpl": output_template,
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+                "extractor_args": {"youtube": {"player_client": ["android"]}},
+                "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+                "socket_timeout": _sock_timeout,
+                "retries": 1,
+                "extractor_retries": 0,
+                "quiet": _quiet,
+                "nocheckcertificate": True,
+            }
+            res = _run_strategy_with_timeout(ydl_opts)
+            if res:
+                return res
+            raise RuntimeError("Failed to download YouTube audio.")
 
-            ydl_opts_list = [
-                # Strategy 1: Mobile clients (Android + iOS) - bypasses web 429 & PO token requirements
-                {
-                    "outtmpl": output_template,
-                    "merge_output_format": "mp4",
-                    "format": fast_format,
-                    "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 1,
-                    "extractor_retries": 0,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-                # Strategy 2: TV & Android Creator
-                {
-                    "outtmpl": output_template,
-                    "merge_output_format": "mp4",
-                    "format": fast_format,
-                    "extractor_args": {"youtube": {"player_client": ["tv", "android_creator"]}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 1,
-                    "extractor_retries": 0,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-                # Strategy 3: Web / mweb with remote challenge solver
-                {
-                    "outtmpl": output_template,
-                    "merge_output_format": "mp4",
-                    "format": f"best[height<={q_val}]/best",
-                    "extractor_args": {"youtube": {"player_client": ["web", "mweb"]}},
-                    "remote_components": ["ejs:github"],
-                    "js_runtimes": {"node": {}, "deno": {}},
-                    "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
-                    "socket_timeout": _sock_timeout,
-                    "retries": 1,
-                    "extractor_retries": 0,
-                    "quiet": _quiet,
-                    "nocheckcertificate": True,
-                },
-            ]
+        # Video (720p / Shorts / 1080p)
+        try:
+            q_val = int(quality)
+        except (ValueError, TypeError):
+            q_val = 720
 
-        def _run_strategy(ydl_opts):
-            """Run a single yt-dlp strategy (called inside a timeout-guarded thread)."""
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filepath = ydl.prepare_filename(info)
+        logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
+        fast_format = (
+            f"best[height<={q_val}][ext=mp4]/"
+            f"best[height<={q_val}]/"
+            f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={q_val}]+bestaudio/"
+            f"best"
+        )
+        ydl_opts = {
+            "outtmpl": output_template,
+            "merge_output_format": "mp4",
+            "format": fast_format,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
+            "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
+            "socket_timeout": _sock_timeout,
+            "retries": 1,
+            "extractor_retries": 0,
+            "quiet": _quiet,
+            "nocheckcertificate": True,
+        }
 
-                # Find the actual file (ext may differ after merge or audio extraction)
-                if not os.path.exists(filepath):
-                    base = os.path.splitext(filepath)[0]
-                    for ext in [".mp3", ".m4a", ".mp4", ".webm", ".mkv"]:
-                        if os.path.exists(base + ext):
-                            filepath = base + ext
-                            break
+        try:
+            res = _run_strategy_with_timeout(ydl_opts)
+            if res:
+                return res
+        except Exception as e:
+            logger.warning(f"yt-dlp video failed: {e}")
 
-                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                    filename = os.path.basename(filepath)
-                    file_size = os.path.getsize(filepath)
-                    _temp_files[filepath] = time.time()
-                    logger.info(f"Downloaded: {info.get('title', 'unknown')} ({file_size} bytes)")
-                    return {
-                        "title": info.get("title", "Video"),
-                        "duration": info.get("duration", 0),
-                        "filename": filename,
-                        "file_size": file_size,
-                        "download_url": f"/file/{filename}",
-                    }
-            return None
-
-        last_err = None
-        for i, ydl_opts in enumerate(ydl_opts_list, 1):
-            try:
-                clients = ydl_opts.get('extractor_args', {}).get('youtube', {}).get('player_client', '?')
-                logger.info(f"Trying strategy {i}/{len(ydl_opts_list)} "
-                            f"(clients={clients}, timeout={STRATEGY_TIMEOUT}s)...")
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    fut = pool.submit(_run_strategy, ydl_opts)
-                    try:
-                        result = fut.result(timeout=STRATEGY_TIMEOUT)
-                        if result:
-                            return result
-                    except concurrent.futures.TimeoutError:
-                        # If download actually finished right around the deadline, use it
-                        if fut.done() and not fut.exception():
-                            res = fut.result()
-                            if res:
-                                logger.info(f"Strategy {i} completed at timeout boundary, returning file.")
-                                return res
-                        last_err = Exception(f"Strategy {i} timed out after {STRATEGY_TIMEOUT}s")
-                        logger.warning(f"Relay strategy {i} TIMED OUT after {STRATEGY_TIMEOUT}s for {url}")
-
-            except Exception as e:
-                last_err = e
-                logger.warning(f"Relay download strategy {i} failed: {type(e).__name__}: {e}")
-            if i < len(ydl_opts_list):
-                time.sleep(1)
-
-        # Fallback to pytubefix if available
+        # Fallback to pytubefix for video
         if has_pytubefix:
             try:
-                logger.info(f"Trying pytubefix fallback for {url}...")
+                logger.info(f"Trying pytubefix video fallback for {url}...")
                 yt = PytubeFixYouTube(url)
-                if is_audio:
-                    stream = yt.streams.filter(only_audio=True).first()
-                else:
-                    stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(file_extension='mp4').first()
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(file_extension='mp4').first()
                 if stream:
-                    ext = "mp3" if is_audio else "mp4"
-                    out_name = f"ytrelay_{file_id}.{ext}"
+                    out_name = f"ytrelay_{file_id}.mp4"
                     fp = stream.download(output_path=tmp_dir, filename=out_name)
                     if os.path.exists(fp) and os.path.getsize(fp) > 0:
                         file_size = os.path.getsize(fp)
                         filename = os.path.basename(fp)
                         _temp_files[fp] = time.time()
-                        logger.info(f"Downloaded via pytubefix: {yt.title} ({file_size} bytes)")
+                        logger.info(f"Downloaded video via pytubefix: {yt.title} ({file_size} bytes)")
                         return {
-                            "title": yt.title or "Media",
+                            "title": yt.title or "Video",
                             "duration": yt.length or 0,
                             "filename": filename,
                             "file_size": file_size,
                             "download_url": f"/file/{filename}",
                         }
             except Exception as pe:
-                logger.warning(f"pytubefix fallback failed: {pe}")
+                logger.warning(f"pytubefix video fallback failed: {pe}")
 
-        raise RuntimeError(f"Relay download failed across all strategies: {last_err}")
+        raise RuntimeError("Failed to download YouTube video.")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

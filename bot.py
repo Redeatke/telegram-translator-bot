@@ -1726,12 +1726,14 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             q_val = 720
 
         logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
-        # Prioritize single pre-muxed mp4 (itag 22/18) for instant 5-second downloads without ffmpeg CPU load
+        # Prioritize H.264 video + AAC audio; automatically muxes to standard AAC so audio plays on iOS/Android/Telegram
         fast_format = (
-            f'best[height<={q_val}][ext=mp4]/'
-            f'best[height<={q_val}]/'
+            f'bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[acodec^=mp4a]/'
             f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
             f'bestvideo[height<={q_val}]+bestaudio/'
+            f'bestvideo[width<={q_val}]+bestaudio/'
+            f'best[height<={q_val}][ext=mp4]/'
+            f'best[height<={q_val}]/'
             f'best'
         )
         ydl_opts = {
@@ -1739,6 +1741,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             'merge_output_format': 'mp4',
             'format': fast_format,
             'compat_opts': ['no-plugins'],
+            'postprocessor_args': {'merger': ['-c:v', 'copy', '-c:a', 'aac']},
             'extractor_args': {'youtube': {'player_client': ['android']}},
             'concurrent_fragment_downloads': _concurrent_frags,
             'socket_timeout': _sock_timeout,
@@ -1760,12 +1763,12 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
         except Exception as e:
             logger.warning(f"yt-dlp video download failed: {e}")
 
-        # Fallback to pytubefix for video
+        # Fallback to pytubefix for video (progressive only to ensure sound)
         if has_pytubefix:
             try:
                 logger.info(f"Trying pytubefix video fallback for {url}...")
                 yt = PytubeFixYouTube(url)
-                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(file_extension='mp4').first()
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(progressive=True).get_highest_resolution()
                 if stream:
                     fp = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
                     return {

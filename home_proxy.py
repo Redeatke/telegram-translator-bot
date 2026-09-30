@@ -311,10 +311,12 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
         fast_format = (
-            f"best[height<={q_val}][ext=mp4]/"
-            f"best[height<={q_val}]/"
+            f"bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
             f"bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={q_val}]+bestaudio/"
+            f"bestvideo[width<={q_val}]+bestaudio/"
+            f"best[height<={q_val}][ext=mp4]/"
+            f"best[height<={q_val}]/"
             f"best"
         )
         ydl_opts = {
@@ -322,6 +324,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             "merge_output_format": "mp4",
             "format": fast_format,
             "compat_opts": ["no-plugins"],
+            "postprocessor_args": {"merger": ["-c:v", "copy", "-c:a", "aac"]},
             "extractor_args": {"youtube": {"player_client": ["android"]}},
             "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
             "socket_timeout": _sock_timeout,
@@ -338,12 +341,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.warning(f"yt-dlp video failed: {e}")
 
-        # Fallback to pytubefix for video
+        # Fallback to pytubefix for video (progressive only to ensure sound)
         if has_pytubefix:
             try:
                 logger.info(f"Trying pytubefix video fallback for {url}...")
                 yt = PytubeFixYouTube(url)
-                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(file_extension='mp4').first()
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(progressive=True).get_highest_resolution()
                 if stream:
                     out_name = f"ytrelay_{file_id}.mp4"
                     fp = stream.download(output_path=tmp_dir, filename=out_name)

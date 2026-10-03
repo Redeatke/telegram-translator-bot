@@ -3793,7 +3793,6 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
                     name=pack_name,
                     title=pack_title,
                     stickers=[input_sticker],
-                    sticker_format=sticker_format,
                 )
                 return pack_name
             except Exception as e2:

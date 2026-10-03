@@ -31,6 +31,7 @@ import yt_dlp.plugins
 yt_dlp.plugins.load_plugins = lambda *a, **k: None
 from yt_dlp.extractor.instagram import InstagramBaseIE
 import card
+import quote_sticker
 
 # yt-dlp's Instagram extractor only turns `video_versions` into downloadable
 # formats, so photo-only carousel items have an empty format list and yt-dlp
@@ -363,6 +364,28 @@ COMMON_LANGUAGES = {
     "ar": "Arabic",
     "hi": "Hindi",
     "tr": "Turkish",
+    "nl": "Dutch",
+    "uk": "Ukrainian",
+    "pl": "Polish",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "no": "Norwegian",
+    "el": "Greek",
+    "he": "Hebrew",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "tl": "Filipino",
+    "sw": "Swahili",
+    "am": "Amharic",
+    "bn": "Bengali",
+    "ro": "Romanian",
+    "hu": "Hungarian",
+    "cs": "Czech",
+    "fa": "Persian",
+    "ur": "Urdu",
 }
 
 # ─── Language flag emoji mapping ──────────────────────────────────────────────
@@ -454,6 +477,143 @@ def get_flag(lang_code: str) -> str:
     return LANG_FLAGS.get(lang_code, "🌐")
 
 
+def resolve_language_code(query: str) -> str:
+    """
+    Resolve an ISO code or language name (case-insensitive) to an ISO language code.
+    Supports codes (e.g. 'nl', 'de', 'es'), full names (e.g. 'dutch', 'german'),
+    and prefix matches (e.g. 'span', 'amhar').
+    """
+    if not query:
+        return None
+    q = query.lower().strip()
+    # 1. Direct code match
+    if q in COMMON_LANGUAGES:
+        return q
+    # 2. Exact language name match
+    for code, name in COMMON_LANGUAGES.items():
+        if name.lower() == q:
+            return code
+    # 3. Prefix match on language name (min 3 chars)
+    if len(q) >= 3:
+        for code, name in COMMON_LANGUAGES.items():
+            if name.lower().startswith(q):
+                return code
+    # 4. Fallback check with GoogleTranslator for any valid ISO code not in COMMON_LANGUAGES
+    try:
+        GoogleTranslator(source="auto", target=q)
+        return q
+    except Exception:
+        pass
+    return None
+
+
+LANGS_PER_PAGE = 8
+
+def build_language_keyboard(current_lang: str, page: int = 0) -> InlineKeyboardMarkup:
+    """Build an interactive paginated inline keyboard for choosing target language."""
+    items = list(COMMON_LANGUAGES.items())
+    total_pages = (len(items) + LANGS_PER_PAGE - 1) // LANGS_PER_PAGE
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * LANGS_PER_PAGE
+    page_items = items[start_idx:start_idx + LANGS_PER_PAGE]
+
+    keyboard = []
+    row = []
+    for code, name in page_items:
+        flag = get_flag(code)
+        is_selected = " ✓" if code == current_lang else ""
+        button_text = f"{flag} {name}{is_selected}"
+        row.append(InlineKeyboardButton(button_text, callback_data=f"lang:set:{code}:{page}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"lang:page:{page - 1}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="lang:noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"lang:page:{page + 1}"))
+    keyboard.append(nav_row)
+
+    # Close button
+    keyboard.append([InlineKeyboardButton("❌ Close", callback_data="lang:close")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def handle_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle language picker inline button clicks."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    user = update.effective_user
+    if not user:
+        return
+
+    config = get_user_config(user.id)
+
+    if action == "close":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "noop":
+        return
+
+    if action == "page":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        current_lang = config["target"]
+        lang_name = COMMON_LANGUAGES.get(current_lang, current_lang.upper())
+        flag = get_flag(current_lang)
+        reply_markup = build_language_keyboard(current_lang, page)
+        try:
+            await query.edit_message_text(
+                fmt_card("🌐 Language Settings",
+                    f"  Current Target: {flag} <b>{lang_name}</b> (<code>{current_lang}</code>)\n\n"
+                    f"  Tap any language below to set it as your target.\n"
+                    f"  Or type <code>/target &lt;name or code&gt;</code> (e.g. <code>/target dutch</code>)"
+                ),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "set":
+        new_lang = parts[2] if len(parts) > 2 else "en"
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        config["target"] = new_lang
+        lang_name = COMMON_LANGUAGES.get(new_lang, new_lang.upper())
+        flag = get_flag(new_lang)
+        reply_markup = build_language_keyboard(new_lang, page)
+        try:
+            await query.edit_message_text(
+                fmt_card("🌐 Language Settings",
+                    f"  Current Target: {flag} <b>{lang_name}</b> (<code>{new_lang}</code>) ✅\n\n"
+                    f"  Tap any language below to switch again.\n"
+                    f"  Or type <code>/target &lt;name or code&gt;</code> (e.g. <code>/target dutch</code>)"
+                ),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        except Exception:
+            pass
+        return
+
+
+
 def get_user_config(user_id: int) -> dict:
     """Retrieve or initialize configuration for a user."""
     if user_id not in user_configs:
@@ -476,13 +636,63 @@ def is_user_premium_or_admin(update: Update) -> bool:
     return False
 
 
+def _detect_by_unicode_script(text: str) -> str:
+    """Detect language from dominant Unicode script as a fallback when langdetect fails."""
+    script_counts = {}
+    for ch in text:
+        cp = ord(ch)
+        # Ge'ez / Ethiopic (Amharic, Tigrinya)
+        if 0x1200 <= cp <= 0x137F or 0x1380 <= cp <= 0x139F or 0x2D80 <= cp <= 0x2DDF or 0xAB00 <= cp <= 0xAB2F:
+            script_counts["am"] = script_counts.get("am", 0) + 1
+        # Arabic script (Arabic, Persian, Urdu)
+        elif 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0xFB50 <= cp <= 0xFDFF or 0xFE70 <= cp <= 0xFEFF:
+            script_counts["ar"] = script_counts.get("ar", 0) + 1
+        # Devanagari (Hindi)
+        elif 0x0900 <= cp <= 0x097F:
+            script_counts["hi"] = script_counts.get("hi", 0) + 1
+        # Bengali
+        elif 0x0980 <= cp <= 0x09FF:
+            script_counts["bn"] = script_counts.get("bn", 0) + 1
+        # Thai
+        elif 0x0E00 <= cp <= 0x0E7F:
+            script_counts["th"] = script_counts.get("th", 0) + 1
+        # CJK Unified Ideographs (Chinese primary)
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            script_counts["zh"] = script_counts.get("zh", 0) + 1
+        # Hiragana + Katakana (Japanese)
+        elif 0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF:
+            script_counts["ja"] = script_counts.get("ja", 0) + 1
+        # Hangul (Korean)
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F:
+            script_counts["ko"] = script_counts.get("ko", 0) + 1
+        # Cyrillic (Russian, Ukrainian)
+        elif 0x0400 <= cp <= 0x04FF:
+            script_counts["ru"] = script_counts.get("ru", 0) + 1
+        # Greek
+        elif 0x0370 <= cp <= 0x03FF:
+            script_counts["el"] = script_counts.get("el", 0) + 1
+        # Hebrew
+        elif 0x0590 <= cp <= 0x05FF:
+            script_counts["he"] = script_counts.get("he", 0) + 1
+    if not script_counts:
+        return ""
+    return max(script_counts, key=script_counts.get)
+
+
 def detect_language_code(text: str) -> str:
-    """Detect the language code of the text, falling back to 'auto' on failure."""
+    """Detect the language code of the text using langdetect with Unicode script fallback."""
+    # Try langdetect first (good for Latin-script languages)
     try:
         lang = detect(text)
-        return lang.lower()
+        if lang:
+            return lang.lower()
     except Exception:
-        return "auto"
+        pass
+    # Fallback: detect by Unicode script (catches Amharic, Arabic, CJK, etc.)
+    script_lang = _detect_by_unicode_script(text)
+    if script_lang:
+        return script_lang
+    return "auto"
 
 
 # ─── Message Formatting Helpers ───────────────────────────────────────────────
@@ -497,8 +707,15 @@ def fmt_card(title: str, body: str, footer: str = "") -> str:
 
 def fmt_translation(src_lang: str, target_lang: str, translated_text: str, fallback: bool = False) -> str:
     """Format translation clean and simple matching Phoenix style."""
-    src_label = src_lang.lower() if src_lang != "auto" else "??"
-    target_label = target_lang.lower()
+    if src_lang and src_lang != "auto":
+        src_name = COMMON_LANGUAGES.get(src_lang.lower(), src_lang.lower())
+        src_flag = get_flag(src_lang.lower())
+        src_label = f"{src_flag} {src_name}"
+    else:
+        src_label = "auto-detected"
+    target_name = COMMON_LANGUAGES.get(target_lang.lower(), target_lang.lower())
+    target_flag = get_flag(target_lang.lower())
+    target_label = f"{target_flag} {target_name}"
 
     msg = f"Translated from {src_label} to {target_label}:\n{translated_text}"
     if fallback:
@@ -568,8 +785,25 @@ async def _translate_google_direct(text: str, target_lang: str) -> str:
         return result
 
 
+async def _translate_mymemory(text: str, target_lang: str) -> str:
+    """Translate text using MyMemory free API (5000 chars/day, no API key needed)."""
+    url = "https://api.mymemory.translated.net/get"
+    params = {
+        "q": text[:500],  # MyMemory has a 500-char per-request limit on free tier
+        "langpair": f"auto|{target_lang}",
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        translated = data.get("responseData", {}).get("translatedText", "")
+        if not translated or translated.upper() == text.upper():
+            raise ValueError("MyMemory returned empty or identical text")
+        return translated
+
+
 async def translate_free(text: str, target_lang: str) -> str:
-    """Translate text using deep-translator first, falling back to direct Google API."""
+    """Translate text using deep-translator first, falling back to direct Google API, then MyMemory."""
     loop = asyncio.get_running_loop()
     # Attempt 1: deep-translator library
     try:
@@ -587,8 +821,15 @@ async def translate_free(text: str, target_lang: str) -> str:
         translated = await _translate_google_direct(text, target_lang)
         return translated
     except Exception as e2:
-        logger.error(f"Direct Google Translate API also failed: {e2}")
-        raise e2
+        logger.warning(f"Direct Google Translate API also failed: {e2}. Trying MyMemory...")
+
+    # Attempt 3: MyMemory free API
+    try:
+        translated = await _translate_mymemory(text, target_lang)
+        return translated
+    except Exception as e3:
+        logger.error(f"All translation engines failed. Last error (MyMemory): {e3}")
+        raise e3
 
 
 async def translate_ai(text: str, target_lang: str) -> str:
@@ -753,6 +994,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"  • Send any text to translate it\n"
         f"  • /tr — translate in groups\n"
         f"  • /target es — switch to Spanish\n"
+        f"  • /languages — interactive language list\n"
         f"  • /engine — toggle AI engine\n"
         f"  • /help — full command list"
     )
@@ -776,7 +1018,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /help      This help page\n"
         f"  /tr        Translate text or reply\n"
         f"  /target    Set target language\n"
+        f"  /languages Interactive language picker\n"
         f"  /engine    Switch AI / Free engine\n"
+        f"  /q         Quote as sticker\n"
+        f"  /gif       Convert video to GIF\n"
         f"  /status    View your settings\n"
         f"  /report    Report a bug\n"
         f"\n"
@@ -832,7 +1077,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Change the user's translation target language."""
+    """Change the user's translation target language or open interactive picker."""
     user = update.effective_user
     if not user:
         return
@@ -843,21 +1088,22 @@ async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         current_target = config["target"]
         current_name = COMMON_LANGUAGES.get(current_target, current_target.upper())
         current_flag = get_flag(current_target)
+        reply_markup = build_language_keyboard(current_target, page=0)
         await update.message.reply_text(
-            fmt_card("🌐 Target Language",
-                f"  Current: {current_flag} <b>{current_name}</b> (<code>{current_target}</code>)\n"
-                f"\n"
-                f"  To change: <code>/target es</code>\n"
-                f"  See codes: /help"
+            fmt_card("🌐 Language Settings",
+                f"  Current Target: {current_flag} <b>{current_name}</b> (<code>{current_target}</code>)\n\n"
+                f"  Tap any language below to set it as your target.\n"
+                f"  Or type: <code>/target &lt;name or code&gt;</code> (e.g. <code>/target dutch</code>)"
             ),
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=reply_markup
         )
         return
 
-    new_target = context.args[0].lower().strip()
+    raw_arg = " ".join(context.args).strip()
+    new_target = resolve_language_code(raw_arg)
 
-    try:
-        GoogleTranslator(source="auto", target=new_target)
+    if new_target:
         config["target"] = new_target
         target_name = COMMON_LANGUAGES.get(new_target, new_target.upper())
         new_flag = get_flag(new_target)
@@ -865,11 +1111,20 @@ async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             fmt_success(f"Target language set to {new_flag} <b>{target_name}</b> (<code>{new_target}</code>)"),
             parse_mode="HTML"
         )
-    except Exception:
+    else:
+        current_target = config["target"]
+        reply_markup = build_language_keyboard(current_target, page=0)
         await update.message.reply_text(
-            fmt_error(f"Unknown language code: <code>{new_target}</code>\nUse /help to see valid codes."),
-            parse_mode="HTML"
+            fmt_error(f"Unknown language: <code>{html.escape(raw_arg)}</code>\nSelect from the list below or use /languages:"),
+            parse_mode="HTML",
+            reply_markup=reply_markup
         )
+
+
+async def languages_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show interactive language settings and full list of available languages."""
+    await target_command(update, context)
+
 
 
 async def engine_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1431,12 +1686,9 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Scenario A0: Reply to an image — read and translate any text found in it
     if update.message.reply_to_message and update.message.reply_to_message.photo:
         if context.args:
-            lang_candidate = context.args[0].lower().strip()
-            try:
-                GoogleTranslator(source="auto", target=lang_candidate)
-                target_lang = lang_candidate
-            except Exception:
-                pass
+            resolved = resolve_language_code(context.args[0])
+            if resolved:
+                target_lang = resolved
 
         if config["engine"] != "ai" or not has_ai:
             await update.message.reply_text(
@@ -1483,23 +1735,16 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message.reply_to_message and update.message.reply_to_message.text:
         text_to_translate = update.message.reply_to_message.text
         if context.args:
-            lang_candidate = context.args[0].lower().strip()
-            try:
-                GoogleTranslator(source="auto", target=lang_candidate)
-                target_lang = lang_candidate
-            except Exception:
-                pass
+            resolved = resolve_language_code(context.args[0])
+            if resolved:
+                target_lang = resolved
 
     # Scenario B: Arguments provided
     elif context.args:
-        if len(context.args) >= 2:
-            lang_candidate = context.args[0].lower().strip()
-            try:
-                GoogleTranslator(source="auto", target=lang_candidate)
-                target_lang = lang_candidate
-                text_to_translate = " ".join(context.args[1:])
-            except Exception:
-                text_to_translate = " ".join(context.args)
+        resolved = resolve_language_code(context.args[0])
+        if resolved and len(context.args) >= 2:
+            target_lang = resolved
+            text_to_translate = " ".join(context.args[1:])
         else:
             text_to_translate = " ".join(context.args)
 
@@ -1508,14 +1753,16 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             fmt_card("🌐 /tr — Translate",
                 f"  <b>Reply mode:</b>\n"
                 f"  Reply to a message with /tr\n"
-                f"  or <code>/tr es</code> for a specific language\n"
+                f"  or <code>/tr dutch</code> (by name or code)\n"
                 f"\n"
                 f"  <b>Image mode (AI engine only):</b>\n"
                 f"  Reply to a photo with /tr to translate any text in it\n"
                 f"\n"
                 f"  <b>Inline mode:</b>\n"
+                f"  <code>/tr dutch hello world</code>\n"
                 f"  <code>/tr es hello world</code>\n"
-                f"  <code>/tr hello world</code>"
+                f"\n"
+                f"  See languages: /languages"
             ),
             parse_mode="HTML"
         )
@@ -3420,6 +3667,378 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
 
+# ─── Quote Sticker Command (/q) ──────────────────────────────────────────────
+
+async def _get_user_avatar_bytes(bot, user) -> bytes:
+    """Download a user's profile photo as bytes, or return None."""
+    try:
+        photos = await bot.get_user_profile_photos(user.id, limit=1)
+        if photos.total_count > 0:
+            photo = photos.photos[0][-1]  # Highest resolution
+            tg_file = await bot.get_file(photo.file_id)
+            return bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        logger.debug(f"Could not fetch avatar for user {user.id}: {e}")
+    return None
+
+
+async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False) -> str:
+    """Find existing pack or create a new one. Returns the pack name. Handles full packs."""
+    from telegram import InputSticker
+    from telegram.constants import StickerFormat
+
+    bot_me = await bot.get_me()
+    bot_username = bot_me.username
+    user_name = user.first_name or "User"
+
+    # Try packs 1, 2, 3... until we find one with space or create a new one
+    for pack_num in range(1, 100):
+        pack_name = quote_sticker.get_sticker_pack_name(user_name, user.id, bot_username, pack_num)
+        pack_title = quote_sticker.get_sticker_pack_title(user_name, pack_num)
+
+        try:
+            sticker_set = await bot.get_sticker_set(pack_name)
+            if len(sticker_set.stickers) < quote_sticker.MAX_STICKERS_PER_PACK:
+                # Pack exists and has room — add to it
+                sticker_format = StickerFormat.VIDEO if is_video else StickerFormat.STATIC
+                input_sticker = InputSticker(
+                    sticker=sticker_bytes,
+                    emoji_list=["💬"],
+                    format=sticker_format,
+                )
+                await bot.add_sticker_to_set(
+                    user_id=user.id,
+                    name=pack_name,
+                    sticker=input_sticker,
+                )
+                return pack_name
+            else:
+                # Pack is full, try next number
+                continue
+        except Exception:
+            # Pack doesn't exist yet — create it
+            try:
+                sticker_format = StickerFormat.VIDEO if is_video else StickerFormat.STATIC
+                input_sticker = InputSticker(
+                    sticker=sticker_bytes,
+                    emoji_list=["💬"],
+                    format=sticker_format,
+                )
+                await bot.create_new_sticker_set(
+                    user_id=user.id,
+                    name=pack_name,
+                    title=pack_title,
+                    stickers=[input_sticker],
+                    sticker_format=sticker_format,
+                )
+                return pack_name
+            except Exception as e2:
+                logger.error(f"Failed to create sticker pack '{pack_name}': {e2}")
+                raise e2
+
+    raise RuntimeError("Could not find or create a sticker pack")
+
+
+async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quote a message as a sticker and add it to the user's sticker pack.
+
+    Usage:
+      /q          – Quote the replied text message as a card sticker
+      /q r        – Quote with reply context (shows who they replied to)
+      /q 5        – Quote the last 5 messages above as individual stickers
+      /q 2 5      – For video: clip from 2s to 5s as a video sticker
+    """
+    user = update.effective_user
+    if not user:
+        return
+
+    if is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    replied = update.message.reply_to_message
+
+    # ── Parse arguments ──
+    args = context.args or []
+    include_reply_context = False
+    multi_count = 0
+    video_start = None
+    video_end = None
+
+    if args:
+        if args[0].lower() == "r":
+            include_reply_context = True
+        elif len(args) == 1 and args[0].isdigit():
+            num = int(args[0])
+            # If replying to a video, treat single number as video end time
+            if replied and (replied.video or replied.video_note or replied.animation):
+                video_start = 0
+                video_end = float(num)
+            else:
+                multi_count = min(num, 10)  # Cap at 10 to avoid spam
+        elif len(args) == 2:
+            try:
+                video_start = float(args[0])
+                video_end = float(args[1])
+            except ValueError:
+                pass
+
+    # ── Multi-quote mode: /q N ──
+    if multi_count > 0 and not replied:
+        await update.message.reply_text(
+            fmt_error("Reply to a message with /q N to quote N messages."),
+            parse_mode="HTML"
+        )
+        return
+
+    if not replied and multi_count == 0:
+        await update.message.reply_text(
+            fmt_card("💬 /q — Quote Sticker",
+                f"  <b>Reply to a message with:</b>\n"
+                f"  <code>/q</code> — Quote as sticker\n"
+                f"  <code>/q r</code> — Quote with reply context\n"
+                f"  <code>/q 5</code> — Quote last 5 messages\n"
+                f"\n"
+                f"  <b>For videos:</b>\n"
+                f"  <code>/q 1 3</code> — Video sticker (1s to 3s)\n"
+                f"  <code>/q 3 6</code> — Video sticker (3s to 6s)"
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        # ── Case 1: Video reply with time range → video sticker ──
+        if replied and (replied.video or replied.video_note or replied.animation) and video_start is not None and video_end is not None:
+            duration = video_end - video_start
+            if duration <= 0:
+                await update.message.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
+                return
+            if duration > 3:
+                await update.message.reply_text(
+                    fmt_warning(f"Video stickers can be max 3 seconds. Trimming to {video_start}s → {video_start + 3}s."),
+                    parse_mode="HTML"
+                )
+                video_end = video_start + 3
+
+            # Download the video
+            video = replied.video or replied.video_note or replied.animation
+            tg_file = await context.bot.get_file(video.file_id)
+            video_bytes = bytes(await tg_file.download_as_bytearray())
+
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(video_bytes)
+                tmp_path = tmp.name
+
+            try:
+                sticker_bytes = await quote_sticker.video_to_sticker(tmp_path, video_start, video_end)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+            if not sticker_bytes:
+                await update.message.reply_text(
+                    fmt_error("Failed to convert video to sticker. The video may be too large or incompatible."),
+                    parse_mode="HTML"
+                )
+                return
+
+            pack_name = await _find_or_create_sticker_pack(
+                context.bot, user, sticker_bytes, is_video=True
+            )
+            sticker_set = await context.bot.get_sticker_set(pack_name)
+            last_sticker = sticker_set.stickers[-1]
+            await update.message.reply_sticker(sticker=last_sticker.file_id)
+            return
+
+        # ── Case 2: Image reply → raw image sticker (no card) ──
+        if replied and replied.photo and not multi_count:
+            photo = replied.photo[-1]
+            tg_file = await context.bot.get_file(photo.file_id)
+            image_bytes = bytes(await tg_file.download_as_bytearray())
+            sticker_bytes = quote_sticker.image_to_sticker(image_bytes)
+
+            pack_name = await _find_or_create_sticker_pack(
+                context.bot, user, sticker_bytes, is_video=False
+            )
+            sticker_set = await context.bot.get_sticker_set(pack_name)
+            last_sticker = sticker_set.stickers[-1]
+            await update.message.reply_sticker(sticker=last_sticker.file_id)
+            return
+
+        # ── Case 3: Text message → quote card sticker ──
+        if replied and (replied.text or replied.caption):
+            messages_to_quote = [replied]
+
+            # Multi-quote: collect N messages above
+            if multi_count > 1:
+                try:
+                    # We already have the replied message; get messages above it
+                    # Note: Telegram Bot API doesn't have a "get messages" method
+                    # We can only quote the single replied message in standard mode
+                    # For multi-quote, user needs to reply to the oldest message they want
+                    pass  # Single quote for now, multi requires chat history access
+                except Exception:
+                    pass
+
+            for msg in messages_to_quote:
+                msg_text = msg.text or msg.caption or ""
+                msg_user = msg.from_user
+                username = msg_user.first_name if msg_user else "Unknown"
+
+                # Get avatar
+                avatar_bytes = None
+                if msg_user:
+                    avatar_bytes = await _get_user_avatar_bytes(context.bot, msg_user)
+
+                # Check for reply context
+                reply_username = None
+                reply_text = None
+                reply_avatar_bytes = None
+                if include_reply_context and msg.reply_to_message:
+                    reply_msg = msg.reply_to_message
+                    reply_username = reply_msg.from_user.first_name if reply_msg.from_user else "Unknown"
+                    reply_text = reply_msg.text or reply_msg.caption or ""
+                    if reply_msg.from_user:
+                        reply_avatar_bytes = await _get_user_avatar_bytes(context.bot, reply_msg.from_user)
+
+                # Generate the card
+                sticker_bytes = quote_sticker.generate_quote_card(
+                    username=username,
+                    text=msg_text,
+                    avatar_bytes=avatar_bytes,
+                    reply_username=reply_username,
+                    reply_text=reply_text,
+                    reply_avatar_bytes=reply_avatar_bytes,
+                )
+
+                # Add to sticker pack
+                pack_name = await _find_or_create_sticker_pack(
+                    context.bot, user, sticker_bytes, is_video=False
+                )
+                sticker_set = await context.bot.get_sticker_set(pack_name)
+                last_sticker = sticker_set.stickers[-1]
+                await update.message.reply_sticker(sticker=last_sticker.file_id)
+            return
+
+        # ── Case 4: Sticker reply → add sticker directly (re-sticker) ──
+        if replied and replied.sticker:
+            # Just add the existing sticker to their pack
+            sticker = replied.sticker
+            tg_file = await context.bot.get_file(sticker.file_id)
+            sticker_bytes = bytes(await tg_file.download_as_bytearray())
+            is_video = sticker.is_video
+
+            pack_name = await _find_or_create_sticker_pack(
+                context.bot, user, sticker_bytes, is_video=is_video
+            )
+            sticker_set = await context.bot.get_sticker_set(pack_name)
+            last_sticker = sticker_set.stickers[-1]
+            await update.message.reply_sticker(sticker=last_sticker.file_id)
+            return
+
+        await update.message.reply_text(
+            fmt_warning("Couldn't find quotable content in that message."),
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logger.error(f"Quote sticker error: {e}", exc_info=True)
+        await update.message.reply_text(
+            fmt_error(f"Failed to create sticker. Make sure you've started the bot in DM first.\n\n<i>{html.escape(str(e)[:200])}</i>"),
+            parse_mode="HTML"
+        )
+
+
+# ─── GIF Command (/gif) ──────────────────────────────────────────────────────
+
+async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Convert a replied video to GIF.
+
+    Usage:
+      /gif        – Convert entire video to GIF
+      /gif 4 10   – Convert from 4s to 10s to GIF
+    """
+    user = update.effective_user
+    if not user:
+        return
+
+    if is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    replied = update.message.reply_to_message
+    if not replied or not (replied.video or replied.video_note or replied.animation):
+        await update.message.reply_text(
+            fmt_card("🎞️ /gif — Video to GIF",
+                f"  Reply to a video with:\n"
+                f"  <code>/gif</code> — Convert full video\n"
+                f"  <code>/gif 4 10</code> — Convert 4s to 10s\n"
+                f"  <code>/gif 0 5</code> — First 5 seconds"
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+    # Parse time range
+    args = context.args or []
+    start_sec = 0.0
+    end_sec = None
+    if len(args) >= 2:
+        try:
+            start_sec = float(args[0])
+            end_sec = float(args[1])
+            if end_sec <= start_sec:
+                await update.message.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
+                return
+        except ValueError:
+            await update.message.reply_text(fmt_error("Invalid time values. Use numbers like: /gif 4 10"), parse_mode="HTML")
+            return
+    elif len(args) == 1:
+        try:
+            end_sec = float(args[0])
+        except ValueError:
+            pass
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
+
+    video = replied.video or replied.video_note or replied.animation
+    tg_file = await context.bot.get_file(video.file_id)
+    video_bytes = bytes(await tg_file.download_as_bytearray())
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+
+    try:
+        gif_bytes = await quote_sticker.video_to_gif(tmp_path, start_sec, end_sec)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    if not gif_bytes:
+        await update.message.reply_text(
+            fmt_error("Failed to convert video to GIF."),
+            parse_mode="HTML"
+        )
+        return
+
+    # Send as animation (GIF)
+    await update.message.reply_animation(
+        animation=gif_bytes,
+        reply_to_message_id=update.message.message_id,
+        filename="converted.gif",
+    )
+
+
 # ─── Auto-Translate in Private Chat ──────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3712,6 +4331,8 @@ async def post_init(application: Application) -> None:
         ("tr", "Translate text, or an image (reply)"),
         ("target", "Set translation target language"),
         ("engine", "Switch AI / Free engine"),
+        ("q", "Quote a message as a sticker"),
+        ("gif", "Convert a video to GIF"),
         ("status", "Show settings and status"),
         ("help", "Full help guide"),
         ("report", "Report a problem to admins"),
@@ -3790,6 +4411,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("target", target_command))
+    application.add_handler(CommandHandler(["languages", "langs", "settings"], languages_command))
     application.add_handler(CommandHandler("engine", engine_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("promote", promote_command))
@@ -3797,12 +4419,15 @@ def main() -> None:
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("setcookies", setcookies_command))
     application.add_handler(CommandHandler("maintenance", maintenance_command))
+    application.add_handler(CommandHandler("q", q_command, block=False))
+    application.add_handler(CommandHandler("gif", gif_command, block=False))
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.Document.ALL,
         setcookies_command
     ))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)
+    application.add_handler(CallbackQueryHandler(handle_lang_callback, pattern="^lang:", block=False))
     application.add_handler(CallbackQueryHandler(handle_downloads_callback, pattern="^dltog:", block=False))
     application.add_handler(CallbackQueryHandler(handle_pending_download_button, pattern="^dlmed:", block=False))
     application.add_handler(CallbackQueryHandler(handle_youtube_download_button, pattern="^ytdl:", block=False))

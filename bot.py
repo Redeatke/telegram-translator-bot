@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import logging
 import asyncio
@@ -10,6 +12,7 @@ from datetime import datetime, timezone
 import json
 import base64
 import threading
+from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
 
 # Anti-flood guards: ignore stale backlogs and deduplicate messages

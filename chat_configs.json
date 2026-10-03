@@ -20,6 +20,36 @@
     "auto_download": true
   },
   "-1002421798840": {
+    "youtube": false,
+    "twitter": false,
+    "twitch": false,
+    "tiktok": false,
+    "instagram": true,
+    "threads": false,
+    "reddit": false,
+    "auto_download": true
+  },
+  "-1001285886605": {
+    "youtube": true,
+    "twitter": true,
+    "twitch": true,
+    "tiktok": true,
+    "instagram": true,
+    "threads": true,
+    "reddit": true,
+    "auto_download": true
+  },
+  "-1001163100221": {
+    "youtube": true,
+    "twitter": true,
+    "twitch": true,
+    "tiktok": true,
+    "instagram": true,
+    "threads": true,
+    "reddit": true,
+    "auto_download": true
+  },
+  "-1001332049055": {
     "youtube": true,
     "twitter": true,
     "twitch": true,

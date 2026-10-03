@@ -151,7 +151,7 @@ Seen before?                  ChromaDB / FAISS Vector Store
 | **STT (Whisper API)** | ~$0.30 (test clips) | ~$1-2 / mo | ~$10 / mo |
 | **TTS (gTTS / MMS)** | Free | Free | Free |
 | **Vector DB (ChromaDB)** | Local / Free | Local file storage | Free |
-| **Hosting** | Local / Free | Railway / Render / PythonAnywhere | $0 - $5 / mo |
+| **Hosting** | Local / Free | Northflank (Container) | $0 - $5 / mo |
 
 ---
 

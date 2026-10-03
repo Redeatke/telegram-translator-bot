@@ -1,68 +1,106 @@
-# 🚀 Deploying to PythonAnywhere
+# 🚀 Deploying to Northflank
 
-This guide provides step-by-step instructions to deploy your Telegram Translation Bot to [PythonAnywhere](https://www.pythonanywhere.com/) for free, 24/7 hosting.
+This guide provides step-by-step instructions to deploy your Telegram Translation & Utility Bot to **[Northflank](https://northflank.com/)** for 24/7, reliable cloud hosting with continuous deployment via GitHub.
+
+---
+
+## 🌟 Why Northflank?
+
+* **Native Dockerfile Support**: Builds our custom container directly with Python 3.12, `ffmpeg`, Node.js, Deno (for YouTube PO tokens), and TrueType vector fonts.
+* **Continuous Git Deployment**: Every `git push origin master` automatically triggers a zero-downtime build and redeploy.
+* **Persistent Long-Polling**: Runs 24/7 without artificial idle sleep timeouts (unlike Render free tier).
+* **Live Streaming Logs**: Instant container logs, resource monitoring (CPU/RAM), and restart controls.
 
 ---
 
 ## 🛠️ Step-by-Step Deployment Guide
 
-### Step 1: Create a PythonAnywhere Account
-1. Go to [PythonAnywhere](https://www.pythonanywhere.com/).
-2. Click **Pricing & Signup** and choose the **Create a Beginner Account** (Free tier).
-3. Choose your username, enter your email, and create a password.
+### Step 1: Create a Project in Northflank
+1. Log in to [Northflank Dashboard](https://app.northflank.com/).
+2. Click **Create Project**.
+3. Choose a project name (e.g. `telegram-bot-project`) and select your preferred region (e.g., US or Europe).
 
-### Step 2: Open a Bash Console
-1. Once logged into your dashboard, click on the **Consoles** tab.
-2. Under **New console**, click on **Bash**. This opens a command line terminal running in the cloud.
+---
 
-### Step 3: Upload Your Files via the Web Interface
-Instead of using command line editors, you can easily upload the files directly from your computer using PythonAnywhere's web dashboard:
+### Step 2: Create a Deployment Service
+1. Inside your Northflank project, click **Create Service** → **Deployment Service**.
+2. Service Details:
+   - **Service Name**: `telegram-translator-bot`
+   - **Service Type**: **Deployment Service** (runs continuously as a background daemon/worker).
 
-1. Click on the **Files** tab at the top of your PythonAnywhere page.
-2. In the **Directories** section on the right, type `telegram-translator-bot` in the text box next to "New directory" and click the **New directory** button.
-3. Click on the newly created `telegram-translator-bot` folder to open it.
-4. On the left side under **Upload a file**, click the button and upload the following files from your local computer:
-   - **`bot.py`** (Located at `c:\Users\red\Documents\2026\AG\telegram-translator-bot\bot.py`)
-   - **`requirements.txt`** (Located at `c:\Users\red\Documents\2026\AG\telegram-translator-bot\requirements.txt`)
-   - **`.env`** (Located at `c:\Users\red\Documents\2026\AG\telegram-translator-bot\.env` — *Note: on Windows, files starting with a dot might be hidden. You can show hidden files, or simply upload it directly*).
+---
 
-*(Once uploaded, you can click on `.env` on PythonAnywhere to view/edit it if you want to update the API keys later).*
+### Step 3: Configure Build Source (GitHub & Dockerfile)
+1. Under **Source**: Select **Version Control (Git)**.
+2. Select your repository: `Redeatke/telegram-translator-bot` (or your GitHub account).
+3. **Branch**: `master`.
+4. **Build Type**: Select **Dockerfile**.
+5. **Dockerfile path**: `Dockerfile` (root directory).
+6. **Build Context**: `/` (root directory).
 
-### Step 4: Install Dependencies
-In the PythonAnywhere Bash console (inside the `telegram-translator-bot` directory), run:
-```bash
-pip3 install --user -r requirements.txt
-```
+> [!NOTE]
+> The included `Dockerfile` installs `ffmpeg`, `Node.js`, `Deno`, `fonts-dejavu-core`, and sets up `bgutil-pot-provider` so YouTube media downloads and quote sticker generation work out of the box.
 
-### Step 5: Start the Bot
-Run the bot to verify it starts correctly:
-```bash
-python3 bot.py
-```
-You should see:
-`[INFO] Telegram Translation Bot is now running!`
+---
 
-Test the bot in Telegram to make sure it responds. If it works, press `Ctrl+C` in the console to stop it.
+### Step 4: Configure Environment Variables
 
-### Step 6: Keep it Running 24/7 (Free Tier Method)
-On PythonAnywhere, **Always-on tasks** and **Scheduled tasks** require a paid plan. However, you can run the bot 24/7 completely free inside a standard **Bash Console**:
+Under **Environment Variables** (or **Secrets**), add the following keys:
 
-1. Open your **Bash Console** (inside the `telegram-translator-bot` directory).
-2. Start the bot:
-   ```bash
-   python3 bot.py
+| Variable Name | Required | Description / Example |
+| :--- | :---: | :--- |
+| `TELEGRAM_BOT_TOKEN` | **Yes** | Your Telegram bot token from [@BotFather](https://t.me/BotFather). |
+| `ADMIN_USER_ID` | **Recommended** | Your numeric Telegram user ID (enables `/admin` and `/maintenance` control panel). |
+| `DOWNLOADS_ENABLED` | Optional | Set to `true` (default) or `false` to toggle media downloader. |
+| `LOG_LEVEL` | Optional | Set to `INFO` (or `DEBUG` for troubleshooting). |
+| `YOUTUBE_COOKIE` | Optional | Netscape-format YouTube cookies string for HQ/restricted YouTube streams. |
+
+---
+
+### Step 5: Networking & Resources
+1. **Ports / Networking**:
+   - Because the bot operates via Telegram **Long Polling** (`Application.run_polling()`), **no public HTTP ports need to be exposed**.
+   - You can leave public networking disabled (internal worker).
+2. **Resources**:
+   - **Compute plan**: `Micro` (0.5 vCPU / 512MB RAM) or `Small` is recommended to ensure smooth video processing with `ffmpeg`.
+
+---
+
+### Step 6: Deploy & Verify
+1. Click **Deploy Service** (or **Create Service**).
+2. Northflank will clone the repository, build the Docker image, and start the bot container.
+3. Open the **Logs** tab in Northflank. You should see:
+   ```text
+   [INFO] Telegram Translation Bot is now running!
+   [INFO] Active Admin ID: 123456789
    ```
-3. Once you see `[INFO] Telegram Translation Bot is now running!`, you can **close your browser tab and turn off your computer**.
-4. The process will continue running on PythonAnywhere's servers!
+4. Open Telegram and test:
+   - Send `/start` or `/ping` in DM to verify responsiveness.
+   - Reply to any message with `/q` to test quote stickers.
+   - Run `/admin` or `/maintenance` to test the owner control panel.
 
-#### How to manage or restart the bot later:
-- If the bot ever stops responding (usually only if PythonAnywhere restarts their servers for monthly maintenance, or if the process encounters an error), just:
-  1. Log into PythonAnywhere.
-  2. Go to the **Consoles** tab.
-  3. Under **Active consoles**, click on your previous `Bash` console.
-  4. Run `python3 bot.py` again to start it back up!
-- If you want to stop the bot manually:
-  1. Open the active console on PythonAnywhere.
-  2. Press `Ctrl+C` to stop it.
+---
 
-*Note: PythonAnywhere free accounts require you to click a "Renew" button on your dashboard once every 30 days (they will send you an email reminder) to keep your account active.*
+## 🔄 Updating & Redeploying
+
+### Automatic Redeploys (CI/CD)
+Whenever you push code changes to GitHub:
+```bash
+git add .
+git commit -m "feat: new feature"
+git push origin master
+```
+Northflank will detect the commit on `master`, build the new container image, and switch traffic seamlessly without manual intervention.
+
+### Manual Restart / Rebuild
+If you ever need to restart or force a fresh container build:
+1. Go to your service in Northflank.
+2. Click the **Actions** dropdown (top right).
+3. Click **Restart Service** or **Rebuild**.
+
+---
+
+## ⚠️ Important Deployment Notes
+
+* **Single Instance Rule**: Never run `python bot.py` locally while the Northflank container is active. Telegram only allows one active long-polling connection per bot token. Running two simultaneously will cause conflict errors (`Conflict: terminated by other getUpdates request`) and duplicate responses.
+* **Remote Maintenance Mode**: If you need to pause the bot without logging into Northflank, simply send `/maintenance` in Telegram DM to toggle maintenance mode on or off instantly across all chats.

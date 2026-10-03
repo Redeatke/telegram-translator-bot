@@ -48,21 +48,55 @@ CARD_REPLY_BG = (35, 38, 55)         # Reply container background
 
 # ─── Font Loading ──────────────────────────────────────────────────────────────
 
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+
+
 def _load_font(font_names: list, size: int) -> ImageFont.FreeTypeFont:
-    """Try to load a font from a list of candidates, falling back to default."""
+    """Try to load a font from bundled fonts or system candidates, falling back to default."""
+    # 1. Check bundled fonts in assets/fonts/
+    for name in font_names:
+        base_name = os.path.basename(name)
+        bundled_path = os.path.join(FONTS_DIR, base_name)
+        if os.path.isfile(bundled_path):
+            try:
+                return ImageFont.truetype(bundled_path, size)
+            except Exception:
+                pass
+
+    # 2. Check system font paths
     for name in font_names:
         try:
             return ImageFont.truetype(name, size)
         except Exception:
             continue
-    return ImageFont.load_default()
+
+    # 3. Fallback to Pillow's load_default (with size if supported)
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
 
 
-FONT_USERNAME = lambda size=22: _load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeuib.ttf"], size)
-FONT_BODY = lambda size=20: _load_font(["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"], size)
-FONT_META = lambda size=14: _load_font(["arial.ttf", "DejaVuSans.ttf", "segoeui.ttf"], size)
-FONT_REPLY_NAME = lambda size=16: _load_font(["arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeuib.ttf"], size)
-FONT_REPLY_TEXT = lambda size=15: _load_font(["arial.ttf", "DejaVuSans.ttf", "segoeui.ttf"], size)
+FONT_USERNAME = lambda size=22: _load_font(
+    ["DejaVuSans-Bold.ttf", "arialbd.ttf", "segoeuib.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    size
+)
+FONT_BODY = lambda size=20: _load_font(
+    ["DejaVuSans.ttf", "segoeui.ttf", "arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    size
+)
+FONT_META = lambda size=14: _load_font(
+    ["DejaVuSans.ttf", "arial.ttf", "segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    size
+)
+FONT_REPLY_NAME = lambda size=16: _load_font(
+    ["DejaVuSans-Bold.ttf", "arialbd.ttf", "segoeuib.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    size
+)
+FONT_REPLY_TEXT = lambda size=15: _load_font(
+    ["DejaVuSans.ttf", "arial.ttf", "segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    size
+)
 
 
 # ─── Text Wrapping ─────────────────────────────────────────────────────────────
@@ -130,7 +164,7 @@ def _draw_avatar_placeholder(draw: ImageDraw.ImageDraw, x: int, y: int, size: in
 
     if glow:
         # Glow ring (cyan)
-        for r_offset in range(4, 0, -1):
+        for r_offset in range(3, 0, -1):
             glow_color = (CARD_ACCENT_CYAN[0], CARD_ACCENT_CYAN[1], CARD_ACCENT_CYAN[2])
             draw.ellipse(
                 [(cx - radius - r_offset, cy - radius - r_offset),
@@ -142,11 +176,12 @@ def _draw_avatar_placeholder(draw: ImageDraw.ImageDraw, x: int, y: int, size: in
     draw.ellipse([(x, y), (x + size, y + size)], fill=(30, 35, 55), outline=CARD_ACCENT_CYAN, width=2)
 
     # Initial letter
-    font = FONT_USERNAME(size // 2)
-    bbox = draw.textbbox((0, 0), initial, font=font)
+    clean_initial = (initial.strip()[:1] if initial else "?").upper()
+    font = FONT_USERNAME(int(size * 0.45))
+    bbox = draw.textbbox((0, 0), clean_initial, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
-    draw.text((cx - tw // 2, cy - th // 2 - 2), initial, font=font, fill=CARD_TEXT_PRIMARY)
+    draw.text((cx - tw // 2, cy - th // 2 - 2), clean_initial, font=font, fill=CARD_TEXT_PRIMARY)
 
 
 # ─── Quote Card Generation (for text messages) ────────────────────────────────
@@ -187,9 +222,9 @@ def generate_quote_card(
     text = _clean_text(text) or "(no text)"
     username = _clean_text(username) or "User"
 
-    PADDING = 24
-    AVATAR_SIZE = 44
-    REPLY_AVATAR_SIZE = 32
+    PADDING = 20
+    AVATAR_SIZE = 40
+    REPLY_AVATAR_SIZE = 30
     CARD_WIDTH = STICKER_SIZE
 
     # ── Measure text to compute dynamic card height ──
@@ -225,21 +260,18 @@ def generate_quote_card(
         reply_line_h = (reply_sample[3] - reply_sample[1]) + 4
 
     # Calculate section heights
-    header_h = AVATAR_SIZE + 8
-    body_h = len(body_lines) * line_height + 12
+    header_h = AVATAR_SIZE + 6
+    body_h = len(body_lines) * line_height + 4
 
     reply_section_h = 0
     if has_reply:
         # Reply header (avatar + name) + reply text + spacing
         reply_header_h = REPLY_AVATAR_SIZE + 4
-        reply_body_h = len(reply_lines) * reply_line_h + 8
-        reply_section_h = reply_header_h + reply_body_h + 12  # 12px gap before main quote
+        reply_body_h = len(reply_lines) * reply_line_h + 6
+        reply_section_h = reply_header_h + reply_body_h + 10  # gap before main quote
 
     total_h = PADDING + reply_section_h + header_h + body_h + PADDING
-    CARD_HEIGHT = max(total_h, 200)
-
-    if CARD_HEIGHT > STICKER_SIZE:
-        CARD_HEIGHT = STICKER_SIZE
+    CARD_HEIGHT = min(max(total_h, 105), STICKER_SIZE)
 
     # ── Create the card ──
     img = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
@@ -310,20 +342,21 @@ def generate_quote_card(
     avatar_x = PADDING
     avatar_y = y
 
+    initial_char = username[0].upper() if username else "?"
     if avatar_bytes:
         drawn = _draw_circular_avatar(img, avatar_bytes, avatar_x, avatar_y, AVATAR_SIZE)
         if not drawn:
-            _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username[0].upper())
+            _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, initial_char)
     else:
-        _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username[0].upper())
+        _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, initial_char)
 
-    name_x = avatar_x + AVATAR_SIZE + 12
+    name_x = avatar_x + AVATAR_SIZE + 10
     draw.text((name_x, avatar_y + 2), username, font=font_user, fill=CARD_TEXT_PRIMARY)
 
     if timestamp:
-        draw.text((name_x, avatar_y + 26), timestamp, font=font_meta, fill=CARD_TEXT_SECONDARY)
+        draw.text((name_x, avatar_y + 24), timestamp, font=font_meta, fill=CARD_TEXT_SECONDARY)
 
-    y += header_h + 4
+    y += header_h + 2
 
     # Accent bar (gradient cyan → purple)
     bar_x = PADDING

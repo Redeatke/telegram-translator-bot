@@ -3847,7 +3847,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
 # ─── Quote Sticker Command (/q) ──────────────────────────────────────────────
 
-async def _get_user_avatar_bytes(bot, user) -> bytes:
+async def _get_user_avatar_bytes(bot, user) -> Optional[bytes]:
     """Download a user's profile photo as bytes, or return None."""
     try:
         photos = await bot.get_user_profile_photos(user.id, limit=1)
@@ -3856,8 +3856,89 @@ async def _get_user_avatar_bytes(bot, user) -> bytes:
             tg_file = await bot.get_file(photo.file_id)
             return bytes(await tg_file.download_as_bytearray())
     except Exception as e:
-        logger.debug(f"Could not fetch avatar for user {user.id}: {e}")
+        logger.debug(f"Could not fetch avatar for user {getattr(user, 'id', None)}: {e}")
     return None
+
+
+async def _get_chat_avatar_bytes(bot, chat) -> Optional[bytes]:
+    """Download a chat or channel's avatar as bytes, or return None."""
+    try:
+        chat_id = getattr(chat, "id", None)
+        if not chat_id:
+            return None
+        chat_obj = await bot.get_chat(chat_id)
+        if chat_obj and chat_obj.photo:
+            tg_file = await bot.get_file(chat_obj.photo.big_file_id)
+            return bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        logger.debug(f"Could not fetch avatar for chat: {e}")
+    return None
+
+
+async def _extract_author_and_avatar(bot, msg) -> tuple[str, Optional[bytes]]:
+    """
+    Extract author name and avatar bytes from a message,
+    properly supporting forwarded messages (Telegram Bot API 7.0+ MessageOrigin and legacy forwards).
+    """
+    author_name = None
+    author_user = None
+    author_chat = None
+
+    # 1. Telegram Bot API 7.0+ MessageOrigin
+    fo = getattr(msg, "forward_origin", None)
+    if fo:
+        # MessageOriginUser
+        if getattr(fo, "sender_user", None):
+            author_user = fo.sender_user
+            author_name = author_user.first_name
+            if getattr(author_user, "last_name", None):
+                author_name = f"{author_user.first_name} {author_user.last_name}"
+        # MessageOriginHiddenUser (user has forward privacy enabled)
+        elif getattr(fo, "sender_user_name", None):
+            author_name = fo.sender_user_name
+        # MessageOriginChat
+        elif getattr(fo, "sender_chat", None):
+            author_chat = fo.sender_chat
+            author_name = getattr(author_chat, "title", None) or "Chat"
+        # MessageOriginChannel
+        elif getattr(fo, "chat", None):
+            author_chat = fo.chat
+            author_name = getattr(author_chat, "title", None) or "Channel"
+
+    # 2. Legacy forward attributes (pre-7.0 or fallback)
+    if not author_name:
+        if getattr(msg, "forward_from", None):
+            author_user = msg.forward_from
+            author_name = author_user.first_name
+            if getattr(author_user, "last_name", None):
+                author_name = f"{author_user.first_name} {author_user.last_name}"
+        elif getattr(msg, "forward_sender_name", None):
+            author_name = msg.forward_sender_name
+        elif getattr(msg, "forward_from_chat", None):
+            author_chat = msg.forward_from_chat
+            author_name = getattr(author_chat, "title", None) or "Channel"
+
+    # 3. Direct message author fallback (if not a forward)
+    if not author_name:
+        if getattr(msg, "from_user", None):
+            author_user = msg.from_user
+            author_name = author_user.first_name
+            if getattr(author_user, "last_name", None):
+                author_name = f"{author_user.first_name} {author_user.last_name}"
+        elif getattr(msg, "sender_chat", None):
+            author_chat = msg.sender_chat
+            author_name = getattr(author_chat, "title", None) or "Chat"
+
+    author_name = (author_name or "User").strip()
+
+    # 4. Fetch avatar bytes
+    avatar_bytes = None
+    if author_user:
+        avatar_bytes = await _get_user_avatar_bytes(bot, author_user)
+    elif author_chat:
+        avatar_bytes = await _get_chat_avatar_bytes(bot, author_chat)
+
+    return author_name, avatar_bytes
 
 
 async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False) -> str:
@@ -4065,13 +4146,7 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             for msg in messages_to_quote:
                 msg_text = msg.text or msg.caption or ""
-                msg_user = msg.from_user
-                username = msg_user.first_name if msg_user else "Unknown"
-
-                # Get avatar
-                avatar_bytes = None
-                if msg_user:
-                    avatar_bytes = await _get_user_avatar_bytes(context.bot, msg_user)
+                username, avatar_bytes = await _extract_author_and_avatar(context.bot, msg)
 
                 # Check for reply context
                 reply_username = None
@@ -4079,10 +4154,8 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_avatar_bytes = None
                 if include_reply_context and msg.reply_to_message:
                     reply_msg = msg.reply_to_message
-                    reply_username = reply_msg.from_user.first_name if reply_msg.from_user else "Unknown"
                     reply_text = reply_msg.text or reply_msg.caption or ""
-                    if reply_msg.from_user:
-                        reply_avatar_bytes = await _get_user_avatar_bytes(context.bot, reply_msg.from_user)
+                    reply_username, reply_avatar_bytes = await _extract_author_and_avatar(context.bot, reply_msg)
 
                 # Generate the card
                 sticker_bytes = quote_sticker.generate_quote_card(

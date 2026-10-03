@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# Install system dependencies: ffmpeg, Node.js, curl, git, and deno (yt-dlp default JS runtime)
+# Install system dependencies: ffmpeg, Node.js, curl, git, fonts, and deno (yt-dlp default JS runtime)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg nodejs npm git curl unzip && \
+    ffmpeg nodejs npm git curl unzip fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/* && \
     curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 

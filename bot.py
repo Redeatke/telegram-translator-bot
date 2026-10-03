@@ -6,10 +6,48 @@ import html
 import tempfile
 import uuid
 import time
+from datetime import datetime, timezone
 import json
 import base64
 import threading
 from dotenv import load_dotenv
+
+# Anti-flood guards: ignore stale backlogs and deduplicate messages
+BOT_STARTUP_TIME = time.time()
+_PROCESSED_MESSAGES = set()
+_MAX_PROCESSED_MESSAGES = 10000
+
+def should_skip_message(message, max_age_seconds: int = 120) -> bool:
+    """
+    Check if a message should be skipped:
+    1. If message is older than max_age_seconds (prevents re-processing backlogs).
+    2. If message was sent before this bot process started.
+    3. If message (chat_id, message_id) has already been processed in this session.
+    """
+    if not message:
+        return True
+
+    # 1. Deduplication check
+    key = (message.chat_id, message.message_id)
+    if key in _PROCESSED_MESSAGES:
+        return True
+
+    # 2. Age check (prevents replay floods from past backlog)
+    if message.date:
+        now_utc = datetime.now(timezone.utc)
+        age = (now_utc - message.date).total_seconds()
+        if age > max_age_seconds:
+            logger.info(f"Skipping stale message {message.message_id} in {message.chat_id} (age: {age:.1f}s)")
+            return True
+        if message.date.timestamp() < (BOT_STARTUP_TIME - 5):
+            logger.info(f"Skipping pre-startup message {message.message_id} in {message.chat_id}")
+            return True
+
+    # Mark as processed
+    if len(_PROCESSED_MESSAGES) > _MAX_PROCESSED_MESSAGES:
+        _PROCESSED_MESSAGES.clear()
+    _PROCESSED_MESSAGES.add(key)
+    return False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import (
@@ -2274,6 +2312,9 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
     if not match:
         return
 
+    if should_skip_message(update.message):
+        return
+
     chat_id = update.effective_chat.id
     if not is_downloader_enabled(chat_id, "youtube"):
         return
@@ -2433,6 +2474,9 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
     text = update.message.text.strip()
     match = TWITCH_CLIP_PATTERN.search(text)
     if not match:
+        return
+
+    if should_skip_message(update.message):
         return
 
     chat_id = update.effective_chat.id
@@ -2992,6 +3036,7 @@ async def handle_threads_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     match = THREADS_URL_PATTERN.search(text)
     if not match: return
+    if should_skip_message(update.message): return
     url = match.group(0)
 
     chat_id = update.effective_chat.id
@@ -3018,6 +3063,7 @@ async def handle_tiktok_message(update: Update, context: ContextTypes.DEFAULT_TY
     text = update.message.text.strip()
     match = TIKTOK_URL_PATTERN.search(text)
     if not match: return
+    if should_skip_message(update.message): return
     url = match.group(0)
 
     chat_id = update.effective_chat.id
@@ -3044,6 +3090,7 @@ async def handle_instagram_message(update: Update, context: ContextTypes.DEFAULT
     text = update.message.text.strip()
     match = INSTAGRAM_URL_PATTERN.search(text)
     if not match: return
+    if should_skip_message(update.message): return
     url = match.group(0)
 
     chat_id = update.effective_chat.id
@@ -3070,6 +3117,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
     text = update.message.text.strip()
     match = REDDIT_URL_PATTERN.search(text)
     if not match: return
+    if should_skip_message(update.message): return
     raw_url = match.group(0)
 
     chat_id = update.effective_chat.id
@@ -3371,6 +3419,9 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     match = TWITTER_URL_PATTERN.search(text)
     if not match:
+        return
+
+    if should_skip_message(update.message):
         return
 
     chat_id = update.effective_chat.id
@@ -4051,6 +4102,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
         return
 
+    if should_skip_message(update.message):
+        return
+
     if update.message.text.startswith("/"):
         return
 
@@ -4501,6 +4555,7 @@ def main() -> None:
             port=port,
             url_path=TELEGRAM_BOT_TOKEN,
             webhook_url=webhook_url,
+            drop_pending_updates=True,
         )
     else:
         # ─── Local / other: Use polling mode ───
@@ -4509,7 +4564,7 @@ def main() -> None:
         print("  Translation Bot is now running!")
         print("  Press Ctrl+C to stop.")
         print("-" * 45 + "\n")
-        application.run_polling(bootstrap_retries=-1)
+        application.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":

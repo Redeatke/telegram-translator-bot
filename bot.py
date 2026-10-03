@@ -49,6 +49,19 @@ def should_skip_message(message, max_age_seconds: int = 120) -> bool:
     _PROCESSED_MESSAGES.add(key)
     return False
 
+
+async def safe_answer_query(query, *args, **kwargs) -> bool:
+    """Safely answer callback queries, ignoring expired query timeout errors."""
+    if not query:
+        return False
+    try:
+        await query.answer(*args, **kwargs)
+        return True
+    except Exception as e:
+        logger.debug(f"Suppressed expired callback query answer error: {e}")
+        return False
+
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import (
     Application,
@@ -1714,7 +1727,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Translate text from a command argument or a replied-to message."""
     user = update.effective_user
-    if not user:
+    if not user or not update.message or should_skip_message(update.message):
         return
 
     text_to_translate = None
@@ -3800,7 +3813,7 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       /q 2 5      – For video: clip from 2s to 5s as a video sticker
     """
     user = update.effective_user
-    if not user:
+    if not user or not update.message or should_skip_message(update.message):
         return
 
     if is_maintenance_active_for_user(user.id):
@@ -4016,7 +4029,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
       /gif 4 10   – Convert from 4s to 10s to GIF
     """
     user = update.effective_user
-    if not user:
+    if not user or not update.message or should_skip_message(update.message):
         return
 
     if is_maintenance_active_for_user(user.id):

@@ -730,19 +730,44 @@ def _detect_by_unicode_script(text: str) -> str:
     return max(script_counts, key=script_counts.get)
 
 
+COMMON_ENGLISH_WORDS = {
+    "hi", "hello", "hey", "how", "are", "you", "i", "im", "i'm", "me", "my",
+    "the", "is", "it", "it's", "this", "that", "goat", "good", "great",
+    "what", "why", "where", "who", "when", "yes", "no", "ok", "okay", "bro",
+    "cool", "nice", "yeah", "yep", "nah", "love", "like", "lol", "lmao",
+    "thanks", "thank", "please", "can", "could", "will", "would", "do", "did",
+    "we", "us", "our", "he", "she", "they", "them", "their", "so", "much",
+    "see", "seen", "saw", "go", "going", "went", "come", "came", "here", "there",
+    "not", "all", "for", "with", "about", "just", "get", "got", "know", "think",
+}
+
+
 def detect_language_code(text: str) -> str:
-    """Detect the language code of the text using langdetect with Unicode script fallback."""
-    # Try langdetect first (good for Latin-script languages)
+    """Detect the language code of the text using Unicode scripts, common word matching, and langdetect."""
+    if not text:
+        return "auto"
+
+    # 1. Non-Latin Unicode scripts (Amharic, Arabic, CJK, etc.)
+    script_lang = _detect_by_unicode_script(text)
+    if script_lang:
+        return script_lang
+
+    # 2. Check for common short English words to avoid langdetect misclassifying "hi" or "my goat"
+    tokens = [re.sub(r'[^a-zA-Z]', '', w).lower() for w in text.split()]
+    tokens = [w for w in tokens if w]
+    if tokens:
+        english_match_count = sum(1 for w in tokens if w in COMMON_ENGLISH_WORDS)
+        if english_match_count >= max(1, (len(tokens) + 1) // 2):
+            return "en"
+
+    # 3. Fall back to langdetect
     try:
         lang = detect(text)
         if lang:
             return lang.lower()
     except Exception:
         pass
-    # Fallback: detect by Unicode script (catches Amharic, Arabic, CJK, etc.)
-    script_lang = _detect_by_unicode_script(text)
-    if script_lang:
-        return script_lang
+
     return "auto"
 
 
@@ -836,24 +861,39 @@ async def _translate_google_direct(text: str, target_lang: str) -> str:
         return result
 
 
-async def _translate_mymemory(text: str, target_lang: str) -> str:
+async def _translate_mymemory(text: str, target_lang: str, src_lang: str = "auto") -> str:
     """Translate text using MyMemory free API (5000 chars/day, no API key needed)."""
+    if not src_lang or src_lang in ["auto", "??"]:
+        src_lang = detect_language_code(text)
+    if not src_lang or src_lang in ["auto", "??"]:
+        src_lang = "en"
+
+    if src_lang.lower() == target_lang.lower():
+        return text
+
     url = "https://api.mymemory.translated.net/get"
     params = {
         "q": text[:500],  # MyMemory has a 500-char per-request limit on free tier
-        "langpair": f"auto|{target_lang}",
+        "langpair": f"{src_lang.lower()}|{target_lang.lower()}",
     }
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
+        status = data.get("responseStatus")
         translated = data.get("responseData", {}).get("translatedText", "")
-        if not translated or translated.upper() == text.upper():
-            raise ValueError("MyMemory returned empty or identical text")
+        if (
+            status != 200
+            or not translated
+            or "INVALID SOURCE LANGUAGE" in translated.upper()
+            or "MYMEMORY WARNING" in translated.upper()
+            or translated.upper() == text.upper()
+        ):
+            raise ValueError(f"MyMemory returned invalid response: {translated}")
         return translated
 
 
-async def translate_free(text: str, target_lang: str) -> str:
+async def translate_free(text: str, target_lang: str, src_lang: str = "auto") -> str:
     """Translate text using deep-translator first, falling back to direct Google API, then MyMemory."""
     loop = asyncio.get_running_loop()
     # Attempt 1: deep-translator library
@@ -876,7 +916,7 @@ async def translate_free(text: str, target_lang: str) -> str:
 
     # Attempt 3: MyMemory free API
     try:
-        translated = await _translate_mymemory(text, target_lang)
+        translated = await _translate_mymemory(text, target_lang, src_lang=src_lang)
         return translated
     except Exception as e3:
         logger.error(f"All translation engines failed. Last error (MyMemory): {e3}")
@@ -1845,7 +1885,7 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # 2. Free engine (or fallback)
     if not translated_text:
         try:
-            translated_text = await translate_free(text_to_translate, target_lang)
+            translated_text = await translate_free(text_to_translate, target_lang, src_lang=src_lang)
         except Exception:
             await update.message.reply_text(
                 fmt_error("Translation failed. Please try again later."),
@@ -4152,7 +4192,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # 2. Free engine (or fallback)
     if not translated_text:
         try:
-            translated_text = await translate_free(text, target_lang)
+            translated_text = await translate_free(text, target_lang, src_lang=src_lang)
         except Exception:
             await update.message.reply_text(
                 fmt_error("Translation failed. Please try again later."),

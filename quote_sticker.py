@@ -35,7 +35,7 @@ MAX_VIDEO_STICKER_SIZE_KB = 256
 MAX_GIF_DURATION = 30       # seconds — reasonable limit for GIFs
 
 # ─── Card Design Colors & Fonts ────────────────────────────────────────────────
-# Design 1: Glassmorphism (default — user can choose)
+# Design: Glassmorphism dark
 
 CARD_BG_PRIMARY = (26, 27, 46)       # #1a1b2e
 CARD_BG_SECONDARY = (13, 14, 26)     # #0d0e1a
@@ -45,6 +45,20 @@ CARD_TEXT_SECONDARY = (140, 150, 170) # Muted text
 CARD_ACCENT_CYAN = (0, 220, 220)     # Cyan glow
 CARD_ACCENT_PURPLE = (140, 80, 220)  # Purple accent
 CARD_REPLY_BG = (35, 38, 55)         # Reply container background
+
+# Avatar color palette — vibrant, varied colors for initial-letter placeholder avatars
+AVATAR_COLORS = [
+    (0, 170, 190),    # Teal
+    (140, 80, 220),   # Purple
+    (220, 80, 100),   # Crimson
+    (50, 170, 100),   # Emerald
+    (230, 140, 40),   # Amber
+    (70, 130, 220),   # Azure
+    (200, 70, 160),   # Magenta
+    (100, 180, 60),   # Lime
+    (200, 100, 50),   # Burnt orange
+    (100, 70, 200),   # Indigo
+]
 
 # ─── Font Loading ──────────────────────────────────────────────────────────────
 
@@ -97,12 +111,161 @@ FONT_REPLY_TEXT = lambda size=15: _load_font(
     ["DejaVuSans.ttf", "arial.ttf", "segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
     size
 )
+FONT_EMOJI = lambda size=20: _load_font(
+    ["NotoEmoji.ttf", "NotoEmoji-Bold.ttf", "NotoEmoji-Regular.ttf",
+     "Segoe UI Emoji.ttf",
+     "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+     "/usr/share/fonts/noto-emoji/NotoEmoji-Regular.ttf"],
+    size
+)
+
+# Detect if a real emoji font is available (vs Pillow's fallback bitmap font)
+_emoji_font_available = False
+try:
+    _test_emoji_font = FONT_EMOJI(20)
+    _emoji_font_available = isinstance(_test_emoji_font, ImageFont.FreeTypeFont)
+    if _emoji_font_available:
+        logger.info("Emoji font loaded successfully for quote cards.")
+except Exception:
+    pass
+
+
+# ─── Emoji Detection & Dual-Font Rendering ────────────────────────────────────
+
+def _is_emoji_char(ch: str) -> bool:
+    """Check if a single character is an emoji that needs the emoji font."""
+    cp = ord(ch)
+    return (
+        0x1F600 <= cp <= 0x1F64F or  # Emoticons (😀-🙏)
+        0x1F300 <= cp <= 0x1F5FF or  # Misc Symbols and Pictographs (🌀-🗿)
+        0x1F680 <= cp <= 0x1F6FF or  # Transport and Map (🚀-🛿)
+        0x1F900 <= cp <= 0x1F9FF or  # Supplemental Symbols (🤐-🧿)
+        0x1FA00 <= cp <= 0x1FA6F or  # Chess Symbols
+        0x1FA70 <= cp <= 0x1FAFF or  # Symbols Extended-A (🩰-🫿)
+        0x2600 <= cp <= 0x26FF or    # Misc symbols (☀☂⚡ etc.)
+        0x2700 <= cp <= 0x27BF or    # Dingbats (✂✈✉ etc.)
+        0xFE00 <= cp <= 0xFE0F or    # Variation Selectors
+        cp == 0x200D or              # Zero Width Joiner (emoji sequences)
+        cp == 0x20E3 or              # Combining Enclosing Keycap
+        0x1F1E0 <= cp <= 0x1F1FF or  # Regional Indicator Symbols (flags)
+        0xE0020 <= cp <= 0xE007F or  # Tags (flag sub-regions)
+        0x2300 <= cp <= 0x23FF or    # Misc Technical (⌚⏰ etc.)
+        0x2B05 <= cp <= 0x2B07 or    # Arrows ⬅⬆⬇
+        0x2B1B <= cp <= 0x2B1C or    # Squares ⬛⬜
+        cp == 0x2B50 or              # Star ⭐
+        cp == 0x2B55 or              # Circle ⭕
+        0x2934 <= cp <= 0x2935 or    # Curved arrows ⤴⤵
+        cp == 0x3030 or              # Wavy dash 〰
+        cp == 0x303D or              # Part alternation mark 〽
+        cp == 0x3297 or              # ㊗
+        cp == 0x3299 or              # ㊙
+        cp == 0x00A9 or              # ©
+        cp == 0x00AE or              # ®
+        cp == 0x2122 or              # ™
+        0x231A <= cp <= 0x231B or    # ⌚⌛
+        0x23E9 <= cp <= 0x23F3 or    # ⏩-⏳
+        0x23F8 <= cp <= 0x23FA or    # ⏸-⏺
+        0x25AA <= cp <= 0x25AB or    # ▪▫
+        cp == 0x25B6 or              # ▶
+        cp == 0x25C0 or              # ◀
+        0x25FB <= cp <= 0x25FE or    # ◻◼◽◾
+        cp == 0x2611 or              # ☑
+        cp == 0x2614 or              # ☔
+        cp == 0x2615 or              # ☕
+        0x2648 <= cp <= 0x2653 or    # Zodiac ♈-♓
+        cp == 0x267F or              # ♿
+        cp == 0x2693 or              # ⚓
+        cp == 0x26A1 or              # ⚡
+        0x2702 <= cp <= 0x2704 or    # ✂-✄
+        0x270A <= cp <= 0x270D or    # ✊-✍
+        cp == 0x270F or              # ✏
+        cp == 0x2712 or              # ✒
+        cp == 0x2714 or              # ✔
+        cp == 0x2716 or              # ✖
+        cp == 0x271D or              # ✝
+        cp == 0x2721 or              # ✡
+        cp == 0x2728 or              # ✨
+        cp == 0x2733 or              # ✳
+        cp == 0x2734 or              # ✴
+        cp == 0x2744 or              # ❄
+        cp == 0x2747 or              # ❇
+        cp == 0x274C or              # ❌
+        cp == 0x274E or              # ❎
+        0x2753 <= cp <= 0x2755 or    # ❓❔❕
+        cp == 0x2757 or              # ❗
+        0x2763 <= cp <= 0x2764 or    # ❣❤
+        0x2795 <= cp <= 0x2797 or    # ➕➖➗
+        cp == 0x27A1 or              # ➡
+        cp == 0x27B0 or              # ➰
+        cp == 0x27BF or              # ➿
+        0x1F700 <= cp <= 0x1F77F or  # Alchemical Symbols
+        0x1F780 <= cp <= 0x1F7FF or  # Geometric Shapes Extended
+        0x1F800 <= cp <= 0x1F8FF     # Supplemental Arrows-C
+    )
+
+
+def _split_emoji_segments(text: str) -> List[tuple]:
+    """Split text into runs of (text, is_emoji) for dual-font rendering."""
+    if not text:
+        return []
+    segments = []
+    current_chars = []
+    current_is_emoji = _is_emoji_char(text[0])
+    for ch in text:
+        is_emoji = _is_emoji_char(ch)
+        if is_emoji == current_is_emoji:
+            current_chars.append(ch)
+        else:
+            segments.append(("".join(current_chars), current_is_emoji))
+            current_chars = [ch]
+            current_is_emoji = is_emoji
+    if current_chars:
+        segments.append(("".join(current_chars), current_is_emoji))
+    return segments
+
+
+def _measure_text_width(text: str, font, emoji_font, draw: ImageDraw.ImageDraw) -> int:
+    """Measure text pixel width, using the correct font for each emoji/text segment."""
+    if not text:
+        return 0
+    if not emoji_font or not _emoji_font_available:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0]
+    total = 0.0
+    for seg_text, is_emoji in _split_emoji_segments(text):
+        f = emoji_font if is_emoji else font
+        try:
+            total += f.getlength(seg_text)
+        except AttributeError:
+            bbox = draw.textbbox((0, 0), seg_text, font=f)
+            total += bbox[2] - bbox[0]
+    return int(total)
+
+
+def _draw_text_with_emoji(draw: ImageDraw.ImageDraw, pos: tuple, text: str,
+                          font, emoji_font, fill):
+    """Draw text at `pos`, using emoji_font for emoji characters."""
+    if not text:
+        return
+    if not emoji_font or not _emoji_font_available:
+        draw.text(pos, text, font=font, fill=fill)
+        return
+    x, y = pos
+    for seg_text, is_emoji in _split_emoji_segments(text):
+        f = emoji_font if is_emoji else font
+        draw.text((int(x), y), seg_text, font=f, fill=fill)
+        try:
+            x += f.getlength(seg_text)
+        except AttributeError:
+            bbox = draw.textbbox((int(x), y), seg_text, font=f)
+            x = bbox[2]
 
 
 # ─── Text Wrapping ─────────────────────────────────────────────────────────────
 
-def _wrap_text(text: str, font, max_width: int, draw: ImageDraw.ImageDraw) -> List[str]:
-    """Wrap text to fit within max_width pixels."""
+def _wrap_text(text: str, font, max_width: int, draw: ImageDraw.ImageDraw,
+               emoji_font=None) -> List[str]:
+    """Wrap text to fit within max_width pixels, with emoji-aware measurement."""
     lines = []
     paragraphs = text.split("\n")
     for p in paragraphs:
@@ -113,8 +276,7 @@ def _wrap_text(text: str, font, max_width: int, draw: ImageDraw.ImageDraw) -> Li
         current_line = []
         for word in words:
             test_line = " ".join(current_line + [word])
-            bbox = draw.textbbox((0, 0), test_line, font=font)
-            width = bbox[2] - bbox[0]
+            width = _measure_text_width(test_line, font, emoji_font, draw)
             if width <= max_width:
                 current_line.append(word)
             else:
@@ -140,6 +302,12 @@ def _clean_text(text: str) -> str:
 
 # ─── Avatar Drawing ────────────────────────────────────────────────────────────
 
+def _get_avatar_color(name: str) -> tuple:
+    """Get a consistent, vibrant avatar background color from a username."""
+    h = sum(ord(c) for c in name) if name else 0
+    return AVATAR_COLORS[h % len(AVATAR_COLORS)]
+
+
 def _draw_circular_avatar(img: Image.Image, avatar_bytes: bytes, x: int, y: int, size: int = 44):
     """Draw a circular avatar onto the image at position (x, y)."""
     try:
@@ -157,31 +325,37 @@ def _draw_circular_avatar(img: Image.Image, avatar_bytes: bytes, x: int, y: int,
         return False
 
 
-def _draw_avatar_placeholder(draw: ImageDraw.ImageDraw, x: int, y: int, size: int, initial: str, glow: bool = True):
-    """Draw a placeholder circular avatar with the user's initial and optional glow ring."""
+def _draw_avatar_placeholder(draw: ImageDraw.ImageDraw, x: int, y: int, size: int,
+                             name: str, glow: bool = True):
+    """Draw a placeholder circular avatar with the user's initial and vibrant per-user color."""
     cx, cy = x + size // 2, y + size // 2
     radius = size // 2
+    bg_color = _get_avatar_color(name)
+    initial = (name.strip()[:1] if name else "?").upper()
 
     if glow:
-        # Glow ring (cyan)
+        # Glow ring in the user's color
         for r_offset in range(3, 0, -1):
-            glow_color = (CARD_ACCENT_CYAN[0], CARD_ACCENT_CYAN[1], CARD_ACCENT_CYAN[2])
             draw.ellipse(
                 [(cx - radius - r_offset, cy - radius - r_offset),
                  (cx + radius + r_offset, cy + radius + r_offset)],
-                outline=glow_color, width=1
+                outline=bg_color, width=1
             )
 
-    # Main circle
-    draw.ellipse([(x, y), (x + size, y + size)], fill=(30, 35, 55), outline=CARD_ACCENT_CYAN, width=2)
+    # Main circle with user-specific vibrant color
+    draw.ellipse([(x, y), (x + size, y + size)], fill=bg_color, outline=None)
 
-    # Initial letter
-    clean_initial = (initial.strip()[:1] if initial else "?").upper()
-    font = FONT_USERNAME(int(size * 0.45))
-    bbox = draw.textbbox((0, 0), clean_initial, font=font)
+    # Initial letter / emoji (white on colored background)
+    font_size = int(size * 0.45)
+    if _is_emoji_char(initial) and _emoji_font_available:
+        font = FONT_EMOJI(font_size)
+    else:
+        font = FONT_USERNAME(font_size)
+
+    bbox = draw.textbbox((0, 0), initial, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
-    draw.text((cx - tw // 2, cy - th // 2 - 2), clean_initial, font=font, fill=CARD_TEXT_PRIMARY)
+    draw.text((cx - tw // 2, cy - th // 2 - 2), initial, font=font, fill=(255, 255, 255))
 
 
 # ─── Quote Card Generation (for text messages) ────────────────────────────────
@@ -198,23 +372,11 @@ def generate_quote_card(
     """
     Generate a glassmorphism-style quote card as a 512px WEBP sticker.
 
-    Layout (when reply context is present):
-      ┌────────────────────────┐
-      │  [reply avatar] reply  │  ← reply context on TOP
-      │  │ reply message text  │
-      │                        │
-      │  [avatar] Username     │  ← main quote on BOTTOM
-      │  │ Main quoted text    │
-      └────────────────────────┘
-
-    Args:
-        username: Name of the person being quoted
-        text: The quoted text
-        avatar_bytes: Optional raw bytes of the quoted user's profile photo
-        reply_username: Optional - who the quoted message was replying to
-        reply_text: Optional - the text being replied to
-        reply_avatar_bytes: Optional raw bytes of the reply user's profile photo
-        timestamp: Optional timestamp string
+    Features:
+      - Dynamic card width: short text produces compact cards, not wide 512px strips
+      - Emoji support: renders emoji characters using NotoEmoji font
+      - Vibrant per-user avatar colors for placeholder initials & emoji avatars
+      - Reply context shown above the main quote
 
     Returns:
         WEBP image bytes suitable for Telegram sticker upload
@@ -222,88 +384,121 @@ def generate_quote_card(
     text = _clean_text(text) or "(no text)"
     username = _clean_text(username) or "User"
 
+    # Layout constants
     PADDING = 20
     AVATAR_SIZE = 40
     REPLY_AVATAR_SIZE = 30
-    CARD_WIDTH = STICKER_SIZE
+    MAX_CONTENT_W = STICKER_SIZE - (PADDING * 2)
 
-    # ── Measure text to compute dynamic card height ──
+    # Standard crisp fonts
+    font_user = FONT_USERNAME(22)
+    font_body = FONT_BODY(20)
+    font_meta = FONT_META(14)
+    font_reply_name = FONT_REPLY_NAME(16)
+    font_reply_text_font = FONT_REPLY_TEXT(15)
+    emoji_font = FONT_EMOJI(20) if _emoji_font_available else None
+    emoji_font_small = FONT_EMOJI(15) if _emoji_font_available else None
+    emoji_font_reply_name = FONT_EMOJI(16) if _emoji_font_available else None
+
     dummy_img = Image.new("RGBA", (1, 1))
-    dummy_draw = ImageDraw.Draw(dummy_img)
+    dd = ImageDraw.Draw(dummy_img)
 
-    font_user = FONT_USERNAME()
-    font_body = FONT_BODY()
-    font_meta = FONT_META()
-    font_reply_name = FONT_REPLY_NAME()
-    font_reply_text_font = FONT_REPLY_TEXT()
-
-    content_width = CARD_WIDTH - (PADDING * 2)
-
-    # Measure main body text
-    body_lines = _wrap_text(text, font_body, content_width - 16, dummy_draw)
+    # Wrap body text at maximum possible width
+    body_lines = _wrap_text(text, font_body, MAX_CONTENT_W - 16, dd,
+                            emoji_font=emoji_font)
     if len(body_lines) > 12:
-        body_lines = body_lines[:11] + ["..."]
+        body_lines = body_lines[:11] + ["…"]
 
-    sample_bbox = dummy_draw.textbbox((0, 0), "Ag", font=font_body)
-    line_height = (sample_bbox[3] - sample_bbox[1]) + 6
+    # Line heights
+    body_sample = dd.textbbox((0, 0), "Ag", font=font_body)
+    line_height = (body_sample[3] - body_sample[1]) + 6
 
-    # Measure reply text (if present)
+    # Measure widest body line
+    max_line_w = 0
+    for line in body_lines:
+        w = _measure_text_width(line, font_body, emoji_font, dd)
+        max_line_w = max(max_line_w, w)
+
+    # Measure username width and timestamp width
+    user_w = _measure_text_width(username, font_user, emoji_font, dd)
+    time_w = _measure_text_width(timestamp, font_meta, emoji_font, dd) if timestamp else 0
+
+    # Reply section measurement
     reply_lines = []
     reply_line_h = 0
     has_reply = bool(reply_username and reply_text)
+    max_reply_line_w = 0
     if has_reply:
         reply_text_clean = _clean_text(reply_text)
-        reply_lines = _wrap_text(reply_text_clean, font_reply_text_font, content_width - 30, dummy_draw)
+        reply_lines = _wrap_text(reply_text_clean, font_reply_text_font,
+                                 MAX_CONTENT_W - 30, dd, emoji_font=emoji_font)
         if len(reply_lines) > 3:
-            reply_lines = reply_lines[:2] + ["..."]
-        reply_sample = dummy_draw.textbbox((0, 0), "Ag", font=font_reply_text_font)
+            reply_lines = reply_lines[:2] + ["…"]
+        reply_sample = dd.textbbox((0, 0), "Ag", font=font_reply_text_font)
         reply_line_h = (reply_sample[3] - reply_sample[1]) + 4
+        for rline in reply_lines:
+            w = _measure_text_width(rline, font_reply_text_font, emoji_font, dd)
+            max_reply_line_w = max(max_reply_line_w, w)
 
-    # Calculate section heights
+    # ── Calculate dynamic card box width ──
+    # Content-based width calculation
+    body_needed_w = PADDING + 16 + max_line_w + PADDING
+    header_needed_w = PADDING + AVATAR_SIZE + 12 + max(user_w, time_w) + PADDING
+    reply_needed_w = 0
+    if has_reply:
+        reply_name_w = _measure_text_width(
+            _clean_text(reply_username), font_reply_name, emoji_font_reply_name, dd
+        )
+        reply_head_w = PADDING + 6 + REPLY_AVATAR_SIZE + 10 + reply_name_w + PADDING
+        reply_body_w = PADDING + 22 + max_reply_line_w + PADDING
+        reply_needed_w = max(reply_head_w, reply_body_w)
+
+    raw_w = max(body_needed_w, header_needed_w, reply_needed_w, 240)
+    CARD_BOX_WIDTH = min(raw_w, STICKER_SIZE)
+
+    # Height: sum of sections
     header_h = AVATAR_SIZE + 6
     body_h = len(body_lines) * line_height + 4
 
     reply_section_h = 0
-    if has_reply:
-        # Reply header (avatar + name) + reply text + spacing
+    if has_reply and reply_lines:
         reply_header_h = REPLY_AVATAR_SIZE + 4
         reply_body_h = len(reply_lines) * reply_line_h + 6
-        reply_section_h = reply_header_h + reply_body_h + 10  # gap before main quote
+        reply_section_h = reply_header_h + reply_body_h + 10
 
     total_h = PADDING + reply_section_h + header_h + body_h + PADDING
     CARD_HEIGHT = min(max(total_h, 105), STICKER_SIZE)
 
-    # ── Create the card ──
-    img = Image.new("RGBA", (CARD_WIDTH, CARD_HEIGHT), (0, 0, 0, 0))
+    # ── Render on a 512px canvas (Telegram sticker requirement: one side = 512px) ──
+    # The canvas width is STICKER_SIZE (512), with transparent background outside CARD_BOX_WIDTH
+    img = Image.new("RGBA", (STICKER_SIZE, CARD_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Background with rounded corners — glassmorphism dark
+    # Background card with rounded corners — glassmorphism dark
     draw.rounded_rectangle(
-        [(0, 0), (CARD_WIDTH - 1, CARD_HEIGHT - 1)],
-        radius=20,
+        [(0, 0), (CARD_BOX_WIDTH - 1, CARD_HEIGHT - 1)],
+        radius=18,
         fill=CARD_BG_PRIMARY,
         outline=CARD_BORDER,
         width=2
     )
 
-
     y = PADDING
 
     # ═══════════════════════════════════════════════════════════
-    # SECTION 1 (TOP): Reply context — who the quoted user was replying to
+    # SECTION 1 (TOP): Reply context
     # ═══════════════════════════════════════════════════════════
     if has_reply and reply_lines:
-        # Reply container background
         reply_container_top = y
         reply_container_h = REPLY_AVATAR_SIZE + 4 + len(reply_lines) * reply_line_h + 12
         draw.rounded_rectangle(
             [(PADDING - 4, reply_container_top - 2),
-             (CARD_WIDTH - PADDING + 4, reply_container_top + reply_container_h)],
+             (CARD_BOX_WIDTH - PADDING + 4, reply_container_top + reply_container_h)],
             radius=10,
             fill=CARD_REPLY_BG,
         )
 
-        # Reply avatar (smaller)
+        # Reply avatar
         reply_avatar_x = PADDING + 6
         reply_avatar_y = y + 2
         reply_name_clean = _clean_text(reply_username)
@@ -311,50 +506,55 @@ def generate_quote_card(
             drawn = _draw_circular_avatar(img, reply_avatar_bytes, reply_avatar_x, reply_avatar_y, REPLY_AVATAR_SIZE)
             if not drawn:
                 _draw_avatar_placeholder(draw, reply_avatar_x, reply_avatar_y, REPLY_AVATAR_SIZE,
-                                         reply_name_clean[0].upper() if reply_name_clean else "?", glow=False)
+                                         reply_name_clean, glow=False)
         else:
             _draw_avatar_placeholder(draw, reply_avatar_x, reply_avatar_y, REPLY_AVATAR_SIZE,
-                                     reply_name_clean[0].upper() if reply_name_clean else "?", glow=False)
+                                     reply_name_clean, glow=False)
 
         # Reply username
         reply_name_x = reply_avatar_x + REPLY_AVATAR_SIZE + 10
-        draw.text((reply_name_x, reply_avatar_y + 4), reply_name_clean,
-                  font=font_reply_name, fill=CARD_TEXT_SECONDARY)
+        _draw_text_with_emoji(draw, (reply_name_x, reply_avatar_y + 4),
+                              reply_name_clean, font_reply_name, emoji_font_reply_name,
+                              fill=CARD_TEXT_SECONDARY)
 
         # Reply accent bar
         y += REPLY_AVATAR_SIZE + 6
-        draw.line([(PADDING + 12, y), (PADDING + 12, y + len(reply_lines) * reply_line_h)],
+        bar_x_reply = PADDING + 12
+        draw.line([(bar_x_reply, y), (bar_x_reply, y + len(reply_lines) * reply_line_h)],
                   fill=CARD_ACCENT_CYAN, width=2)
 
-        # Reply text
+        # Reply text lines
+        reply_text_x = PADDING + 22
         for rline in reply_lines:
-            draw.text((PADDING + 22, y), rline,
-                      font=font_reply_text_font, fill=CARD_TEXT_SECONDARY)
+            _draw_text_with_emoji(draw, (reply_text_x, y), rline,
+                                  font_reply_text_font, emoji_font_small,
+                                  fill=CARD_TEXT_SECONDARY)
             y += reply_line_h
 
-        y += 12  # Gap between reply section and main quote
+        y += 12
 
     # ═══════════════════════════════════════════════════════════
-    # SECTION 2 (BOTTOM): Main quoted message — avatar + username + text
+    # SECTION 2 (BOTTOM): Main quoted message
     # ═══════════════════════════════════════════════════════════
 
     # Avatar + Username header
     avatar_x = PADDING
     avatar_y = y
 
-    initial_char = username[0].upper() if username else "?"
     if avatar_bytes:
         drawn = _draw_circular_avatar(img, avatar_bytes, avatar_x, avatar_y, AVATAR_SIZE)
         if not drawn:
-            _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, initial_char)
+            _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username)
     else:
-        _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, initial_char)
+        _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username)
 
     name_x = avatar_x + AVATAR_SIZE + 10
-    draw.text((name_x, avatar_y + 2), username, font=font_user, fill=CARD_TEXT_PRIMARY)
+    _draw_text_with_emoji(draw, (name_x, avatar_y + 2),
+                          username, font_user, emoji_font, fill=CARD_TEXT_PRIMARY)
 
     if timestamp:
-        draw.text((name_x, avatar_y + 24), timestamp, font=font_meta, fill=CARD_TEXT_SECONDARY)
+        draw.text((name_x, avatar_y + 24), timestamp,
+                  font=font_meta, fill=CARD_TEXT_SECONDARY)
 
     y += header_h + 2
 
@@ -371,13 +571,14 @@ def generate_quote_card(
             b = int(CARD_ACCENT_CYAN[2] * (1 - ratio) + CARD_ACCENT_PURPLE[2] * ratio)
             draw.line([(bar_x, bar_top + i), (bar_x + 3, bar_top + i)], fill=(r, g, b))
 
-    # Body text
+    # Body text lines
     text_x = bar_x + 16
     for line in body_lines:
-        draw.text((text_x, y), line, font=font_body, fill=CARD_TEXT_PRIMARY)
+        _draw_text_with_emoji(draw, (text_x, y), line,
+                              font_body, emoji_font, fill=CARD_TEXT_PRIMARY)
         y += line_height
 
-    # ── Convert to WEBP for Telegram sticker ──
+    # ── Ensure one side is exactly 512px (Telegram sticker requirement) ──
     w, h = img.size
     if w != STICKER_SIZE and h != STICKER_SIZE:
         if w >= h:

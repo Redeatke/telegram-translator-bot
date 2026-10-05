@@ -58,6 +58,7 @@ from config import (
     get_download_mode,
     toggle_downloader,
     toggle_download_mode,
+    reset_chat_config,
     is_maintenance_active_for_user,
     MAINTENANCE_NOTICE,
     ADMIN_USER_IDS,
@@ -95,6 +96,7 @@ from translation import (
     translate_ai,
     translate_ai_word_aligned,
     translate_image_ai,
+    clean_caption_for_translation,
 )
 
 from moderation import (
@@ -364,10 +366,24 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     config = get_user_config(user.id)
     target_lang = config["target"]
 
-    # Scenario A0: Reply to an image — read and translate any text found in it
-    if update.message.reply_to_message and update.message.reply_to_message.photo:
-        if context.args:
-            resolved = resolve_language_code(context.args[0])
+    replied = update.message.reply_to_message
+
+    # Check if user explicitly asked for image OCR (e.g. /tr ocr or /tr img)
+    force_ocr = bool(context.args and context.args[0].lower() in ["ocr", "image", "img", "vision"])
+
+    # Extract text from replied message (text or caption)
+    replied_text = None
+    if replied:
+        if replied.text:
+            replied_text = replied.text.strip()
+        elif replied.caption:
+            replied_text = clean_caption_for_translation(replied.caption)
+
+    # Scenario A0: Reply to an image without text/caption (or forced OCR) — AI Vision OCR
+    if replied and replied.photo and (not replied_text or force_ocr):
+        target_arg_idx = 1 if force_ocr else 0
+        if context.args and len(context.args) > target_arg_idx:
+            resolved = resolve_language_code(context.args[target_arg_idx])
             if resolved:
                 target_lang = resolved
 
@@ -382,7 +398,7 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
         try:
-            photo = update.message.reply_to_message.photo[-1]
+            photo = replied.photo[-1]
             tg_file = await context.bot.get_file(photo.file_id)
             image_bytes = bytes(await tg_file.download_as_bytearray())
             translated_text = await translate_image_ai(image_bytes, target_lang)
@@ -412,32 +428,33 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Scenario A: Reply to a message
-    if update.message.reply_to_message and update.message.reply_to_message.text:
-        text_to_translate = update.message.reply_to_message.text
+    # Scenario A: Reply to a message with text or media caption
+    if replied_text:
+        text_to_translate = replied_text
         if context.args:
             resolved = resolve_language_code(context.args[0])
             if resolved:
                 target_lang = resolved
 
-    # Scenario B: Arguments provided
+    # Scenario B: Inline arguments provided without a replied message
     elif context.args:
         resolved = resolve_language_code(context.args[0])
         if resolved and len(context.args) >= 2:
             target_lang = resolved
             text_to_translate = " ".join(context.args[1:])
-        else:
+        elif not resolved:
             text_to_translate = " ".join(context.args)
+        # If user only passed a language code (e.g. /tr en) with no reply and no other text, text_to_translate stays None
 
     if not text_to_translate:
         await update.message.reply_text(
             fmt_card("🌐 /tr — Translate",
                 f"  <b>Reply mode:</b>\n"
-                f"  Reply to a message with /tr\n"
+                f"  Reply to a message, video, or photo with /tr\n"
                 f"  or <code>/tr dutch</code> (by name or code)\n"
                 f"\n"
                 f"  <b>Image mode (AI engine only):</b>\n"
-                f"  Reply to a photo with /tr to translate any text in it\n"
+                f"  Reply to a photo with /tr to translate text inside it\n"
                 f"\n"
                 f"  <b>Inline mode:</b>\n"
                 f"  <code>/tr dutch hello world</code>\n"
@@ -1041,6 +1058,7 @@ def build_downloads_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(mode_txt, callback_data="dltog:mode"),
         ],
         [
+            InlineKeyboardButton("🔄 Reset to Defaults", callback_data="dltog:reset"),
             InlineKeyboardButton("✖️ Close Settings", callback_data="dltog:close"),
         ],
     ]
@@ -1156,7 +1174,10 @@ async def handle_downloads_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
         return
 
-    if action == "mode":
+    if action == "reset":
+        reset_chat_config(chat.id)
+        await query.answer("✅ Reset all media settings to default (all enabled).")
+    elif action == "mode":
         new_mode = toggle_download_mode(chat.id)
         mode_str = "Auto-Download" if new_mode else "Button-Prompt"
         await query.answer(f"Switched mode to {mode_str}")
@@ -1232,8 +1253,7 @@ async def auto_pinger_loop(application: Application) -> None:
 
 async def post_init(application: Application) -> None:
     """Register bot commands in Telegram's menu button and start background tasks on startup."""
-    global _config_bot
-    _config_bot = application.bot
+    config._config_bot = application.bot
     await load_chat_configs_from_channel()
 
     await application.bot.set_my_commands([

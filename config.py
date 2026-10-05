@@ -289,6 +289,12 @@ def toggle_download_mode(chat_id: int) -> bool:
     save_chat_configs()
     return new_state
 
+def reset_chat_config(chat_id: int) -> Dict[str, Any]:
+    """Reset a chat's configuration back to defaults (all platforms enabled)."""
+    chat_configs[chat_id] = DEFAULT_CHAT_CONFIG.copy()
+    save_chat_configs()
+    return chat_configs[chat_id]
+
 load_chat_configs()
 
 

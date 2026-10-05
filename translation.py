@@ -63,6 +63,59 @@ def resolve_language_code(query: str) -> Optional[str]:
     return None
 
 
+def clean_caption_for_translation(caption: str) -> str:
+    """
+    Extract and clean translatable text from media captions (e.g. Twitter/X, TikTok, Instagram, Reddit).
+    Removes engagement stats (likes, retweets, views), action links (View on X),
+    and social media platform headers while preserving the actual post content and quote tweets.
+    """
+    if not caption:
+        return ""
+
+    lines = [line.strip() for line in caption.split("\n")]
+    cleaned_lines = []
+
+    # Regex to detect stats line: e.g. ❤️ 76.5K • 🔁 7.8K • 👁️ 2.9M or ❤️ 1.2K
+    stats_pattern = re.compile(r"^[❤️🔁👁️💬👍👎🔄\s\d\.\,KkMmBb•·\-\|/]+$")
+    # Regex for View on X / Instagram / etc.
+    view_link_pattern = re.compile(r"^(↗️\s*)?view\s+on\s+.*$", re.IGNORECASE)
+
+    for line in lines:
+        if not line:
+            continue
+        if stats_pattern.match(line):
+            continue
+        if view_link_pattern.match(line):
+            continue
+        cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return caption.strip()
+
+    # Check if first line is a platform header:
+    first_line = cleaned_lines[0]
+    is_twitter_header = (first_line.startswith("𝕏") or "𝕏" in first_line) and ("@" in first_line)
+    is_media_header = bool(re.match(r"^[🎵📸🧵]\s+", first_line))
+    is_reddit_header = bool(re.match(r"^🤖\s*r/\w+\s*•\s*", first_line))
+    is_yt_header = bool(re.match(r"^[📹🎵]\s+", first_line))
+
+    if is_twitter_header or is_media_header:
+        if len(cleaned_lines) > 1:
+            cleaned_lines = cleaned_lines[1:]
+        else:
+            cleaned = re.sub(r"^[𝕏🎵📸🧵]\s*", "", first_line)
+            cleaned = re.sub(r"\s*\(@[a-zA-Z0-9_]+\)", "", cleaned).strip()
+            if cleaned:
+                cleaned_lines = [cleaned]
+    elif is_reddit_header:
+        cleaned_lines[0] = re.sub(r"^🤖\s*r/\w+\s*•\s*", "", first_line).strip()
+    elif is_yt_header:
+        cleaned_lines[0] = re.sub(r"^[📹🎵]\s*", "", first_line).strip()
+
+    result = "\n".join(cleaned_lines).strip()
+    return result if result else caption.strip()
+
+
 LANGS_PER_PAGE = 8
 
 def build_language_keyboard(current_lang: str, page: int = 0) -> InlineKeyboardMarkup:

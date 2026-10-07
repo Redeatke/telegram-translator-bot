@@ -723,83 +723,71 @@ async def video_to_gif(
     Convert a video (or portion of it) to an optimized GIF.
     Returns GIF bytes or None on failure.
     """
-    duration_args = []
+    start_sec = max(0.0, float(start_sec))
     if end_sec is not None:
-        duration = end_sec - start_sec
+        duration = float(end_sec) - start_sec
         if duration <= 0:
             return None
         if duration > MAX_GIF_DURATION:
             duration = MAX_GIF_DURATION
-        duration_args = ["-t", str(duration)]
+    else:
+        duration = MAX_GIF_DURATION
 
     with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
         output_path = tmp.name
 
     try:
-        # Two-pass GIF: generate palette then apply it for quality
-        palette_path = output_path + "_palette.png"
+        # Fast high-quality GIF generation using palettegen & paletteuse in a single filtergraph.
+        # scale=min(max_width,iw):-2 avoids upscaling small videos and enforces even dimensions.
+        filter_str = (
+            f"[0:v] fps=15,scale=min({max_width}\\,iw):-2:flags=lanczos,split [a][b]; "
+            f"[a] palettegen=stats_mode=diff [p]; "
+            f"[b][p] paletteuse=dither=bayer:bayer_scale=5"
+        )
 
-        # Pass 1: Generate palette
-        cmd_palette = [
+        cmd = [
             "ffmpeg", "-y",
             "-ss", str(start_sec),
+            "-t", str(duration),
             "-i", video_path,
-            *duration_args,
-            "-vf", f"scale={max_width}:-1:flags=lanczos,fps=15,palettegen=stats_mode=diff",
-            palette_path,
+            "-filter_complex", filter_str,
+            output_path,
         ]
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd_palette,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=60)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
 
         if proc.returncode != 0:
-            # Fallback: single-pass GIF
-            cmd_simple = [
+            logger.warning(
+                f"ffmpeg complex filter failed: {stderr.decode(errors='ignore').strip()}, "
+                f"trying fallback single-pass GIF"
+            )
+            # Fallback: single-pass GIF with standard palette
+            cmd_fallback = [
                 "ffmpeg", "-y",
                 "-ss", str(start_sec),
+                "-t", str(duration),
                 "-i", video_path,
-                *duration_args,
-                "-vf", f"scale={max_width}:-1:flags=lanczos,fps=15",
+                "-vf", f"fps=15,scale=min({max_width}\\,iw):-2:flags=lanczos",
                 output_path,
             ]
-            proc2 = await asyncio.create_subprocess_exec(
-                *cmd_simple,
+            proc_fallback = await asyncio.create_subprocess_exec(
+                *cmd_fallback,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await asyncio.wait_for(proc2.communicate(), timeout=60)
-            if proc2.returncode != 0:
-                logger.error(f"ffmpeg GIF error: {stderr.decode()}")
-                return None
-        else:
-            # Pass 2: Apply palette
-            cmd_gif = [
-                "ffmpeg", "-y",
-                "-ss", str(start_sec),
-                "-i", video_path,
-                *duration_args,
-                "-i", palette_path,
-                "-lavfi", f"scale={max_width}:-1:flags=lanczos,fps=15 [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5",
-                output_path,
-            ]
-            proc3 = await asyncio.create_subprocess_exec(
-                *cmd_gif,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc3.communicate(), timeout=60)
-            if proc3.returncode != 0:
-                logger.error(f"ffmpeg GIF pass 2 error: {stderr.decode()}")
+            _, stderr_fallback = await asyncio.wait_for(proc_fallback.communicate(), timeout=60)
+            if proc_fallback.returncode != 0:
+                logger.error(f"ffmpeg GIF error: {stderr_fallback.decode(errors='ignore').strip()}")
                 return None
 
-        try:
-            os.unlink(palette_path)
-        except OSError:
-            pass
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            logger.error("ffmpeg produced empty GIF output")
+            return None
 
         with open(output_path, "rb") as f:
             return f.read()
@@ -811,7 +799,8 @@ async def video_to_gif(
         return None
     finally:
         try:
-            os.unlink(output_path)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
         except OSError:
             pass
 

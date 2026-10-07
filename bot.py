@@ -888,86 +888,165 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── GIF Command (/gif) ──────────────────────────────────────────────────────
 
+def _extract_video_media(message):
+    """Extract a video, animation, video note, or video document from a Telegram message."""
+    if not message:
+        return None
+    if message.video:
+        return message.video
+    if message.animation:
+        return message.animation
+    if message.video_note:
+        return message.video_note
+    if message.document and message.document.mime_type:
+        mime = message.document.mime_type.lower()
+        if mime.startswith("video/") or mime == "image/gif":
+            return message.document
+    return None
+
+
 async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Convert a replied video to GIF.
+    """Convert a replied video or attached video to GIF.
 
     Usage:
-      /gif        – Convert entire video to GIF
+      /gif        – Convert video to GIF (up to 30s)
+      /gif 5      – First 5 seconds to GIF
       /gif 4 10   – Convert from 4s to 10s to GIF
     """
     user = update.effective_user
-    if not user or not update.message or should_skip_message(update.message):
+    msg = update.effective_message
+    if not user or not msg or should_skip_message(msg):
         return
 
     if is_maintenance_active_for_user(user.id):
-        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
         return
 
-    replied = update.message.reply_to_message
-    if not replied or not (replied.video or replied.video_note or replied.animation):
-        await update.message.reply_text(
+    replied = msg.reply_to_message
+    # Check replied message first, then fall back to the message itself (e.g. video sent with /gif caption)
+    target_msg = replied if (replied and _extract_video_media(replied)) else msg
+    video = _extract_video_media(target_msg)
+
+    if not video:
+        await msg.reply_text(
             fmt_card("🎞️ /gif — Video to GIF",
-                f"  Reply to a video with:\n"
-                f"  <code>/gif</code> — Convert full video\n"
-                f"  <code>/gif 4 10</code> — Convert 4s to 10s\n"
-                f"  <code>/gif 0 5</code> — First 5 seconds"
+                f"  Reply to a video or send a video with:\n"
+                f"  <code>/gif</code> — Convert full video (up to 30s)\n"
+                f"  <code>/gif 5</code> — First 5 seconds\n"
+                f"  <code>/gif 4 10</code> — Convert 4s to 10s"
             ),
+            parse_mode="HTML"
+        )
+        return
+
+    # Check file size before downloading (Telegram Bot API download limit is 20 MB)
+    if getattr(video, "file_size", None) and video.file_size > 20 * 1024 * 1024:
+        size_mb = video.file_size / (1024 * 1024)
+        await msg.reply_text(
+            fmt_error(f"Video is too large ({size_mb:.1f} MB). Telegram bots can only download files up to 20 MB."),
             parse_mode="HTML"
         )
         return
 
     # Parse time range
     args = context.args or []
+    if not args:
+        raw_text = msg.text or msg.caption or ""
+        tokens = raw_text.split()
+        for idx, t in enumerate(tokens):
+            if t.startswith("/gif"):
+                args = tokens[idx + 1:]
+                break
+
     start_sec = 0.0
     end_sec = None
     if len(args) >= 2:
         try:
-            start_sec = float(args[0])
+            start_sec = max(0.0, float(args[0]))
             end_sec = float(args[1])
             if end_sec <= start_sec:
-                await update.message.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
+                await msg.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
                 return
         except ValueError:
-            await update.message.reply_text(fmt_error("Invalid time values. Use numbers like: /gif 4 10"), parse_mode="HTML")
+            await msg.reply_text(fmt_error("Invalid time values. Use numbers like: <code>/gif 4 10</code>"), parse_mode="HTML")
             return
     elif len(args) == 1:
         try:
-            end_sec = float(args[0])
+            val = float(args[0])
+            if val <= 0:
+                await msg.reply_text(fmt_error("Duration must be greater than 0."), parse_mode="HTML")
+                return
+            end_sec = val
         except ValueError:
-            pass
+            await msg.reply_text(fmt_error("Invalid time value. Use numbers like: <code>/gif 5</code>"), parse_mode="HTML")
+            return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
 
-    video = replied.video or replied.video_note or replied.animation
-    tg_file = await context.bot.get_file(video.file_id)
-    video_bytes = bytes(await tg_file.download_as_bytearray())
-
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp.write(video_bytes)
-        tmp_path = tmp.name
-
+    # Download video
     try:
+        tg_file = await context.bot.get_file(video.file_id)
+        video_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        logger.error(f"Failed to download video for /gif: {e}")
+        err_msg = str(e)
+        if "file is too big" in err_msg.lower():
+            await msg.reply_text(fmt_error("Video exceeds Telegram's 20 MB download limit."), parse_mode="HTML")
+        else:
+            await msg.reply_text(fmt_error(f"Failed to download video: {err_msg[:120]}"), parse_mode="HTML")
+        return
+
+    # Determine file extension
+    suffix = ".mp4"
+    if hasattr(video, "file_name") and video.file_name:
+        _, ext = os.path.splitext(video.file_name)
+        if ext:
+            suffix = ext
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(video_bytes)
+            tmp_path = tmp.name
+
         gif_bytes = await quote_sticker.video_to_gif(tmp_path, start_sec, end_sec)
+    except Exception as e:
+        logger.error(f"GIF execution error: {e}", exc_info=True)
+        await msg.reply_text(fmt_error(f"GIF conversion error: {str(e)[:150]}"), parse_mode="HTML")
+        return
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     if not gif_bytes:
-        await update.message.reply_text(
-            fmt_error("Failed to convert video to GIF."),
+        await msg.reply_text(
+            fmt_error("Failed to convert video to GIF. The video codec may be incompatible or damaged."),
             parse_mode="HTML"
         )
         return
 
-    # Send as animation (GIF)
-    await update.message.reply_animation(
-        animation=gif_bytes,
-        reply_to_message_id=update.message.message_id,
-        filename="converted.gif",
-    )
+    # Send as animation (GIF) or fallback to document if Telegram animation fails
+    try:
+        await msg.reply_animation(
+            animation=gif_bytes,
+            reply_to_message_id=msg.message_id,
+            filename="converted.gif",
+        )
+    except Exception as e:
+        logger.warning(f"reply_animation failed ({e}), falling back to reply_document")
+        try:
+            await msg.reply_document(
+                document=gif_bytes,
+                reply_to_message_id=msg.message_id,
+                filename="converted.gif",
+                caption="🎞️ Converted GIF",
+            )
+        except Exception as e2:
+            logger.error(f"Failed to send GIF: {e2}")
+            await msg.reply_text(fmt_error(f"Failed to send converted GIF: {str(e2)[:120]}"), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Translate incoming text messages in private chats."""
@@ -1352,6 +1431,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["maintenance", "admin"], maintenance_command))
     application.add_handler(CommandHandler("q", q_command, block=False))
     application.add_handler(CommandHandler("gif", gif_command, block=False))
+    application.add_handler(MessageHandler(filters.CaptionRegex(r"^/gif(?:\s|$)"), gif_command, block=False))
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.Document.ALL,
         setcookies_command

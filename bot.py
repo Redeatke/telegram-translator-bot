@@ -128,6 +128,7 @@ from downloaders import (
 )
 
 from twitter_handler import handle_twitter_message
+from voice_agent import handle_voice_message, voice_command
 import quote_sticker
 import card
 
@@ -187,6 +188,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /engine    Switch AI / Free engine\n"
         f"  /q         Quote as sticker\n"
         f"  /gif       Convert video to GIF\n"
+        f"  /voice     Amharic Voice Assistant\n"
         f"  /status    View your settings\n"
         f"  /report    Report a bug\n"
         f"\n"
@@ -1432,6 +1434,7 @@ async def post_init(application: Application) -> None:
         ("engine", "Switch AI / Free engine"),
         ("q", "Quote a message as a sticker"),
         ("gif", "Convert a video to GIF"),
+        ("voice", "Amharic Voice Assistant"),
         ("status", "Show settings and status"),
         ("help", "Full help guide"),
         ("report", "Report a problem to admins"),
@@ -1530,6 +1533,8 @@ def main() -> None:
     application.add_handler(CommandHandler("q", q_command, block=False))
     application.add_handler(CommandHandler("gif", gif_command, block=False))
     application.add_handler(MessageHandler(filters.CaptionRegex(r"^/gif(?:\s|$)"), gif_command, block=False))
+    application.add_handler(CommandHandler("voice", voice_command))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message, block=False))
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.Document.ALL,
         setcookies_command

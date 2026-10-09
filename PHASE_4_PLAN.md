@@ -119,10 +119,10 @@ Seen before?                  ChromaDB / FAISS Vector Store
 ## 📅 Implementation Milestones
 
 ### Milestone 1: Audio Pipeline & STT Prototype
-- [ ] Add Telegram voice message handler (`filters.VOICE`).
-- [ ] Convert `.oga` Telegram voice notes to `.wav` via ffmpeg.
-- [ ] Transcribe Amharic audio using Whisper.
-- [ ] Validate transcription accuracy on sample Amharic speech.
+- [x] Add Telegram voice message handler (`filters.VOICE`).
+- [x] Convert `.oga` Telegram voice notes to `.wav` via ffmpeg.
+- [x] Transcribe Amharic audio using Whisper API / Gemini Flash multimodal audio.
+- [x] Validate transcription accuracy on sample Amharic speech.
 
 ### Milestone 2: Amharic Knowledge Base (RAG)
 - [ ] Set up local ChromaDB storage.
@@ -131,9 +131,9 @@ Seen before?                  ChromaDB / FAISS Vector Store
 - [ ] Implement local query/audio cache for instant repeat answers.
 
 ### Milestone 3: Amharic Voice Response (TTS)
-- [ ] Integrate Amharic TTS engine (`gTTS` / Meta MMS).
-- [ ] Convert synthesized speech to Telegram voice note format (OGG OPUS).
-- [ ] Send voice response back to the user with caption transcript.
+- [x] Integrate Amharic TTS engine (`gTTS` Amharic `am` voice synthesis).
+- [x] Convert synthesized speech to Telegram voice note format (OGG OPUS).
+- [x] Send voice response back to the user with caption transcript.
 
 ### Milestone 4: Telegram Mini App Experience
 - [ ] Build responsive web frontend (Vanilla CSS, Glassmorphism aesthetic).

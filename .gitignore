@@ -13,4 +13,6 @@ setup_auto_refresh_task.bat
 test_*.py
 sample_*.png
 *.png
+!splash_icon.png
+!webapp/splash_icon.png
 *.exe

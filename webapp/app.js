@@ -358,8 +358,9 @@
       `;
     }
 
-    // Direct Google TTS MP3 streaming URL (100% reliable across all Telegram platforms)
-    const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${langCode}&client=tw-ob&q=${encodeURIComponent(textToSpeak)}`;
+    // Use same-origin Vercel Serverless Function to stream audio without browser CORS/Referer blocks
+    const ttsUrl = `/api/tts?tl=${encodeURIComponent(langCode)}&q=${encodeURIComponent(textToSpeak)}`;
+    const fallbackUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${encodeURIComponent(langCode)}&client=tw-ob&q=${encodeURIComponent(textToSpeak)}`;
 
     currentAudio = new Audio(ttsUrl);
     currentAudio.playbackRate = currentPlaybackRate;
@@ -369,16 +370,26 @@
     };
 
     currentAudio.onerror = (e) => {
-      console.warn('HTML5 Audio error, attempting SpeechSynthesis fallback:', e);
-      stopCurrentAudio();
-      // SpeechSynthesis Fallback
-      fallbackSpeechSynthesis(textToSpeak, langCode);
+      console.warn('Serverless audio failed, trying fallback stream:', e);
+      // Fallback to direct stream
+      currentAudio = new Audio(fallbackUrl);
+      currentAudio.playbackRate = currentPlaybackRate;
+      currentAudio.onended = () => stopCurrentAudio();
+      currentAudio.play().catch(() => {
+        stopCurrentAudio();
+        fallbackSpeechSynthesis(textToSpeak, langCode);
+      });
     };
 
     currentAudio.play().catch((err) => {
-      console.warn('Playback blocked or failed:', err);
-      stopCurrentAudio();
-      fallbackSpeechSynthesis(textToSpeak, langCode);
+      console.warn('Playback error, trying fallback stream:', err);
+      currentAudio = new Audio(fallbackUrl);
+      currentAudio.playbackRate = currentPlaybackRate;
+      currentAudio.onended = () => stopCurrentAudio();
+      currentAudio.play().catch(() => {
+        stopCurrentAudio();
+        fallbackSpeechSynthesis(textToSpeak, langCode);
+      });
     });
   }
 

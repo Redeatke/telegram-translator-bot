@@ -136,10 +136,10 @@ Seen before?                  ChromaDB / FAISS Vector Store
 - [x] Send voice response back to the user with caption transcript.
 
 ### Milestone 4: Telegram Mini App Experience
-- [ ] Build responsive web frontend (Vanilla CSS, Glassmorphism aesthetic).
-- [ ] Connect Telegram WebApp SDK (`window.Telegram.WebApp`).
-- [ ] Live audio streaming & waveform visualizer.
-- [ ] Deploy frontend to static host (Vercel / Cloudflare Pages / Railway).
+- [x] Build responsive web frontend (Vanilla CSS, Glassmorphism aesthetic).
+- [x] Connect Telegram WebApp SDK (`window.Telegram.WebApp`).
+- [x] Live audio streaming & waveform visualizer.
+- [x] Deploy frontend configuration for static host (Vercel `webapp/`).
 
 ---
 

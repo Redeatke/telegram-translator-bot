@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>አጋዥ — Amharic Voice AI</title>
-  <meta name="description" content="Intelligent Amharic Voice AI Assistant Telegram Mini App">
+  <title>Redster Translator — Amharic & English Voice AI</title>
+  <meta name="description" content="Instant Dual-Language Voice & Text Translator for Telegram">
 
   <!-- Telegram WebApp SDK -->
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -22,19 +22,19 @@
   <div class="ambient-glow glow-bottom"></div>
 
   <div class="app-container" id="appContainer">
-    <!-- Header -->
-    <header class="app-header">
-      <div class="user-pill" id="userPill">
-        <div class="avatar-ring" id="userAvatar">አ</div>
-        <div class="user-meta">
-          <span class="user-name" id="userName">እንኳን ደህና መጡ</span>
-          <span class="status-indicator">
-            <span class="dot"></span> Online
-          </span>
+    <!-- Header: Redster Translator Branding -->
+    <header class="app-header glass-panel">
+      <div class="brand-bar">
+        <div class="brand-logo">🌐</div>
+        <div class="brand-details">
+          <h2 class="brand-name">Redster Translator</h2>
+          <p class="brand-tagline">Dual-Language Voice & Text • አማርኛ & English</p>
         </div>
       </div>
-      <div class="header-badges">
-        <span class="badge gemini-badge">⚡ Gemini 2.5</span>
+      <div class="header-status">
+        <span class="status-indicator">
+          <span class="dot"></span> Ready
+        </span>
       </div>
     </header>
 
@@ -46,24 +46,24 @@
           <div class="icon-pulse-ring"></div>
           <div class="hero-icon">🎙️</div>
         </div>
-        <h1 class="hero-title">የአማርኛ ድምፅ ረዳት</h1>
-        <p class="hero-subtitle">የፈለጉትን ጥያቄ በድምፅ ወይም በፅሁፍ ይጠይቁ፣ አጋዥ በአማርኛ ይመልሳል!</p>
+        <h1 class="hero-title">የቀጥታ ድምፅና ፅሁፍ ተርጓሚ</h1>
+        <p class="hero-subtitle">በአማርኛ ወይም በእንግሊዝኛ ይናገሩ ወይም ይፃፉ። ዋናውን ቋንቋ እና ትርጉሙን ከሁለቱም ድምፆች ጋር ያገኛሉ!</p>
 
         <!-- Topic Suggestion Chips -->
         <div class="suggestion-section">
-          <span class="section-label">የተመረጡ ጥያቄዎች (Suggested Topics):</span>
+          <span class="section-label">የተመረጡ ምሳሌዎች (Try Examples):</span>
           <div class="chips-container" id="chipsContainer">
-            <button class="chip" data-query="ስለ ኢትዮጵያ ታሪክ ባጭሩ ንገረኝ">
+            <button class="chip" data-query="ሰላም እንደምን ነህ?">
+              🇪🇹 ሰላም እንደምን ነህ?
+            </button>
+            <button class="chip" data-query="How do I get to the airport?">
+              🇬🇧 How do I get to the airport?
+            </button>
+            <button class="chip" data-query="ስለ ኢትዮጵያ ታሪክ ንገረኝ">
               🇪🇹 ስለ ኢትዮጵያ ታሪክ
             </button>
-            <button class="chip" data-query="ዛሬ እንዴት ልትረዳኝ ትችላለህ?">
-              💡 ምን ምን ትችላለህ?
-            </button>
-            <button class="chip" data-query="ምርጥ ባህላዊ የኢትዮጵያ ምግቦች የትኞቹ ናቸው?">
-              🍲 ባህላዊ ምግቦች
-            </button>
-            <button class="chip" data-query="ቀላል የአማርኛ ግጥም ንገረኝ">
-              📜 የአማርኛ ግጥም
+            <button class="chip" data-query="Thank you very much for your help!">
+              🇬🇧 Thank you for your help
             </button>
           </div>
         </div>
@@ -75,7 +75,7 @@
 
     <!-- Visualizer overlay during recording -->
     <div class="visualizer-bar-container" id="visualizerContainer">
-      <canvas id="waveformCanvas" width="360" height="70"></canvas>
+      <canvas id="waveformCanvas" width="360" height="60"></canvas>
       <div class="recording-timer" id="recordingTimer">00:00</div>
     </div>
 
@@ -87,10 +87,10 @@
           <input 
             type="text" 
             id="textInput" 
-            placeholder="በአማርኛ ይፃፉ ወይም ድምፅ ይቅረጹ..." 
+            placeholder="በአማርኛ ወይም English ይፃፉ..." 
             autocomplete="off"
           />
-          <button class="send-btn" id="sendBtn" title="Send message" aria-label="Send">
+          <button class="send-btn" id="sendBtn" title="Send" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <line x1="22" y1="2" x2="11" y2="13"></line>
               <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
@@ -110,7 +110,7 @@
       </div>
 
       <div class="dock-footer-hints">
-        <span id="dockHint">ማይክሮፎኑን ተጭነው በአማርኛ ይናገሩ 🎤</span>
+        <span id="dockHint">ማይክሮፎኑን ተጭነው በአማርኛ ወይም English ይናገሩ 🎤</span>
       </div>
     </footer>
   </div>

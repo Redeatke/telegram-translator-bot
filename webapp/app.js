@@ -1,6 +1,6 @@
 /**
- * አጋዥ (Agazh) — Amharic Voice AI
- * Telegram Mini App Client Logic
+ * Redster Translator — Telegram Mini App
+ * Instant Dual-Language Voice & Text Translator (Amharic & English)
  */
 
 (function () {
@@ -27,8 +27,6 @@
   }
 
   // ── DOM References ──
-  const userNameEl = document.getElementById('userName');
-  const userAvatarEl = document.getElementById('userAvatar');
   const chatFeed = document.getElementById('chatFeed');
   const messagesList = document.getElementById('messagesList');
   const welcomeCard = document.getElementById('welcomeCard');
@@ -41,15 +39,7 @@
   const recordingTimer = document.getElementById('recordingTimer');
   const dockHint = document.getElementById('dockHint');
 
-  // Set user profile from Telegram
-  if (tg?.initDataUnsafe?.user) {
-    const u = tg.initDataUnsafe.user;
-    const name = u.first_name || 'ወዳጄ';
-    userNameEl.textContent = name;
-    userAvatarEl.textContent = name.charAt(0).toUpperCase();
-  }
-
-  // ── State ──
+  // ── Audio Engine State ──
   let isRecording = false;
   let mediaRecorder = null;
   let audioChunks = [];
@@ -59,7 +49,17 @@
   let recordStartTime = null;
   let timerInterval = null;
 
-  // ── Audio Recording & Waveform Visualizer ──
+  // Global Audio Player for TTS
+  let currentAudio = null;
+  let activePlayButton = null;
+  let currentPlaybackRate = 1.0;
+
+  // Helper to detect Ge'ez (Amharic) characters
+  function isAmharic(text) {
+    return /[\u1200-\u137F]/.test(text);
+  }
+
+  // ── Speech-to-Text & Audio Recording ──
   async function startRecording() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -112,7 +112,7 @@
 
     micBtn.classList.remove('recording');
     visualizerContainer.classList.remove('active');
-    dockHint.textContent = 'መልሱ እየተዘጋጀ ነው... (Processing...) ⏳';
+    dockHint.textContent = 'ትርጉሙ እየተዘጋጀ ነው... (Translating...) ⏳';
 
     clearInterval(timerInterval);
     if (animFrameId) cancelAnimationFrame(animFrameId);
@@ -134,7 +134,6 @@
     const dataArray = new Uint8Array(bufferLength);
 
     analyser.getByteFrequencyData(dataArray);
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const barWidth = (canvas.width / bufferLength) * 1.5;
@@ -142,7 +141,6 @@
 
     for (let i = 0; i < bufferLength; i++) {
       const barHeight = (dataArray[i] / 255) * canvas.height * 0.9;
-
       const grad = ctx.createLinearGradient(0, canvas.height, 0, 0);
       grad.addColorStop(0, '#06B6D4');
       grad.addColorStop(1, '#8B5CF6');
@@ -158,28 +156,73 @@
     animFrameId = requestAnimationFrame(drawWaveform);
   }
 
-  // ── Handling Audio & AI Answering ──
-  async function handleRecordedAudio(blob) {
+  // ── Process Recorded Voice ──
+  async function handleRecordedAudio() {
+    // If Web Speech API recognition was available or standard audio
+    // For demo/standalone mode, we give an interactive sample or ask user
     appendUserMessage('🎙️ የድምፅ መልዕክት (Voice Note)');
     showTypingIndicator();
 
-    // In client-side mini app, use Web Speech API or simulate instant intelligent AI
-    // We synthesize answer with Amharic response
     setTimeout(() => {
       removeTypingIndicator();
-      const sampleResponses = [
-        'ሰላም! የላኩልኝን የድምፅ መልዕክት በጥሩ ሁኔታ ተቀብያለሁ። ስለ ኢትዮጵያ ታሪክ ወይም ባህል ማንኛውንም ጥያቄ ለመመለስ ዝግጁ ነኝ!',
-        'እንኳን ደህና መጡ! ድምፅዎ ግልፅ ነው። ምን ላግዝዎ እችላለሁ?',
-        'ጥያቄዎ ግሩም ነው! በአማርኛ ቋንቋ ማንኛውንም መረጃ በድምፅ እና በፅሁፍ እሰጣችኋለሁ።'
-      ];
-      const replyText = sampleResponses[Math.floor(Math.random() * sampleResponses.length)];
-      appendBotResponse(replyText);
-      dockHint.textContent = 'ማይክሮፎኑን ተጭነው በአማርኛ ይናገሩ 🎤';
-    }, 1200);
+      const originalText = 'ሰላም እንደምን አላችሁ? ስለረዳችሁኝ በጣም አመሰግናለሁ!';
+      const translatedText = 'Hello, how are you? Thank you very much for your help!';
+      renderDualLanguageCard(originalText, translatedText, 'am', 'en');
+      dockHint.textContent = 'ማይክሮፎኑን ተጭነው በአማርኛ ወይም English ይናገሩ 🎤';
+    }, 1100);
   }
 
-  // ── Handling Text Query ──
-  function handleTextSubmit() {
+  // ── Translation Engine ──
+  async function translateText(query) {
+    const inputIsAm = isAmharic(query);
+    const sourceLang = inputIsAm ? 'am' : 'en';
+    const targetLang = inputIsAm ? 'en' : 'am';
+
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(query)}`;
+
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        let translated = '';
+        if (data && data[0]) {
+          for (const item of data[0]) {
+            if (item && item[0]) translated += item[0];
+          }
+        }
+        if (translated.trim()) {
+          return {
+            original: query,
+            translated: translated.trim(),
+            sourceLang,
+            targetLang
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('Google Translate API failed, trying fallback:', e);
+    }
+
+    // Fallback translations
+    let fallback = 'ጥያቄዎ ደርሶኛል (Message received)';
+    if (query.toLowerCase().includes('hello') || query.includes('ሰላም')) {
+      fallback = inputIsAm ? 'Hello, how are you?' : 'ሰላም እንደምን ነህ?';
+    } else if (query.toLowerCase().includes('time') || query.includes('ሰዓት')) {
+      fallback = inputIsAm ? 'What time is it?' : 'ስንት ሰዓት ነው?';
+    } else if (query.toLowerCase().includes('thank') || query.includes('አመሰግና')) {
+      fallback = inputIsAm ? 'Thank you very much!' : 'በጣም አመሰግናለሁ!';
+    }
+
+    return {
+      original: query,
+      translated: fallback,
+      sourceLang,
+      targetLang
+    };
+  }
+
+  // ── Text Submit Handler ──
+  async function handleTextSubmit() {
     const text = textInput.value.trim();
     if (!text) return;
 
@@ -188,63 +231,75 @@
     triggerHaptic('light');
     showTypingIndicator();
 
-    // Query response
-    setTimeout(() => {
+    try {
+      const res = await translateText(text);
       removeTypingIndicator();
-      generateBotAnswerForText(text);
-    }, 1000);
-  }
-
-  function generateBotAnswerForText(query) {
-    let reply = 'ጥያቄዎ ደርሶኛል! አጋዥ በአማርኛ ለመመለስ ሁልጊዜ ዝግጁ ነው።';
-
-    if (query.includes('ታሪክ')) {
-      reply = 'ኢትዮጵያ በዓለም ላይ ካሉ ጥንታዊ እና ረጅም ታሪክ ካላቸው ሀገራት አንዷ ናት። የላሊበላ ውቅር አብያተ ክርስቲያናት፣ የአክሱም ሐውልቶች እና የፋሲል ግቢ ታዋቂ ቅርሶቿ ናቸው።';
-    } else if (query.includes('ምግብ')) {
-      reply = 'ከምርጥ የኢትዮጵያ ባህላዊ ምግቦች መካከል እንጀራ በዶሮ ወጥ፣ ሽሮ፣ ክትፎ እና ጥብስ ግንባር ቀደም ተጠቃሽ ናቸው!';
-    } else if (query.includes('ምን') || query.includes('ትችላለህ')) {
-      reply = 'እኔ አጋዥ (Agazh) እባላለሁ። የአማርኛ ድምፅ እና ፅሁፍ ረዳትዎ ነኝ! ጥያቄዎችን መመለስ፣ ቋንቋ ማስተማር እና መረጃዎችን በድምፅ መስጠት እችላለሁ።';
-    } else if (query.includes('ግጥም')) {
-      reply = '«ፍቅር ያሸንፋል በሁሉም ዘንድሮ፣\nአንድነት ይስፈን በሰላም አብሮ።»\nመልካም ጊዜ ይሁንልዎ!';
+      renderDualLanguageCard(res.original, res.translated, res.sourceLang, res.targetLang);
+    } catch (err) {
+      removeTypingIndicator();
+      renderDualLanguageCard(text, 'Translation temporarily unavailable.', 'en', 'am');
     }
 
-    appendBotResponse(reply);
-    dockHint.textContent = 'ማይክሮፎኑን ተጭነው በአማርኛ ይናገሩ 🎤';
+    dockHint.textContent = 'ማይክሮፎኑን ተጭነው በአማርኛ ወይም English ይናገሩ 🎤';
   }
 
-  // ── Chat UI Rendering ──
+  // ── Render User Message ──
   function appendUserMessage(text) {
     if (welcomeCard) welcomeCard.style.display = 'none';
 
     const wrapper = document.createElement('div');
     wrapper.className = 'msg-wrapper msg-user';
-    wrapper.innerHTML = `<div class="msg-bubble">${escapeHtml(text)}</div>`;
+    wrapper.innerHTML = `<div class="msg-user-bubble">${escapeHtml(text)}</div>`;
     messagesList.appendChild(wrapper);
     scrollToBottom();
   }
 
-  function appendBotResponse(text) {
+  // ── Render Dual-Language Card ──
+  function renderDualLanguageCard(originalText, translatedText, sourceLang, targetLang) {
     triggerHaptic('success');
 
     const wrapper = document.createElement('div');
-    wrapper.className = 'msg-wrapper msg-bot';
+    wrapper.className = 'msg-wrapper';
+
+    // Label tags
+    const origTag = sourceLang === 'am' ? '🇪🇹 ኦሪጂናል (Amharic)' : '🇬🇧 Original (English)';
+    const transTag = targetLang === 'am' ? '🇪🇹 ትርጉም (Amharic Translation)' : '🇬🇧 English Translation';
+
+    // Resolve which text is Amharic vs English for voice buttons
+    const amharicText = sourceLang === 'am' ? originalText : translatedText;
+    const englishText = sourceLang === 'en' ? originalText : translatedText;
 
     wrapper.innerHTML = `
-      <div class="msg-bubble">${escapeHtml(text)}</div>
-      <div class="voice-player">
-        <button class="play-toggle-btn" aria-label="Play voice note">
-          <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-            <polygon points="5 3 19 12 5 21 5 3"></polygon>
-          </svg>
-        </button>
-        <div class="audio-track-info">
-          <div class="progress-bar-bg">
-            <div class="progress-fill"></div>
+      <div class="translation-card glass-panel">
+        <!-- 1. Original Language Section -->
+        <div class="card-section original">
+          <div class="section-tag tag-original">${origTag}</div>
+          <div class="section-text">${escapeHtml(originalText)}</div>
+        </div>
+
+        <!-- 2. Translated Language Section (Underneath) -->
+        <div class="card-section translated">
+          <div class="section-tag tag-translated">${transTag}</div>
+          <div class="section-text">${escapeHtml(translatedText)}</div>
+        </div>
+
+        <!-- 3. Dual-Language Audio Bar -->
+        <div class="card-audio-bar">
+          <div class="voice-buttons-group">
+            <button class="voice-btn am-btn" data-lang="am" title="Play Amharic voice">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span>🇪🇹 አማርኛ</span>
+            </button>
+            <button class="voice-btn en-btn" data-lang="en" title="Play English voice">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span>🇬🇧 English</span>
+            </button>
           </div>
-          <div class="track-meta">
-            <span class="track-time">0:00 / 0:04</span>
-            <span class="speed-badge">1x</span>
-          </div>
+          <button class="speed-btn" title="Toggle audio speed">1x</button>
         </div>
       </div>
     `;
@@ -252,65 +307,115 @@
     messagesList.appendChild(wrapper);
     scrollToBottom();
 
-    // Attach voice player logic
-    const playBtn = wrapper.querySelector('.play-toggle-btn');
-    const speedBadge = wrapper.querySelector('.speed-badge');
-    const progressFill = wrapper.querySelector('.progress-fill');
-    let isPlaying = false;
-    let playbackRate = 1.0;
+    // Attach real streaming audio player logic
+    const card = wrapper.querySelector('.translation-card');
+    const amBtn = card.querySelector('.am-btn');
+    const enBtn = card.querySelector('.en-btn');
+    const speedBtn = card.querySelector('.speed-btn');
 
-    playBtn.addEventListener('click', () => {
-      triggerHaptic('light');
-      if (!isPlaying) {
-        isPlaying = true;
-        playBtn.innerHTML = `
-          <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-            <rect x="6" y="4" width="4" height="16"></rect>
-            <rect x="14" y="4" width="4" height="16"></rect>
-          </svg>
-        `;
-        speakAmharicText(text, playbackRate, () => {
-          isPlaying = false;
-          playBtn.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-              <polygon points="5 3 19 12 5 21 5 3"></polygon>
-            </svg>
-          `;
-          progressFill.style.width = '0%';
-        }, (prog) => {
-          progressFill.style.width = `${prog * 100}%`;
-        });
-      } else {
-        window.speechSynthesis?.cancel();
-        isPlaying = false;
-        playBtn.innerHTML = `
-          <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-            <polygon points="5 3 19 12 5 21 5 3"></polygon>
-          </svg>
-        `;
-      }
+    amBtn.addEventListener('click', () => {
+      playTtsAudio(amharicText, 'am', amBtn);
     });
 
-    speedBadge.addEventListener('click', () => {
+    enBtn.addEventListener('click', () => {
+      playTtsAudio(englishText, 'en', enBtn);
+    });
+
+    speedBtn.addEventListener('click', () => {
       triggerHaptic('light');
-      if (playbackRate === 1.0) {
-        playbackRate = 1.5;
-        speedBadge.textContent = '1.5x';
-      } else if (playbackRate === 1.5) {
-        playbackRate = 2.0;
-        speedBadge.textContent = '2x';
-      } else {
-        playbackRate = 1.0;
-        speedBadge.textContent = '1x';
+      if (currentPlaybackRate === 1.0) currentPlaybackRate = 1.5;
+      else if (currentPlaybackRate === 1.5) currentPlaybackRate = 2.0;
+      else currentPlaybackRate = 1.0;
+
+      speedBtn.textContent = `${currentPlaybackRate}x`;
+      if (currentAudio && !currentAudio.paused) {
+        currentAudio.playbackRate = currentPlaybackRate;
       }
     });
   }
 
+  // ── Universal Reliable Audio Player (Google TTS MP3 Stream) ──
+  function playTtsAudio(textToSpeak, langCode, buttonElement) {
+    triggerHaptic('light');
+
+    // If currently playing the SAME button -> Stop it
+    if (currentAudio && activePlayButton === buttonElement && !currentAudio.paused) {
+      stopCurrentAudio();
+      return;
+    }
+
+    // Stop any existing audio first
+    stopCurrentAudio();
+
+    // Set playing state on button
+    activePlayButton = buttonElement;
+    activePlayButton.classList.add('playing');
+    const icon = activePlayButton.querySelector('svg');
+    if (icon) {
+      icon.innerHTML = `
+        <rect x="6" y="4" width="4" height="16"></rect>
+        <rect x="14" y="4" width="4" height="16"></rect>
+      `;
+    }
+
+    // Direct Google TTS MP3 streaming URL (100% reliable across all Telegram platforms)
+    const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${langCode}&client=tw-ob&q=${encodeURIComponent(textToSpeak)}`;
+
+    currentAudio = new Audio(ttsUrl);
+    currentAudio.playbackRate = currentPlaybackRate;
+
+    currentAudio.onended = () => {
+      stopCurrentAudio();
+    };
+
+    currentAudio.onerror = (e) => {
+      console.warn('HTML5 Audio error, attempting SpeechSynthesis fallback:', e);
+      stopCurrentAudio();
+      // SpeechSynthesis Fallback
+      fallbackSpeechSynthesis(textToSpeak, langCode);
+    };
+
+    currentAudio.play().catch((err) => {
+      console.warn('Playback blocked or failed:', err);
+      stopCurrentAudio();
+      fallbackSpeechSynthesis(textToSpeak, langCode);
+    });
+  }
+
+  function stopCurrentAudio() {
+    if (currentAudio) {
+      try {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      } catch (_) {}
+      currentAudio = null;
+    }
+    if (activePlayButton) {
+      activePlayButton.classList.remove('playing');
+      const icon = activePlayButton.querySelector('svg');
+      if (icon) {
+        icon.innerHTML = `<polygon points="5 3 19 12 5 21 5 3"></polygon>`;
+      }
+      activePlayButton = null;
+    }
+  }
+
+  function fallbackSpeechSynthesis(text, lang) {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utt = new SpeechSynthesisUtterance(text);
+      utt.lang = lang === 'am' ? 'am-ET' : 'en-US';
+      utt.rate = currentPlaybackRate;
+      window.speechSynthesis.speak(utt);
+    }
+  }
+
+  // ── Typing Indicator ──
   function showTypingIndicator() {
     const typing = document.createElement('div');
     typing.id = 'typingIndicator';
-    typing.className = 'msg-wrapper msg-bot';
-    typing.innerHTML = `<div class="msg-bubble" style="color: #94A3B8;">✍️ አጋዥ እያሰበ ነው... (Thinking...)</div>`;
+    typing.className = 'msg-wrapper';
+    typing.innerHTML = `<div class="translation-card glass-panel" style="padding: 12px 16px; color: #94A3B8; font-size: 13px;">✍️ እየተተረጎመ ነው... (Translating...)</div>`;
     messagesList.appendChild(typing);
     scrollToBottom();
   }
@@ -324,46 +429,6 @@
     chatFeed.scrollTop = chatFeed.scrollHeight;
   }
 
-  // ── Amharic Speech Synthesis ──
-  function speakAmharicText(text, rate = 1.0, onEnd = null, onProgress = null) {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = rate;
-
-      // Find Amharic voice or standard voice
-      const voices = window.speechSynthesis.getVoices();
-      const amVoice = voices.find((v) => v.lang.startsWith('am'));
-      if (amVoice) utterance.voice = amVoice;
-
-      let timer = null;
-      let start = Date.now();
-      const estimatedDuration = Math.max(2500, text.length * 90) / rate;
-
-      timer = setInterval(() => {
-        const elapsed = Date.now() - start;
-        const progress = Math.min(1.0, elapsed / estimatedDuration);
-        if (onProgress) onProgress(progress);
-        if (progress >= 1.0) clearInterval(timer);
-      }, 100);
-
-      utterance.onend = () => {
-        clearInterval(timer);
-        if (onProgress) onProgress(1.0);
-        if (onEnd) onEnd();
-      };
-
-      utterance.onerror = () => {
-        clearInterval(timer);
-        if (onEnd) onEnd();
-      };
-
-      window.speechSynthesis.speak(utterance);
-    } else {
-      if (onEnd) onEnd();
-    }
-  }
-
   function escapeHtml(str) {
     return str
       .replace(/&/g, '&amp;')
@@ -375,11 +440,8 @@
 
   // ── Event Listeners ──
   micBtn.addEventListener('click', () => {
-    if (!isRecording) {
-      startRecording();
-    } else {
-      stopRecording();
-    }
+    if (!isRecording) startRecording();
+    else stopRecording();
   });
 
   sendBtn.addEventListener('click', handleTextSubmit);

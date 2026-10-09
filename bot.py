@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import html
+import shutil
 import asyncio
 import tempfile
 import logging
@@ -103,6 +104,11 @@ from moderation import (
     ban_command,
     promote_command,
     demote_command,
+    warn_command,
+    warns_command,
+    unwarn_command,
+    clearwarns_command,
+    set_warn_limit_command,
     report_command,
     setcookies_command,
     maintenance_command,
@@ -118,6 +124,7 @@ from downloaders import (
     handle_tiktok_message,
     handle_reddit_message,
     handle_pending_download_button,
+    download_generic_media,
 )
 
 from twitter_handler import handle_twitter_message
@@ -183,8 +190,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /status    View your settings\n"
         f"  /report    Report a bug\n"
         f"\n"
-        f"─── 👮 Admin Only ───\n"
+        f"─── 👮 Group Moderation ───\n"
         f"\n"
+        f"  /warn      Warn a user (3-5 lives before ban)\n"
+        f"  /warns     Check user warnings & lives\n"
+        f"  /unwarn    Remove 1 warning (restore 1 life)\n"
+        f"  /clearwarns Clear all warnings\n"
+        f"  /setwarnlimit Set lives limit (3 to 5)\n"
         f"  /ban       Ban a user\n"
         f"  /promote   Promote to admin\n"
         f"  /demote    Demote an admin\n"
@@ -905,13 +917,44 @@ def _extract_video_media(message):
     return None
 
 
+def _extract_url_from_message(message) -> Optional[str]:
+    """Extract a media URL from message entities, caption entities, or text."""
+    if not message:
+        return None
+
+    # Check caption entities first (e.g. hyperlinked text like 'Instagram Link')
+    if getattr(message, "caption_entities", None):
+        for ent in message.caption_entities:
+            if ent.type == "text_link" and ent.url:
+                return ent.url
+            elif ent.type == "url" and message.caption:
+                return message.caption[ent.offset : ent.offset + ent.length]
+
+    # Check text entities
+    if getattr(message, "entities", None):
+        for ent in message.entities:
+            if ent.type == "text_link" and ent.url:
+                return ent.url
+            elif ent.type == "url" and message.text:
+                return message.text[ent.offset : ent.offset + ent.length]
+
+    # Fallback to regex in caption or text
+    raw_text = (getattr(message, "caption", "") or "") + " " + (getattr(message, "text", "") or "")
+    match = re.search(r'https?://[^\s<>"]+', raw_text)
+    if match:
+        return match.group(0)
+
+    return None
+
+
 async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Convert a replied video or attached video to GIF.
+    """Convert a replied video, attached video, or video link to GIF.
 
     Usage:
-      /gif        – Convert video to GIF (up to 30s)
-      /gif 5      – First 5 seconds to GIF
-      /gif 4 10   – Convert from 4s to 10s to GIF
+      /gif                     – Convert replied/attached video or link to GIF (up to 30s)
+      /gif 5                   – First 5 seconds
+      /gif 4 10                – Convert from 4s to 10s
+      /gif <url> [start] [end] – Convert video at URL to GIF
     """
     user = update.effective_user
     msg = update.effective_message
@@ -923,32 +966,8 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     replied = msg.reply_to_message
-    # Check replied message first, then fall back to the message itself (e.g. video sent with /gif caption)
-    target_msg = replied if (replied and _extract_video_media(replied)) else msg
-    video = _extract_video_media(target_msg)
 
-    if not video:
-        await msg.reply_text(
-            fmt_card("🎞️ /gif — Video to GIF",
-                f"  Reply to a video or send a video with:\n"
-                f"  <code>/gif</code> — Convert full video (up to 30s)\n"
-                f"  <code>/gif 5</code> — First 5 seconds\n"
-                f"  <code>/gif 4 10</code> — Convert 4s to 10s"
-            ),
-            parse_mode="HTML"
-        )
-        return
-
-    # Check file size before downloading (Telegram Bot API download limit is 20 MB)
-    if getattr(video, "file_size", None) and video.file_size > 20 * 1024 * 1024:
-        size_mb = video.file_size / (1024 * 1024)
-        await msg.reply_text(
-            fmt_error(f"Video is too large ({size_mb:.1f} MB). Telegram bots can only download files up to 20 MB."),
-            parse_mode="HTML"
-        )
-        return
-
-    # Parse time range
+    # Parse arguments: extract optional URL and time range
     args = context.args or []
     if not args:
         raw_text = msg.text or msg.caption or ""
@@ -958,21 +977,30 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 args = tokens[idx + 1:]
                 break
 
+    url_from_args = None
+    time_args = []
+    for arg in args:
+        if arg.startswith("http://") or arg.startswith("https://"):
+            if not url_from_args:
+                url_from_args = arg
+        else:
+            time_args.append(arg)
+
     start_sec = 0.0
     end_sec = None
-    if len(args) >= 2:
+    if len(time_args) >= 2:
         try:
-            start_sec = max(0.0, float(args[0]))
-            end_sec = float(args[1])
+            start_sec = max(0.0, float(time_args[0]))
+            end_sec = float(time_args[1])
             if end_sec <= start_sec:
                 await msg.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
                 return
         except ValueError:
             await msg.reply_text(fmt_error("Invalid time values. Use numbers like: <code>/gif 4 10</code>"), parse_mode="HTML")
             return
-    elif len(args) == 1:
+    elif len(time_args) == 1:
         try:
-            val = float(args[0])
+            val = float(time_args[0])
             if val <= 0:
                 await msg.reply_text(fmt_error("Duration must be greater than 0."), parse_mode="HTML")
                 return
@@ -981,43 +1009,104 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await msg.reply_text(fmt_error("Invalid time value. Use numbers like: <code>/gif 5</code>"), parse_mode="HTML")
             return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
+    # Check target message for video object
+    target_msg = replied if (replied and _extract_video_media(replied)) else msg
+    video = _extract_video_media(target_msg)
 
-    # Download video
-    try:
-        tg_file = await context.bot.get_file(video.file_id)
-        video_bytes = bytes(await tg_file.download_as_bytearray())
-    except Exception as e:
-        logger.error(f"Failed to download video for /gif: {e}")
-        err_msg = str(e)
-        if "file is too big" in err_msg.lower():
-            await msg.reply_text(fmt_error("Video exceeds Telegram's 20 MB download limit."), parse_mode="HTML")
-        else:
-            await msg.reply_text(fmt_error(f"Failed to download video: {err_msg[:120]}"), parse_mode="HTML")
+    # Check if there is an URL in args, replied message, or current message
+    fallback_url = (
+        url_from_args
+        or _extract_url_from_message(replied)
+        or _extract_url_from_message(msg)
+    )
+
+    if not video and not fallback_url:
+        await msg.reply_text(
+            fmt_card("🎞️ /gif — Video to GIF",
+                f"  Reply to a video or send a video/link with:\n"
+                f"  <code>/gif</code> — Convert full video (up to 30s)\n"
+                f"  <code>/gif 5</code> — First 5 seconds\n"
+                f"  <code>/gif 4 10</code> — Convert 4s to 10s\n"
+                f"  <code>/gif https://... 2 8</code> — Convert from link"
+            ),
+            parse_mode="HTML"
+        )
         return
 
-    # Determine file extension
-    suffix = ".mp4"
-    if hasattr(video, "file_name") and video.file_name:
-        _, ext = os.path.splitext(video.file_name)
-        if ext:
-            suffix = ext
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
 
-    tmp_path = None
+    video_source_path = None
+    cleanup_temp_file = False
+    cleanup_temp_dir = None
+
+    # Step 1: If Telegram video object is available and within 20MB limit, try downloading via Telegram Bot API
+    if video:
+        file_size = getattr(video, "file_size", None)
+        if not file_size or file_size <= 20 * 1024 * 1024:
+            try:
+                tg_file = await context.bot.get_file(video.file_id)
+                video_bytes = bytes(await tg_file.download_as_bytearray())
+                suffix = ".mp4"
+                if hasattr(video, "file_name") and video.file_name:
+                    _, ext = os.path.splitext(video.file_name)
+                    if ext:
+                        suffix = ext
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(video_bytes)
+                    video_source_path = tmp.name
+                    cleanup_temp_file = True
+            except Exception as e:
+                logger.warning(f"Telegram get_file failed for /gif ({e}), checking for fallback URL...")
+
+    # Step 2: Fallback to yt-dlp downloader if Telegram download failed or file too big or direct link
+    if not video_source_path and fallback_url:
+        try:
+            cleanup_temp_dir = tempfile.mkdtemp()
+            info = await download_generic_media(fallback_url, cleanup_temp_dir, platform_name="Video")
+            video_source_path = info.get("filepath")
+        except Exception as e:
+            logger.error(f"URL video download failed for /gif ({fallback_url}): {e}")
+            if not video:
+                await msg.reply_text(
+                    fmt_error(f"Failed to download video from link: {str(e)[:120]}"),
+                    parse_mode="HTML"
+                )
+                if cleanup_temp_dir and os.path.exists(cleanup_temp_dir):
+                    shutil.rmtree(cleanup_temp_dir, ignore_errors=True)
+                return
+
+    if not video_source_path or not os.path.exists(video_source_path):
+        if video and getattr(video, "file_size", None) and video.file_size > 20 * 1024 * 1024:
+            size_mb = video.file_size / (1024 * 1024)
+            await msg.reply_text(
+                fmt_error(f"Video is too large ({size_mb:.1f} MB) and exceeds Telegram's 20 MB download limit."),
+                parse_mode="HTML"
+            )
+        else:
+            await msg.reply_text(
+                fmt_error("Failed to retrieve video file (Telegram file was not found or link download failed)."),
+                parse_mode="HTML"
+            )
+        if cleanup_temp_dir and os.path.exists(cleanup_temp_dir):
+            shutil.rmtree(cleanup_temp_dir, ignore_errors=True)
+        return
+
+    # Step 3: Convert video to GIF using quote_sticker.video_to_gif
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(video_bytes)
-            tmp_path = tmp.name
-
-        gif_bytes = await quote_sticker.video_to_gif(tmp_path, start_sec, end_sec)
+        gif_bytes = await quote_sticker.video_to_gif(video_source_path, start_sec, end_sec)
     except Exception as e:
         logger.error(f"GIF execution error: {e}", exc_info=True)
         await msg.reply_text(fmt_error(f"GIF conversion error: {str(e)[:150]}"), parse_mode="HTML")
         return
     finally:
-        if tmp_path:
+        if cleanup_temp_file and video_source_path:
             try:
-                os.unlink(tmp_path)
+                os.unlink(video_source_path)
+            except OSError:
+                pass
+        if cleanup_temp_dir and os.path.exists(cleanup_temp_dir):
+            try:
+                shutil.rmtree(cleanup_temp_dir, ignore_errors=True)
             except OSError:
                 pass
 
@@ -1347,6 +1436,10 @@ async def post_init(application: Application) -> None:
         ("help", "Full help guide"),
         ("report", "Report a problem to admins"),
         ("setcookies", "Update YouTube cookies (DM only)"),
+        ("warn", "Warn a user (Admins)"),
+        ("warns", "Check warnings and lives"),
+        ("unwarn", "Remove 1 warning (Admins)"),
+        ("clearwarns", "Clear all warnings (Admins)"),
         ("ban", "Ban user from group (Admins)"),
         ("promote", "Promote user to Admin (Admins)"),
         ("demote", "Demote Admin (Admins)"),
@@ -1423,6 +1516,11 @@ def main() -> None:
     application.add_handler(CommandHandler("target", target_command))
     application.add_handler(CommandHandler(["languages", "langs", "settings"], languages_command))
     application.add_handler(CommandHandler("engine", engine_command))
+    application.add_handler(CommandHandler("warn", warn_command))
+    application.add_handler(CommandHandler("warns", warns_command))
+    application.add_handler(CommandHandler(["unwarn", "rmwarn"], unwarn_command))
+    application.add_handler(CommandHandler(["clearwarns", "resetwarns"], clearwarns_command))
+    application.add_handler(CommandHandler(["setwarnlimit", "warnlimit", "setwarns"], set_warn_limit_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("promote", promote_command))
     application.add_handler(CommandHandler("demote", demote_command))

@@ -739,52 +739,74 @@ async def video_to_gif(
         output_path = tmp.name
 
     try:
-        # Fast high-quality GIF generation using palettegen & paletteuse in a single filtergraph.
-        # scale=min(max_width,iw):-2 avoids upscaling small videos and enforces even dimensions.
+        # Ultra-fast high-quality GIF generation with -nostdin and output -t
         filter_str = (
-            f"[0:v] fps={fps},scale=min({max_width}\\,iw):-2:flags=lanczos,split [a][b]; "
-            f"[a] palettegen=stats_mode=diff [p]; "
-            f"[b][p] paletteuse=dither=bayer:bayer_scale=5"
+            f"fps={fps},scale=min({max_width}\\,iw):-2:flags=fast_bilinear,split[s0][s1];"
+            f"[s0]palettegen=max_colors=128[p];"
+            f"[s1][p]paletteuse=dither=bayer:bayer_scale=3"
         )
 
         cmd = [
             "ffmpeg", "-y",
+            "-nostdin",
             "-ss", str(start_sec),
-            "-t", str(duration),
             "-i", video_path,
-            "-filter_complex", filter_str,
+            "-t", str(duration),
+            "-vf", filter_str,
             output_path,
         ]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
+
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            logger.error("ffmpeg GIF conversion timed out after 20s")
+            return None
 
         if proc.returncode != 0:
+            err_output = stderr.decode(errors='ignore').strip()
             logger.warning(
-                f"ffmpeg complex filter failed: {stderr.decode(errors='ignore').strip()}, "
-                f"trying fallback single-pass GIF"
+                f"ffmpeg palette filter failed: {err_output[:200]}, trying standard fallback"
             )
-            # Fallback: single-pass GIF with standard palette
+            # Fallback: standard GIF encoding without palette filter
             cmd_fallback = [
                 "ffmpeg", "-y",
+                "-nostdin",
                 "-ss", str(start_sec),
-                "-t", str(duration),
                 "-i", video_path,
-                "-vf", f"fps={fps},scale=min({max_width}\\,iw):-2:flags=lanczos",
+                "-t", str(duration),
+                "-vf", f"fps={fps},scale=min({max_width}\\,iw):-2",
                 output_path,
             ]
             proc_fallback = await asyncio.create_subprocess_exec(
                 *cmd_fallback,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr_fallback = await asyncio.wait_for(proc_fallback.communicate(), timeout=35)
+            try:
+                _, stderr_fallback = await asyncio.wait_for(proc_fallback.communicate(), timeout=15.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc_fallback.kill()
+                    await proc_fallback.wait()
+                except Exception:
+                    pass
+                return None
+
             if proc_fallback.returncode != 0:
-                logger.error(f"ffmpeg GIF error: {stderr_fallback.decode(errors='ignore').strip()}")
+                logger.error(f"ffmpeg GIF error: {stderr_fallback.decode(errors='ignore').strip()[:200]}")
                 return None
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
@@ -793,11 +815,8 @@ async def video_to_gif(
 
         with open(output_path, "rb") as f:
             return f.read()
-    except asyncio.TimeoutError:
-        logger.error("ffmpeg GIF conversion timed out")
-        return None
     except Exception as e:
-        logger.error(f"GIF conversion error: {e}")
+        logger.error(f"GIF conversion error: {e}", exc_info=True)
         return None
     finally:
         try:

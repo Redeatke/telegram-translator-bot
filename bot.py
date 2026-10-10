@@ -1036,7 +1036,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    status_msg = await msg.reply_text("⏳ <i>Processing GIF...</i>", parse_mode="HTML")
+    status_msg = await msg.reply_text("🎞️ <i>Converting video to GIF...</i>", parse_mode="HTML")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
 
     video_source_path = None
@@ -1047,8 +1047,8 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if video:
         file_size = getattr(video, "file_size", None)
         if not file_size or file_size <= 20 * 1024 * 1024:
+            tmp = None
             try:
-                await status_msg.edit_text("⏳ <i>Downloading video from Telegram...</i>", parse_mode="HTML")
                 tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=15.0)
                 suffix = ".mp4"
                 if hasattr(video, "file_name") and video.file_name:
@@ -1074,36 +1074,34 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Step 2: Fallback to video source downloader if Telegram download failed or file too big or direct link
     if not video_source_path and fallback_url:
         try:
-            await status_msg.edit_text("⏳ <i>Downloading video from link...</i>", parse_mode="HTML")
             cleanup_temp_dir = tempfile.mkdtemp()
             video_source_path = await download_video_source(fallback_url, cleanup_temp_dir)
         except Exception as e:
             logger.error(f"URL video download failed for /gif ({fallback_url}): {e}")
 
     if not video_source_path or not os.path.exists(video_source_path):
+        err_msg = "Failed to retrieve video (Telegram file was not found or link download failed)."
         if video and getattr(video, "file_size", None) and video.file_size > 20 * 1024 * 1024:
             size_mb = video.file_size / (1024 * 1024)
-            await status_msg.edit_text(
-                fmt_error(f"Video is too large ({size_mb:.1f} MB) and exceeds Telegram's 20 MB download limit."),
-                parse_mode="HTML"
-            )
-        else:
-            await status_msg.edit_text(
-                fmt_error("Failed to retrieve video (Telegram file was not found or link download failed)."),
-                parse_mode="HTML"
-            )
+            err_msg = f"Video is too large ({size_mb:.1f} MB) and exceeds Telegram's 20 MB download limit."
+        try:
+            await status_msg.edit_text(fmt_error(err_msg), parse_mode="HTML")
+        except Exception:
+            await msg.reply_text(fmt_error(err_msg), parse_mode="HTML")
         if cleanup_temp_dir and os.path.exists(cleanup_temp_dir):
             shutil.rmtree(cleanup_temp_dir, ignore_errors=True)
         return
 
     # Step 3: Convert video to GIF using quote_sticker.video_to_gif
     try:
-        await status_msg.edit_text("🎞️ <i>Converting video to GIF...</i>", parse_mode="HTML")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
         gif_bytes = await quote_sticker.video_to_gif(video_source_path, start_sec, end_sec)
     except Exception as e:
         logger.error(f"GIF execution error: {e}", exc_info=True)
-        await status_msg.edit_text(fmt_error(f"GIF conversion error: {str(e)[:150]}"), parse_mode="HTML")
+        try:
+            await status_msg.edit_text(fmt_error(f"GIF conversion error: {str(e)[:150]}"), parse_mode="HTML")
+        except Exception:
+            pass
         return
     finally:
         if cleanup_temp_file and video_source_path:
@@ -1118,15 +1116,17 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
 
     if not gif_bytes:
-        await status_msg.edit_text(
-            fmt_error("Failed to convert video to GIF. The video format may be incompatible or damaged."),
-            parse_mode="HTML"
-        )
+        try:
+            await status_msg.edit_text(
+                fmt_error("Failed to convert video to GIF. The video format may be incompatible or damaged."),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
         return
 
     # Step 4: Send as animation (GIF) or fallback to document if Telegram animation fails
     try:
-        await status_msg.edit_text("📤 <i>Uploading GIF...</i>", parse_mode="HTML")
         await msg.reply_animation(
             animation=gif_bytes,
             reply_to_message_id=msg.message_id,
@@ -1151,7 +1151,10 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
         except Exception as e2:
             logger.error(f"Failed to send GIF: {e2}")
-            await status_msg.edit_text(fmt_error(f"Failed to send converted GIF: {str(e2)[:120]}"), parse_mode="HTML")
+            try:
+                await status_msg.edit_text(fmt_error(f"Failed to send converted GIF: {str(e2)[:120]}"), parse_mode="HTML")
+            except Exception:
+                pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Translate incoming text messages in private chats."""

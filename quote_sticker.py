@@ -32,7 +32,8 @@ MAX_STICKERS_PER_PACK = 120  # Telegram limit
 MAX_VIDEO_STICKER_DURATION = 3  # seconds
 MAX_VIDEO_STICKER_FPS = 30
 MAX_VIDEO_STICKER_SIZE_KB = 256
-MAX_GIF_DURATION = 30       # seconds — reasonable limit for GIFs
+DEFAULT_GIF_DURATION = 6.0   # seconds — ideal default length for crisp, fast-loading GIFs
+MAX_GIF_DURATION = 15.0       # seconds — max ceiling for GIF duration to prevent CPU freeze / oversized files
 
 # ─── Card Design Colors & Fonts ────────────────────────────────────────────────
 # Design: Glassmorphism dark
@@ -717,7 +718,8 @@ async def video_to_gif(
     video_path: str,
     start_sec: float = 0,
     end_sec: Optional[float] = None,
-    max_width: int = 480,
+    max_width: int = 400,
+    fps: int = 12,
 ) -> Optional[bytes]:
     """
     Convert a video (or portion of it) to an optimized GIF.
@@ -731,7 +733,7 @@ async def video_to_gif(
         if duration > MAX_GIF_DURATION:
             duration = MAX_GIF_DURATION
     else:
-        duration = MAX_GIF_DURATION
+        duration = DEFAULT_GIF_DURATION
 
     with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
         output_path = tmp.name
@@ -740,7 +742,7 @@ async def video_to_gif(
         # Fast high-quality GIF generation using palettegen & paletteuse in a single filtergraph.
         # scale=min(max_width,iw):-2 avoids upscaling small videos and enforces even dimensions.
         filter_str = (
-            f"[0:v] fps=15,scale=min({max_width}\\,iw):-2:flags=lanczos,split [a][b]; "
+            f"[0:v] fps={fps},scale=min({max_width}\\,iw):-2:flags=lanczos,split [a][b]; "
             f"[a] palettegen=stats_mode=diff [p]; "
             f"[b][p] paletteuse=dither=bayer:bayer_scale=5"
         )
@@ -759,7 +761,7 @@ async def video_to_gif(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
 
         if proc.returncode != 0:
             logger.warning(
@@ -772,7 +774,7 @@ async def video_to_gif(
                 "-ss", str(start_sec),
                 "-t", str(duration),
                 "-i", video_path,
-                "-vf", f"fps=15,scale=min({max_width}\\,iw):-2:flags=lanczos",
+                "-vf", f"fps={fps},scale=min({max_width}\\,iw):-2:flags=lanczos",
                 output_path,
             ]
             proc_fallback = await asyncio.create_subprocess_exec(
@@ -780,7 +782,7 @@ async def video_to_gif(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr_fallback = await asyncio.wait_for(proc_fallback.communicate(), timeout=60)
+            _, stderr_fallback = await asyncio.wait_for(proc_fallback.communicate(), timeout=35)
             if proc_fallback.returncode != 0:
                 logger.error(f"ffmpeg GIF error: {stderr_fallback.decode(errors='ignore').strip()}")
                 return None

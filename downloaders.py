@@ -844,6 +844,77 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
         raise Exception(f"{platform_name} download timed out.")
 
 
+async def download_video_source(url: str, output_dir: str) -> Optional[str]:
+    """Download video from URL (Instagram, TikTok, Reddit, YouTube, or direct MP4 link) for GIF conversion.
+    Returns the absolute path to the downloaded video file, or None if failed.
+    """
+    if not url:
+        return None
+
+    # 1. Direct video file URL
+    clean_url = url.split("?")[0].lower()
+    if clean_url.endswith((".mp4", ".mov", ".mkv", ".webm")):
+        try:
+            out_path = os.path.join(output_dir, f"video_{uuid.uuid4().hex[:8]}.mp4")
+            async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200 and len(resp.content) > 0:
+                    with open(out_path, "wb") as f:
+                        f.write(resp.content)
+                    return out_path
+        except Exception as e:
+            logger.warning(f"Direct video download failed ({e}), continuing fallback...")
+
+    # 2. Instagram: Fast direct extraction of CDN video URL
+    if INSTAGRAM_URL_PATTERN.search(url):
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _extract_ig():
+                ydl_opts = {
+                    'format': 'best',
+                    'quiet': True,
+                    'no_warnings': True,
+                    'skip_download': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
+                    for e in entries:
+                        if not e:
+                            continue
+                        item_url = e.get('url')
+                        if not item_url and e.get('formats'):
+                            item_url = e['formats'][-1].get('url')
+                        if item_url and e.get('ext') != 'jpg':
+                            return item_url
+                return None
+
+            video_cdn_url = await loop.run_in_executor(None, _extract_ig)
+            if video_cdn_url:
+                out_path = os.path.join(output_dir, f"ig_{uuid.uuid4().hex[:8]}.mp4")
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    resp = await client.get(video_cdn_url, headers=headers)
+                    if resp.status_code == 200 and len(resp.content) > 0:
+                        with open(out_path, "wb") as f:
+                            f.write(resp.content)
+                        return out_path
+        except Exception as ig_err:
+            logger.warning(f"Fast Instagram extraction failed for GIF ({ig_err}), falling back to yt-dlp...")
+
+    # 3. Generic media download with reasonable 45-second timeout
+    try:
+        info = await asyncio.wait_for(
+            download_generic_media(url, output_dir, platform_name="Video"),
+            timeout=45.0
+        )
+        return info.get("filepath")
+    except Exception as e:
+        logger.error(f"Failed to download video source from {url}: {e}")
+        return None
+
+
 async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
     """Execute download and upload for generic media (TikTok, Instagram, Reddit)."""
     if not status_msg:

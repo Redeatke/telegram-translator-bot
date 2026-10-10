@@ -12,7 +12,7 @@
     tg.ready();
     tg.expand();
     try {
-      tg.enableClosingConfirmation();
+      tg.disableClosingConfirmation();
     } catch (_) {}
   }
 
@@ -38,6 +38,62 @@
   const waveformCanvas = document.getElementById('waveformCanvas');
   const recordingTimer = document.getElementById('recordingTimer');
   const dockHint = document.getElementById('dockHint');
+  const clearChatBtn = document.getElementById('clearChatBtn');
+
+  // ── Chat Memory Persistence ──
+  const STORAGE_KEY = 'redster_chat_history_v1';
+  let chatHistory = [];
+
+  function loadChatHistory() {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        chatHistory = JSON.parse(stored);
+      }
+    } catch (e) {
+      console.warn('Failed to parse chat history:', e);
+      chatHistory = [];
+    }
+
+    if (Array.isArray(chatHistory) && chatHistory.length > 0) {
+      if (welcomeCard) welcomeCard.style.display = 'none';
+      if (clearChatBtn) clearChatBtn.style.display = 'inline-flex';
+
+      chatHistory.forEach((msg) => {
+        if (msg.type === 'user') {
+          appendUserMessage(msg.text, false);
+        } else if (msg.type === 'translation') {
+          renderDualLanguageCard(msg.original, msg.translated, msg.sourceLang, msg.targetLang, false);
+        }
+      });
+      scrollToBottom();
+    } else {
+      if (welcomeCard) welcomeCard.style.display = 'flex';
+      if (clearChatBtn) clearChatBtn.style.display = 'none';
+    }
+  }
+
+  function saveChatHistory() {
+    try {
+      if (chatHistory.length > 100) {
+        chatHistory = chatHistory.slice(-100);
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(chatHistory));
+    } catch (e) {
+      console.warn('Failed to save chat history:', e);
+    }
+  }
+
+  function clearChat() {
+    triggerHaptic('medium');
+    chatHistory = [];
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (_) {}
+    messagesList.innerHTML = '';
+    if (welcomeCard) welcomeCard.style.display = 'flex';
+    if (clearChatBtn) clearChatBtn.style.display = 'none';
+  }
 
   // ── Audio Engine State ──
   let isRecording = false;
@@ -244,19 +300,29 @@
   }
 
   // ── Render User Message ──
-  function appendUserMessage(text) {
+  function appendUserMessage(text, persist = true) {
     if (welcomeCard) welcomeCard.style.display = 'none';
+    if (clearChatBtn) clearChatBtn.style.display = 'inline-flex';
 
     const wrapper = document.createElement('div');
     wrapper.className = 'msg-wrapper msg-user';
     wrapper.innerHTML = `<div class="msg-user-bubble">${escapeHtml(text)}</div>`;
     messagesList.appendChild(wrapper);
     scrollToBottom();
+
+    if (persist) {
+      chatHistory.push({ type: 'user', text, timestamp: Date.now() });
+      saveChatHistory();
+    }
   }
 
   // ── Render Dual-Language Card ──
-  function renderDualLanguageCard(originalText, translatedText, sourceLang, targetLang) {
-    triggerHaptic('success');
+  function renderDualLanguageCard(originalText, translatedText, sourceLang, targetLang, persist = true) {
+    if (persist) {
+      triggerHaptic('success');
+    }
+    if (welcomeCard) welcomeCard.style.display = 'none';
+    if (clearChatBtn) clearChatBtn.style.display = 'inline-flex';
 
     const wrapper = document.createElement('div');
     wrapper.className = 'msg-wrapper';
@@ -332,6 +398,18 @@
         currentAudio.playbackRate = currentPlaybackRate;
       }
     });
+
+    if (persist) {
+      chatHistory.push({
+        type: 'translation',
+        original: originalText,
+        translated: translatedText,
+        sourceLang,
+        targetLang,
+        timestamp: Date.now()
+      });
+      saveChatHistory();
+    }
   }
 
   // ── Universal Reliable Audio Player (Google TTS MP3 Stream) ──
@@ -473,5 +551,23 @@
       handleTextSubmit();
     }
   });
+
+  clearChatBtn?.addEventListener('click', () => {
+    triggerHaptic('light');
+    if (tg?.showConfirm) {
+      tg.showConfirm('የተተረጎሙትን መልዕክቶች ማጥፋት ይፈልጋሉ? (Clear all chat messages?)', (confirmed) => {
+        if (confirmed) {
+          clearChat();
+        }
+      });
+    } else {
+      if (window.confirm('Clear all chat messages?')) {
+        clearChat();
+      }
+    }
+  });
+
+  // Restore saved translations from memory on startup
+  loadChatHistory();
 
 })();

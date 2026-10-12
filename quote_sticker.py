@@ -371,224 +371,136 @@ def generate_quote_card(
     timestamp: Optional[str] = None,
 ) -> bytes:
     """
-    Generate a glassmorphism-style quote card as a 512px WEBP sticker.
-
-    Features:
-      - Dynamic card width: short text produces compact cards, not wide 512px strips
-      - Emoji support: renders emoji characters using NotoEmoji font
-      - Vibrant per-user avatar colors for placeholder initials & emoji avatars
-      - Reply context shown above the main quote
-
-    Returns:
-        WEBP image bytes suitable for Telegram sticker upload
+    Generate a Telegram/Quotly-style quote card as a 512px WEBP sticker.
+    Matches Telegram's native message structure:
+      - Quoted user's avatar on top-left
+      - Quoted user's name on top (vibrant accent color)
+      - If reply context: indented reply container with vertical accent bar
+      - Quoted message body text below
+      - Snug card bounding box scaled to 512px without excess empty canvas
     """
     text = _clean_text(text) or "(no text)"
     username = _clean_text(username) or "User"
 
-    # Layout constants
-    PADDING = 20
-    AVATAR_SIZE = 40
-    REPLY_AVATAR_SIZE = 30
-    MAX_CONTENT_W = STICKER_SIZE - (PADDING * 2)
+    PADDING = 18
+    AVATAR_SIZE = 48
 
-    # Standard crisp fonts
     font_user = FONT_USERNAME(22)
-    font_body = FONT_BODY(20)
-    font_meta = FONT_META(14)
-    font_reply_name = FONT_REPLY_NAME(16)
-    font_reply_text_font = FONT_REPLY_TEXT(15)
-    emoji_font = FONT_EMOJI(20) if _emoji_font_available else None
-    emoji_font_small = FONT_EMOJI(15) if _emoji_font_available else None
-    emoji_font_reply_name = FONT_EMOJI(16) if _emoji_font_available else None
+    font_body = FONT_BODY(21)
+    font_reply_name = FONT_REPLY_NAME(17)
+    font_reply_text_font = FONT_REPLY_TEXT(16)
+
+    emoji_font = FONT_EMOJI(21) if _emoji_font_available else None
+    emoji_font_small = FONT_EMOJI(16) if _emoji_font_available else None
 
     dummy_img = Image.new("RGBA", (1, 1))
     dd = ImageDraw.Draw(dummy_img)
 
-    # Wrap body text at maximum possible width
-    body_lines = _wrap_text(text, font_body, MAX_CONTENT_W - 16, dd,
-                            emoji_font=emoji_font)
-    if len(body_lines) > 12:
-        body_lines = body_lines[:11] + ["…"]
+    content_x = PADDING + AVATAR_SIZE + 14
+    max_content_w = 480 - content_x - PADDING
 
-    # Line heights
-    body_sample = dd.textbbox((0, 0), "Ag", font=font_body)
-    line_height = (body_sample[3] - body_sample[1]) + 6
-
-    # Measure widest body line
-    max_line_w = 0
-    for line in body_lines:
-        w = _measure_text_width(line, font_body, emoji_font, dd)
-        max_line_w = max(max_line_w, w)
-
-    # Measure username width and timestamp width
+    # 1. Author username width
     user_w = _measure_text_width(username, font_user, emoji_font, dd)
-    time_w = _measure_text_width(timestamp, font_meta, emoji_font, dd) if timestamp else 0
+    header_w = user_w
 
-    # Reply section measurement
-    reply_lines = []
-    reply_line_h = 0
+    # 2. Reply section measurement
     has_reply = bool(reply_username and reply_text)
-    max_reply_line_w = 0
+    reply_lines = []
+    reply_w = 0
+    reply_h = 0
+    rline_h = 20
     if has_reply:
-        reply_text_clean = _clean_text(reply_text)
-        reply_lines = _wrap_text(reply_text_clean, font_reply_text_font,
-                                 MAX_CONTENT_W - 30, dd, emoji_font=emoji_font)
+        reply_clean = _clean_text(reply_text)
+        reply_lines = _wrap_text(reply_clean, font_reply_text_font, max_content_w - 24, dd, emoji_font=emoji_font_small)
         if len(reply_lines) > 3:
             reply_lines = reply_lines[:2] + ["…"]
+        rname_w = _measure_text_width(_clean_text(reply_username), font_reply_name, emoji_font_small, dd)
+        rlines_max_w = max([_measure_text_width(l, font_reply_text_font, emoji_font_small, dd) for l in reply_lines] or [0])
+        reply_w = max(rname_w, rlines_max_w) + 20
         reply_sample = dd.textbbox((0, 0), "Ag", font=font_reply_text_font)
-        reply_line_h = (reply_sample[3] - reply_sample[1]) + 4
-        for rline in reply_lines:
-            w = _measure_text_width(rline, font_reply_text_font, emoji_font, dd)
-            max_reply_line_w = max(max_reply_line_w, w)
+        rline_h = (reply_sample[3] - reply_sample[1]) + 4
+        reply_h = 22 + len(reply_lines) * rline_h + 8
 
-    # ── Calculate dynamic card box width ──
-    # Content-based width calculation
-    body_needed_w = PADDING + 16 + max_line_w + PADDING
-    header_needed_w = PADDING + AVATAR_SIZE + 12 + max(user_w, time_w) + PADDING
-    reply_needed_w = 0
-    if has_reply:
-        reply_name_w = _measure_text_width(
-            _clean_text(reply_username), font_reply_name, emoji_font_reply_name, dd
-        )
-        reply_head_w = PADDING + 6 + REPLY_AVATAR_SIZE + 10 + reply_name_w + PADDING
-        reply_body_w = PADDING + 22 + max_reply_line_w + PADDING
-        reply_needed_w = max(reply_head_w, reply_body_w)
+    # 3. Main body text lines
+    body_lines = _wrap_text(text, font_body, max_content_w, dd, emoji_font=emoji_font)
+    if len(body_lines) > 12:
+        body_lines = body_lines[:11] + ["…"]
+    body_sample = dd.textbbox((0, 0), "Ag", font=font_body)
+    line_h = (body_sample[3] - body_sample[1]) + 6
+    body_max_w = max([_measure_text_width(l, font_body, emoji_font, dd) for l in body_lines] or [0])
+    body_h = len(body_lines) * line_h
 
-    raw_w = max(body_needed_w, header_needed_w, reply_needed_w, 240)
-    CARD_BOX_WIDTH = min(raw_w, STICKER_SIZE)
+    # Calculate snug card dimensions
+    needed_content_w = max(header_w, reply_w, body_max_w, 140)
+    card_w = min(content_x + needed_content_w + PADDING, 512)
+    card_w = max(card_w, 230)
 
-    # Height: sum of sections
-    header_h = AVATAR_SIZE + 6
-    body_h = len(body_lines) * line_height + 4
+    total_content_h = 30 + (reply_h + 8 if has_reply else 0) + body_h
+    card_h = max(total_content_h + (PADDING * 2), AVATAR_SIZE + (PADDING * 2), 105)
+    card_h = min(card_h, 512)
 
-    reply_section_h = 0
-    if has_reply and reply_lines:
-        reply_header_h = REPLY_AVATAR_SIZE + 4
-        reply_body_h = len(reply_lines) * reply_line_h + 6
-        reply_section_h = reply_header_h + reply_body_h + 10
-
-    total_h = PADDING + reply_section_h + header_h + body_h + PADDING
-    CARD_HEIGHT = min(max(total_h, 105), STICKER_SIZE)
-
-    # ── Render on a 512px canvas (Telegram sticker requirement: one side = 512px) ──
-    # The canvas width is STICKER_SIZE (512), with transparent background outside CARD_BOX_WIDTH
-    img = Image.new("RGBA", (STICKER_SIZE, CARD_HEIGHT), (0, 0, 0, 0))
+    img = Image.new("RGBA", (int(card_w), int(card_h)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Background card with rounded corners — glassmorphism dark
+    # Background card: Sleek dark glassmorphism
+    BG_COLOR = (26, 24, 34)
+    BORDER_COLOR = (46, 43, 58)
     draw.rounded_rectangle(
-        [(0, 0), (CARD_BOX_WIDTH - 1, CARD_HEIGHT - 1)],
-        radius=18,
-        fill=CARD_BG_PRIMARY,
-        outline=CARD_BORDER,
-        width=2
+        [(0, 0), (card_w - 1, card_h - 1)],
+        radius=20,
+        fill=BG_COLOR,
+        outline=BORDER_COLOR,
+        width=2,
     )
 
-    y = PADDING
-
-    # ═══════════════════════════════════════════════════════════
-    # SECTION 1 (TOP): Reply context
-    # ═══════════════════════════════════════════════════════════
-    if has_reply and reply_lines:
-        reply_container_top = y
-        reply_container_h = REPLY_AVATAR_SIZE + 4 + len(reply_lines) * reply_line_h + 12
-        draw.rounded_rectangle(
-            [(PADDING - 4, reply_container_top - 2),
-             (CARD_BOX_WIDTH - PADDING + 4, reply_container_top + reply_container_h)],
-            radius=10,
-            fill=CARD_REPLY_BG,
-        )
-
-        # Reply avatar
-        reply_avatar_x = PADDING + 6
-        reply_avatar_y = y + 2
-        reply_name_clean = _clean_text(reply_username)
-        if reply_avatar_bytes:
-            drawn = _draw_circular_avatar(img, reply_avatar_bytes, reply_avatar_x, reply_avatar_y, REPLY_AVATAR_SIZE)
-            if not drawn:
-                _draw_avatar_placeholder(draw, reply_avatar_x, reply_avatar_y, REPLY_AVATAR_SIZE,
-                                         reply_name_clean, glow=False)
-        else:
-            _draw_avatar_placeholder(draw, reply_avatar_x, reply_avatar_y, REPLY_AVATAR_SIZE,
-                                     reply_name_clean, glow=False)
-
-        # Reply username
-        reply_name_x = reply_avatar_x + REPLY_AVATAR_SIZE + 10
-        _draw_text_with_emoji(draw, (reply_name_x, reply_avatar_y + 4),
-                              reply_name_clean, font_reply_name, emoji_font_reply_name,
-                              fill=CARD_TEXT_SECONDARY)
-
-        # Reply accent bar
-        y += REPLY_AVATAR_SIZE + 6
-        bar_x_reply = PADDING + 12
-        draw.line([(bar_x_reply, y), (bar_x_reply, y + len(reply_lines) * reply_line_h)],
-                  fill=CARD_ACCENT_CYAN, width=2)
-
-        # Reply text lines
-        reply_text_x = PADDING + 22
-        for rline in reply_lines:
-            _draw_text_with_emoji(draw, (reply_text_x, y), rline,
-                                  font_reply_text_font, emoji_font_small,
-                                  fill=CARD_TEXT_SECONDARY)
-            y += reply_line_h
-
-        y += 12
-
-    # ═══════════════════════════════════════════════════════════
-    # SECTION 2 (BOTTOM): Main quoted message
-    # ═══════════════════════════════════════════════════════════
-
-    # Avatar + Username header
+    # Draw Avatar top-left
     avatar_x = PADDING
-    avatar_y = y
-
+    avatar_y = PADDING
     if avatar_bytes:
         drawn = _draw_circular_avatar(img, avatar_bytes, avatar_x, avatar_y, AVATAR_SIZE)
         if not drawn:
-            _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username)
+            _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username, glow=True)
     else:
-        _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username)
+        _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username, glow=True)
 
-    name_x = avatar_x + AVATAR_SIZE + 10
-    _draw_text_with_emoji(draw, (name_x, avatar_y + 2),
-                          username, font_user, emoji_font, fill=CARD_TEXT_PRIMARY)
+    # Draw author name (cyan/turquoise accent)
+    USER_ACCENT = (42, 212, 183)  # #2AD4B7
+    _draw_text_with_emoji(draw, (content_x, avatar_y + 2), username, font_user, emoji_font, fill=USER_ACCENT)
 
-    if timestamp:
-        draw.text((name_x, avatar_y + 24), timestamp,
-                  font=font_meta, fill=CARD_TEXT_SECONDARY)
+    cur_y = avatar_y + 32
 
-    y += header_h + 2
+    # Draw Reply Section if present
+    if has_reply:
+        REPLY_ACCENT = (224, 86, 151)  # #E05697 Pink bar and author
+        bar_x = content_x
+        bar_h = reply_h - 6
+        draw.line([(bar_x, cur_y), (bar_x, cur_y + bar_h)], fill=REPLY_ACCENT, width=3)
 
-    # Accent bar (gradient cyan → purple)
-    bar_x = PADDING
-    bar_top = y
-    bar_bottom = y + len(body_lines) * line_height
-    bar_height = bar_bottom - bar_top
-    if bar_height > 0:
-        for i in range(bar_height):
-            ratio = i / max(bar_height - 1, 1)
-            r = int(CARD_ACCENT_CYAN[0] * (1 - ratio) + CARD_ACCENT_PURPLE[0] * ratio)
-            g = int(CARD_ACCENT_CYAN[1] * (1 - ratio) + CARD_ACCENT_PURPLE[1] * ratio)
-            b = int(CARD_ACCENT_CYAN[2] * (1 - ratio) + CARD_ACCENT_PURPLE[2] * ratio)
-            draw.line([(bar_x, bar_top + i), (bar_x + 3, bar_top + i)], fill=(r, g, b))
+        reply_name_clean = _clean_text(reply_username)
+        _draw_text_with_emoji(draw, (bar_x + 10, cur_y), reply_name_clean, font_reply_name, emoji_font_small, fill=REPLY_ACCENT)
 
-    # Body text lines
-    text_x = bar_x + 16
-    for line in body_lines:
-        _draw_text_with_emoji(draw, (text_x, y), line,
-                              font_body, emoji_font, fill=CARD_TEXT_PRIMARY)
-        y += line_height
+        ry = cur_y + 22
+        for rline in reply_lines:
+            _draw_text_with_emoji(draw, (bar_x + 10, ry), rline, font_reply_text_font, emoji_font_small, fill=(235, 238, 245))
+            ry += rline_h
 
-    # ── Ensure one side is exactly 512px (Telegram sticker requirement) ──
+        cur_y += reply_h + 4
+
+    # Draw Main Message text
+    TEXT_COLOR = (245, 246, 250)
+    for bline in body_lines:
+        _draw_text_with_emoji(draw, (content_x, cur_y), bline, font_body, emoji_font, fill=TEXT_COLOR)
+        cur_y += line_h
+
+    # Ensure one side is exactly 512px with no stretched empty padding
     w, h = img.size
-    if w != STICKER_SIZE and h != STICKER_SIZE:
-        if w >= h:
-            new_w = STICKER_SIZE
-            new_h = int(h * (STICKER_SIZE / w))
-        else:
-            new_h = STICKER_SIZE
-            new_w = int(w * (STICKER_SIZE / h))
-        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    if w >= h:
+        new_w = STICKER_SIZE
+        new_h = max(int(h * (STICKER_SIZE / w)), 1)
+    else:
+        new_h = STICKER_SIZE
+        new_w = max(int(w * (STICKER_SIZE / h)), 1)
+    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
     buffer = io.BytesIO()
     img.save(buffer, format="WEBP", quality=95)
@@ -723,6 +635,8 @@ async def video_to_gif(
 ) -> Optional[bytes]:
     """
     Convert a video (or portion of it) to an optimized GIF.
+    Robustly handles Twitter videos, streaming timestamps, variable frame rates,
+    and non-zero presentation timestamps.
     Returns GIF bytes or None on failure.
     """
     start_sec = max(0.0, float(start_sec))
@@ -739,22 +653,20 @@ async def video_to_gif(
         output_path = tmp.name
 
     try:
-        # Ultra-fast high-quality GIF generation with -nostdin and output -t
+        # Scale filter ensuring strictly even dimensions and fast bilinear
+        scale_filter = f"scale='trunc(min({max_width},iw)/2)*2':'trunc(ow/a/2)*2':flags=fast_bilinear"
+
+        # Stage 1: Palettegen + Bayer dithering for crisp high-quality GIF
         filter_str = (
-            f"fps={fps},scale=min({max_width}\\,iw):-2:flags=fast_bilinear,split[s0][s1];"
+            f"fps={fps},{scale_filter},split[s0][s1];"
             f"[s0]palettegen=max_colors=128[p];"
             f"[s1][p]paletteuse=dither=bayer:bayer_scale=3"
         )
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-nostdin",
-            "-ss", str(start_sec),
-            "-i", video_path,
-            "-t", str(duration),
-            "-vf", filter_str,
-            output_path,
-        ]
+        cmd = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts"]
+        if start_sec > 0.05:
+            cmd.extend(["-ss", str(start_sec)])
+        cmd.extend(["-i", video_path, "-t", str(duration), "-vf", filter_str, output_path])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -764,59 +676,79 @@ async def video_to_gif(
         )
 
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=25.0)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
                 await proc.wait()
             except Exception:
                 pass
-            logger.error("ffmpeg GIF conversion timed out after 20s")
-            return None
+            logger.warning("ffmpeg GIF conversion timed out during stage 1")
+            stderr = b""
 
-        if proc.returncode != 0:
-            err_output = stderr.decode(errors='ignore').strip()
-            logger.warning(
-                f"ffmpeg palette filter failed: {err_output[:200]}, trying standard fallback"
-            )
-            # Fallback: standard GIF encoding without palette filter
-            cmd_fallback = [
-                "ffmpeg", "-y",
-                "-nostdin",
-                "-ss", str(start_sec),
-                "-i", video_path,
-                "-t", str(duration),
-                "-vf", f"fps={fps},scale=min({max_width}\\,iw):-2",
-                output_path,
-            ]
-            proc_fallback = await asyncio.create_subprocess_exec(
-                *cmd_fallback,
+        success = proc.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+        # Stage 2 Fallback: Output seeking with palette filter (solves fragmented mp4 PTS offsets)
+        if not success:
+            logger.warning("ffmpeg stage 1 failed, trying stage 2 (output seeking)...")
+            cmd_s2 = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-i", video_path]
+            if start_sec > 0.05:
+                cmd_s2.extend(["-ss", str(start_sec)])
+            cmd_s2.extend(["-t", str(duration), "-vf", filter_str, output_path])
+
+            proc2 = await asyncio.create_subprocess_exec(
+                *cmd_s2,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
-                _, stderr_fallback = await asyncio.wait_for(proc_fallback.communicate(), timeout=15.0)
+                await asyncio.wait_for(proc2.communicate(), timeout=20.0)
             except asyncio.TimeoutError:
                 try:
-                    proc_fallback.kill()
-                    await proc_fallback.wait()
+                    proc2.kill()
+                    await proc2.wait()
                 except Exception:
                     pass
+            success = proc2.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+        # Stage 3 Fallback: Standard encoding without palette filter
+        if not success:
+            logger.warning("ffmpeg stage 2 failed, trying stage 3 (standard GIF encoder)...")
+            cmd_s3 = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-i", video_path]
+            if start_sec > 0.05:
+                cmd_s3.extend(["-ss", str(start_sec)])
+            cmd_s3.extend(["-t", str(duration), "-vf", f"fps={fps},{scale_filter}", output_path])
+
+            proc3 = await asyncio.create_subprocess_exec(
+                *cmd_s3,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr3 = await asyncio.wait_for(proc3.communicate(), timeout=15.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc3.kill()
+                    await proc3.wait()
+                except Exception:
+                    pass
+                logger.error("ffmpeg stage 3 timed out")
                 return None
 
-            if proc_fallback.returncode != 0:
-                logger.error(f"ffmpeg GIF error: {stderr_fallback.decode(errors='ignore').strip()[:200]}")
+            if proc3.returncode != 0:
+                logger.error(f"All ffmpeg GIF stages failed: {stderr3.decode(errors='ignore').strip()[:250]}")
                 return None
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            logger.error("ffmpeg produced empty GIF output")
+            logger.error("ffmpeg produced empty GIF output across all attempts")
             return None
 
         with open(output_path, "rb") as f:
             return f.read()
     except Exception as e:
-        logger.error(f"GIF conversion error: {e}", exc_info=True)
+        logger.error(f"GIF conversion exception: {e}", exc_info=True)
         return None
     finally:
         try:
@@ -828,27 +760,38 @@ async def video_to_gif(
 
 # ─── Sticker Pack Naming ───────────────────────────────────────────────────────
 
-def get_sticker_pack_name(user_first_name: str, user_id: int, bot_username: str, pack_number: int = 1) -> str:
+def get_sticker_pack_name(user_first_name: str, user_id: int, bot_username: str, pack_number: int = 1, is_video: bool = False) -> str:
     """
     Generate a Telegram sticker pack short name.
-    Format: {sanitized_name}_quotes_by_{bot_username}
-    For pack 2+: {sanitized_name}_quotes_2_by_{bot_username}
+    Telegram rules:
+      - Can contain only English letters, digits, and underscores.
+      - Must begin with a letter.
+      - Must end in _by_<bot_username>.
+      - Length must be 1-64 characters.
+      - Must be globally unique across Telegram.
+    Includes user_id to ensure complete per-user isolation without conflicts.
+    Separates static ('q') and video ('vid') packs because Telegram sets cannot mix formats.
     """
-    # Sanitize name: only alphanumeric and underscores, max 20 chars
-    safe_name = re.sub(r"[^a-zA-Z0-9]", "_", user_first_name)[:20].strip("_").lower()
-    if not safe_name:
-        safe_name = f"user_{user_id}"
+    safe_name = re.sub(r"[^a-zA-Z0-9]", "_", user_first_name or "")[:12].strip("_").lower()
+    prefix = "vid" if is_video else "q"
+    suffix = f"_by_{bot_username}"
 
-    if pack_number <= 1:
-        return f"{safe_name}_quotes_by_{bot_username}"
-    else:
-        return f"{safe_name}_quotes_{pack_number}_by_{bot_username}"
+    name_part = f"_{safe_name}" if safe_name else ""
+    num_part = f"_{pack_number}" if pack_number > 1 else ""
+
+    base = f"u{user_id}_{prefix}{name_part}{num_part}"
+    max_base_len = 64 - len(suffix)
+    if len(base) > max_base_len:
+        base = base[:max_base_len].rstrip("_")
+
+    return f"{base}{suffix}"
 
 
-def get_sticker_pack_title(user_first_name: str, pack_number: int = 1) -> str:
+def get_sticker_pack_title(user_first_name: str, pack_number: int = 1, is_video: bool = False) -> str:
     """Generate human-readable sticker pack title."""
-    name = user_first_name or "User"
+    name = (user_first_name or "User").strip()
+    tag = "Video Stickers" if is_video else "Sticker Pack"
     if pack_number <= 1:
-        return f"{name}'s Sticker Pack"
+        return f"{name}'s {tag}"
     else:
-        return f"{name}'s Sticker Pack {pack_number}"
+        return f"{name}'s {tag} {pack_number}"

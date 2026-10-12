@@ -96,7 +96,6 @@ from translation import (
     translate_free,
     translate_ai,
     translate_ai_word_aligned,
-    translate_image_ai,
     clean_caption_for_translation,
 )
 
@@ -142,27 +141,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     config = get_user_config(user.id if user else 0)
 
     target_name = COMMON_LANGUAGES.get(config["target"], config["target"].upper())
-    engine_name = "AI (OpenRouter)" if config["engine"] == "ai" else "Free (Google Translate)"
     target_flag = get_flag(config["target"])
 
     body = (
         f"👋 Welcome, <b>{first_name}</b>!\n"
         f"\n"
-        f"I'm your personal translator. Send me any\n"
+        f"I'm your personal translator and media assistant. Send me any\n"
         f"text and I'll translate it instantly.\n"
         f"\n"
         f"─── ⚙️ Your Settings ───\n"
         f"\n"
-        f"  {target_flag}  Language    <b>{target_name}</b>\n"
-        f"  ⚡  Engine      <b>{engine_name}</b>\n"
+        f"  {target_flag}  Target Language    <b>{target_name}</b>\n"
         f"\n"
         f"─── 🚀 Quick Start ───\n"
         f"\n"
         f"  • Send any text to translate it\n"
-        f"  • /tr — translate in groups\n"
-        f"  • /target es — switch to Spanish\n"
+        f"  • /tr — translate in groups or reply to images\n"
+        f"  • /sticker — make/add stickers from images, stickers, or text\n"
+        f"  • /gif — convert video to animated GIF\n"
+        f"  • /target es — switch target language to Spanish\n"
         f"  • /languages — interactive language list\n"
-        f"  • /engine — toggle AI engine\n"
         f"  • /help — full command list"
     )
 
@@ -174,8 +172,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show help with all commands and language codes."""
+    top_5_langs = list(COMMON_LANGUAGES.items())[:5]
     lang_lines = "\n".join(
-        [f"  {get_flag(code)}  <code>{code}</code>  {name}" for code, name in COMMON_LANGUAGES.items()]
+        [f"  {get_flag(code)}  <code>{code}</code>  {name}" for code, name in top_5_langs]
     )
 
     body = (
@@ -186,8 +185,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /tr        Translate text or reply\n"
         f"  /target    Set target language\n"
         f"  /languages Interactive language picker\n"
-        f"  /engine    Switch AI / Free engine\n"
-        f"  /q         Quote as sticker\n"
+        f"  /sticker   Create / add sticker (photo, sticker, quote)\n"
+        f"  /q         Quote as sticker (use <code>/q r</code> with reply)\n"
         f"  /gif       Convert video to GIF\n"
         f"  /voice     Amharic Voice Assistant\n"
         f"  /status    View your settings\n"
@@ -204,11 +203,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /promote   Promote to admin\n"
         f"  /demote    Demote an admin\n"
         f"\n"
-        f"─── 🌍 Languages ───\n"
+        f"─── 🌍 Languages (Top 5) ───\n"
         f"\n"
         f"{lang_lines}\n"
         f"\n"
-        f"Use any ISO 639-1 code with /target"
+        f"Use /languages to see all languages, or any ISO 639-1 code with /target"
     )
 
     await update.message.reply_text(
@@ -218,29 +217,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display user config and premium status."""
+    """Display user config and status."""
     user = update.effective_user
     if not user:
         return
 
     config = get_user_config(user.id)
     is_premium = user.is_premium or False
-    engine_name = "AI (OpenRouter)" if config["engine"] == "ai" else "Free (Google Translate)"
     target_name = COMMON_LANGUAGES.get(config["target"], config["target"].upper())
     target_flag = get_flag(config["target"])
 
     premium_badge = "⭐ Yes" if is_premium else "No"
-
     pinger_status = f"Active ({PING_INTERVAL:.1f}s)" if AUTO_PING_ENABLED else "Disabled"
+    ai_status = "Available (OpenRouter)" if has_ai else "Free (Google Translate)"
 
     body = (
         f"  👤  User ID       <code>{user.id}</code>\n"
         f"  💎  Premium       {premium_badge}\n"
         f"  {target_flag}  Language     <b>{target_name}</b> (<code>{config['target']}</code>)\n"
-        f"  ⚡  Engine        <b>{engine_name}</b>\n"
-        f"  🔔  Auto Pinger   <b>{pinger_status}</b>\n"
-        f"\n"
-        f"AI access: <i>{'open to all' if ALLOW_ALL_TO_USE_AI else 'Premium & Admins only'}</i>"
+        f"  ⚡  Translation   <b>{ai_status}</b>\n"
+        f"  🔔  Auto Pinger   <b>{pinger_status}</b>"
     )
 
     await update.message.reply_text(
@@ -300,59 +296,7 @@ async def languages_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 
-async def engine_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle between AI and Free translation engines."""
-    user = update.effective_user
-    if not user:
-        return
 
-    config = get_user_config(user.id)
-    current_engine = config["engine"]
-
-    eligible = ALLOW_ALL_TO_USE_AI or is_user_premium_or_admin(update)
-
-    if current_engine == "free":
-        # Trying to switch to AI
-        if not has_ai:
-            await update.message.reply_text(
-                fmt_warning("AI engine is unavailable — no API key configured."),
-                parse_mode="HTML"
-            )
-            return
-
-        if not eligible:
-            body = (
-                f"  The AI engine is a premium feature.\n"
-                f"\n"
-                f"  ⭐ Get Telegram Premium or contact\n"
-                f"  the bot admin for access."
-            )
-            await update.message.reply_text(
-                fmt_card("🔒 Premium Required", body),
-                parse_mode="HTML"
-            )
-            return
-
-        config["engine"] = "ai"
-        await update.message.reply_text(
-            fmt_card("⚡ Engine Switched",
-                f"  Now using: <b>AI (OpenRouter)</b>\n"
-                f"  Model: <code>{OPENROUTER_MODEL}</code>\n"
-                f"\n"
-                f"  Enjoy context-aware translations!"
-            ),
-            parse_mode="HTML"
-        )
-    else:
-        config["engine"] = "free"
-        await update.message.reply_text(
-            fmt_card("🔄 Engine Switched",
-                f"  Now using: <b>Free (Google Translate)</b>\n"
-                f"\n"
-                f"  Use /engine to switch back to AI."
-            ),
-            parse_mode="HTML"
-        )
 
 # ─── Global Error Handler ────────────────────────────────────────────────────
 
@@ -383,8 +327,19 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     replied = update.message.reply_to_message
 
-    # Check if user explicitly asked for image OCR (e.g. /tr ocr or /tr img)
-    force_ocr = bool(context.args and context.args[0].lower() in ["ocr", "image", "img", "vision"])
+    # If replied to media without text or caption, do nothing
+    if replied and not replied.text and not replied.caption:
+        if (
+            replied.photo
+            or replied.video
+            or replied.animation
+            or replied.document
+            or replied.sticker
+            or replied.video_note
+            or replied.voice
+            or replied.audio
+        ):
+            return
 
     # Extract text from replied message (text or caption)
     replied_text = None
@@ -393,55 +348,6 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             replied_text = replied.text.strip()
         elif replied.caption:
             replied_text = clean_caption_for_translation(replied.caption)
-
-    # Scenario A0: Reply to an image without text/caption (or forced OCR) — AI Vision OCR
-    if replied and replied.photo and (not replied_text or force_ocr):
-        target_arg_idx = 1 if force_ocr else 0
-        if context.args and len(context.args) > target_arg_idx:
-            resolved = resolve_language_code(context.args[target_arg_idx])
-            if resolved:
-                target_lang = resolved
-
-        if config["engine"] != "ai" or not has_ai:
-            await update.message.reply_text(
-                fmt_error("Image translation requires the AI engine. Switch with /engine ai first."),
-                parse_mode="HTML",
-                reply_to_message_id=update.message.message_id
-            )
-            return
-
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-        try:
-            photo = replied.photo[-1]
-            tg_file = await context.bot.get_file(photo.file_id)
-            image_bytes = bytes(await tg_file.download_as_bytearray())
-            translated_text = await translate_image_ai(image_bytes, target_lang)
-        except Exception as e:
-            logger.error(f"Image translation failed: {e}")
-            await update.message.reply_text(
-                fmt_error("Couldn't translate text from this image. Please try again."),
-                parse_mode="HTML",
-                reply_to_message_id=update.message.message_id
-            )
-            return
-
-        if translated_text.strip() == "NO_TEXT_FOUND":
-            await update.message.reply_text(
-                fmt_warning("No readable text was found in this image."),
-                parse_mode="HTML",
-                reply_to_message_id=update.message.message_id
-            )
-            return
-
-        target_name = COMMON_LANGUAGES.get(target_lang, target_lang.upper())
-        await update.message.reply_photo(
-            photo=photo.file_id,
-            caption=f"🖼️ <b>Image Translation</b> (→ {html.escape(target_name)}):\n{html.escape(translated_text)}",
-            parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
-        return
 
     # Scenario A: Reply to a message with text or media caption
     if replied_text:
@@ -465,11 +371,8 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(
             fmt_card("🌐 /tr — Translate",
                 f"  <b>Reply mode:</b>\n"
-                f"  Reply to a message, video, or photo with /tr\n"
+                f"  Reply to a message or caption with /tr\n"
                 f"  or <code>/tr dutch</code> (by name or code)\n"
-                f"\n"
-                f"  <b>Image mode (AI engine only):</b>\n"
-                f"  Reply to a photo with /tr to translate text inside it\n"
                 f"\n"
                 f"  <b>Inline mode:</b>\n"
                 f"  <code>/tr dutch hello world</code>\n"
@@ -483,7 +386,6 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    engine = config["engine"]
     translated_text = None
     fallback = False
     aligned_pairs = []
@@ -491,8 +393,8 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     src_lang = detect_language_code(text_to_translate)
     is_short = len(text_to_translate.split()) <= 10
 
-    # 1. Try AI engine (short texts also get a word-by-word alignment)
-    if engine == "ai" and has_ai:
+    # 1. Try AI translation if configured (short texts also get a word-by-word alignment)
+    if has_ai:
         try:
             if is_short:
                 result = await translate_ai_word_aligned(text_to_translate, target_lang)
@@ -636,7 +538,7 @@ async def _extract_author_and_avatar(bot, msg) -> tuple[str, Optional[bytes]]:
 
 
 async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False) -> str:
-    """Find existing pack or create a new one. Returns the pack name. Handles full packs."""
+    """Find existing pack or create a new one. Returns the pack name. Handles full packs and user isolation."""
     from telegram import InputSticker
     from telegram.constants import StickerFormat
 
@@ -644,39 +546,46 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
     bot_username = bot_me.username
     user_name = user.first_name or "User"
 
-    # Try packs 1, 2, 3... until we find one with space or create a new one
-    for pack_num in range(1, 100):
-        pack_name = quote_sticker.get_sticker_pack_name(user_name, user.id, bot_username, pack_num)
-        pack_title = quote_sticker.get_sticker_pack_title(user_name, pack_num)
+    sticker_format = StickerFormat.VIDEO if is_video else StickerFormat.STATIC
+    input_sticker = InputSticker(
+        sticker=sticker_bytes,
+        emoji_list=["💬"],
+        format=sticker_format,
+    )
 
+    # Try packs 1, 2, 3...
+    for pack_num in range(1, 100):
+        pack_name = quote_sticker.get_sticker_pack_name(user_name, user.id, bot_username, pack_num, is_video=is_video)
+        pack_title = quote_sticker.get_sticker_pack_title(user_name, pack_num, is_video=is_video)
+
+        exists = False
+        sticker_set = None
         try:
             sticker_set = await bot.get_sticker_set(pack_name)
-            if len(sticker_set.stickers) < quote_sticker.MAX_STICKERS_PER_PACK:
-                # Pack exists and has room — add to it
-                sticker_format = StickerFormat.VIDEO if is_video else StickerFormat.STATIC
-                input_sticker = InputSticker(
-                    sticker=sticker_bytes,
-                    emoji_list=["💬"],
-                    format=sticker_format,
-                )
+            exists = True
+        except Exception:
+            exists = False
+
+        if exists and sticker_set:
+            if len(sticker_set.stickers) >= quote_sticker.MAX_STICKERS_PER_PACK:
+                # Pack is full, move to next number
+                continue
+            try:
                 await bot.add_sticker_to_set(
                     user_id=user.id,
                     name=pack_name,
                     sticker=input_sticker,
                 )
                 return pack_name
-            else:
-                # Pack is full, try next number
-                continue
-        except Exception:
-            # Pack doesn't exist yet — create it
+            except Exception as e:
+                err_str = str(e).lower()
+                if "stickers_too_much" in err_str or "full" in err_str:
+                    continue
+                logger.error(f"Failed to add sticker to existing pack '{pack_name}': {e}")
+                raise e
+        else:
+            # Create new pack
             try:
-                sticker_format = StickerFormat.VIDEO if is_video else StickerFormat.STATIC
-                input_sticker = InputSticker(
-                    sticker=sticker_bytes,
-                    emoji_list=["💬"],
-                    format=sticker_format,
-                )
                 await bot.create_new_sticker_set(
                     user_id=user.id,
                     name=pack_name,
@@ -685,30 +594,32 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
                 )
                 return pack_name
             except Exception as e2:
-                logger.error(f"Failed to create sticker pack '{pack_name}': {e2}")
+                logger.error(f"Failed to create new sticker pack '{pack_name}': {e2}")
                 raise e2
 
     raise RuntimeError("Could not find or create a sticker pack")
 
 
 async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quote a message as a sticker and add it to the user's sticker pack.
+    """Quote a message or convert media/stickers into sticker pack.
 
     Usage:
-      /q          – Quote the replied text message as a card sticker
-      /q r        – Quote with reply context (shows who they replied to)
-      /q 5        – Quote the last 5 messages above as individual stickers
-      /q 2 5      – For video: clip from 2s to 5s as a video sticker
+      /sticker     – Convert replied image/sticker/video to sticker pack
+      /q           – Quote the replied text message as a card sticker
+      /q r         – Quote with reply context (shows who they replied to)
+      /q 1 3       – For video: clip from 1s to 3s as a video sticker
     """
     user = update.effective_user
-    if not user or not update.message or should_skip_message(update.message):
+    msg = update.effective_message
+    if not user or not msg or should_skip_message(msg):
         return
 
     if is_maintenance_active_for_user(user.id):
-        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
         return
 
-    replied = update.message.reply_to_message
+    replied = msg.reply_to_message
+    target_msg = replied or (msg if (msg.photo or msg.document) else None)
 
     # ── Parse arguments ──
     args = context.args or []
@@ -718,16 +629,16 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     video_end = None
 
     if args:
-        if args[0].lower() == "r":
+        if args[0].lower() in ("r", "reply", "-r"):
             include_reply_context = True
         elif len(args) == 1 and args[0].isdigit():
             num = int(args[0])
             # If replying to a video, treat single number as video end time
-            if replied and (replied.video or replied.video_note or replied.animation):
+            if target_msg and (target_msg.video or target_msg.video_note or target_msg.animation):
                 video_start = 0
                 video_end = float(num)
             else:
-                multi_count = min(num, 10)  # Cap at 10 to avoid spam
+                multi_count = min(num, 10)
         elif len(args) == 2:
             try:
                 video_start = float(args[0])
@@ -735,48 +646,39 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except ValueError:
                 pass
 
-    # ── Multi-quote mode: /q N ──
-    if multi_count > 0 and not replied:
-        await update.message.reply_text(
-            fmt_error("Reply to a message with /q N to quote N messages."),
-            parse_mode="HTML"
-        )
-        return
-
-    if not replied and multi_count == 0:
-        await update.message.reply_text(
-            fmt_card("💬 /q — Quote Sticker",
-                f"  <b>Reply to a message with:</b>\n"
-                f"  <code>/q</code> — Quote as sticker\n"
-                f"  <code>/q r</code> — Quote with reply context\n"
-                f"  <code>/q 5</code> — Quote last 5 messages\n"
+    if not target_msg:
+        await msg.reply_text(
+            fmt_card("🎨 /sticker & /q — Sticker Creator",
+                f"  <b>Reply to any message with:</b>\n"
+                f"  <code>/sticker</code> — Convert photo/sticker to your pack\n"
+                f"  <code>/q</code> — Quote text message as a sticker\n"
+                f"  <code>/q r</code> — Quote with replied message context\n"
                 f"\n"
                 f"  <b>For videos:</b>\n"
-                f"  <code>/q 1 3</code> — Video sticker (1s to 3s)\n"
-                f"  <code>/q 3 6</code> — Video sticker (3s to 6s)"
+                f"  <code>/sticker 1 3</code> — Video sticker (1s to 3s)\n"
+                f"  <code>/q 2 5</code> — Video sticker clip"
             ),
             parse_mode="HTML"
         )
         return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="choose_sticker")
 
     try:
         # ── Case 1: Video reply with time range → video sticker ──
-        if replied and (replied.video or replied.video_note or replied.animation) and video_start is not None and video_end is not None:
+        if target_msg and (target_msg.video or target_msg.video_note or target_msg.animation) and video_start is not None and video_end is not None:
             duration = video_end - video_start
             if duration <= 0:
-                await update.message.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
+                await msg.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
                 return
             if duration > 3:
-                await update.message.reply_text(
+                await msg.reply_text(
                     fmt_warning(f"Video stickers can be max 3 seconds. Trimming to {video_start}s → {video_start + 3}s."),
                     parse_mode="HTML"
                 )
                 video_end = video_start + 3
 
-            # Download the video
-            video = replied.video or replied.video_note or replied.animation
+            video = target_msg.video or target_msg.video_note or target_msg.animation
             tg_file = await context.bot.get_file(video.file_id)
             video_bytes = bytes(await tg_file.download_as_bytearray())
 
@@ -794,7 +696,7 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     pass
 
             if not sticker_bytes:
-                await update.message.reply_text(
+                await msg.reply_text(
                     fmt_error("Failed to convert video to sticker. The video may be too large or incompatible."),
                     parse_mode="HTML"
                 )
@@ -805,100 +707,130 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             sticker_set = await context.bot.get_sticker_set(pack_name)
             last_sticker = sticker_set.stickers[-1]
-            await update.message.reply_sticker(sticker=last_sticker.file_id)
+            await msg.reply_sticker(sticker=last_sticker.file_id)
             return
 
-        # ── Case 2: Image reply → raw image sticker (no card) ──
-        if replied and replied.photo and not multi_count:
-            photo = replied.photo[-1]
-            tg_file = await context.bot.get_file(photo.file_id)
-            image_bytes = bytes(await tg_file.download_as_bytearray())
-            sticker_bytes = quote_sticker.image_to_sticker(image_bytes)
+        # ── Case 2: Image / Photo reply → 512px sticker ──
+        is_photo = bool(target_msg and target_msg.photo)
+        is_doc_img = bool(
+            target_msg and target_msg.document and target_msg.document.mime_type
+            and target_msg.document.mime_type.lower().startswith("image/")
+        )
+        if (is_photo or is_doc_img) and not multi_count:
+            file_obj = target_msg.photo[-1] if is_photo else target_msg.document
+            tg_file = await context.bot.get_file(file_obj.file_id)
+            raw_bytes = bytes(await tg_file.download_as_bytearray())
+            sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
 
             pack_name = await _find_or_create_sticker_pack(
                 context.bot, user, sticker_bytes, is_video=False
             )
             sticker_set = await context.bot.get_sticker_set(pack_name)
             last_sticker = sticker_set.stickers[-1]
-            await update.message.reply_sticker(sticker=last_sticker.file_id)
+            await msg.reply_sticker(sticker=last_sticker.file_id)
             return
 
-        # ── Case 3: Text message → quote card sticker ──
-        if replied and (replied.text or replied.caption):
-            messages_to_quote = [replied]
-
-            # Multi-quote: collect N messages above
-            if multi_count > 1:
-                try:
-                    # We already have the replied message; get messages above it
-                    # Note: Telegram Bot API doesn't have a "get messages" method
-                    # We can only quote the single replied message in standard mode
-                    # For multi-quote, user needs to reply to the oldest message they want
-                    pass  # Single quote for now, multi requires chat history access
-                except Exception:
-                    pass
-
-            for msg in messages_to_quote:
-                msg_text = msg.text or msg.caption or ""
-                username, avatar_bytes = await _extract_author_and_avatar(context.bot, msg)
-
-                # Check for reply context
-                reply_username = None
-                reply_text = None
-                reply_avatar_bytes = None
-                if include_reply_context and msg.reply_to_message:
-                    reply_msg = msg.reply_to_message
-                    reply_text = reply_msg.text or reply_msg.caption or ""
-                    reply_username, reply_avatar_bytes = await _extract_author_and_avatar(context.bot, reply_msg)
-
-                # Generate the card
-                time_str = msg.date.strftime("%I:%M %p").lstrip("0") if getattr(msg, "date", None) else None
-                sticker_bytes = quote_sticker.generate_quote_card(
-                    username=username,
-                    text=msg_text,
-                    avatar_bytes=avatar_bytes,
-                    reply_username=reply_username,
-                    reply_text=reply_text,
-                    reply_avatar_bytes=reply_avatar_bytes,
-                    timestamp=time_str,
+        # ── Case 3: Existing sticker reply → re-sticker / add to pack ──
+        if target_msg and target_msg.sticker:
+            stk = target_msg.sticker
+            if stk.is_animated:
+                await msg.reply_text(
+                    fmt_warning("⚠️ Telegram animated (.tgs vector) stickers cannot be added to standard packs.\n\nOnly static image stickers, photos, videos, and quote cards can be added."),
+                    parse_mode="HTML"
                 )
+                return
 
-                # Add to sticker pack
+            tg_file = await context.bot.get_file(stk.file_id)
+            raw_bytes = bytes(await tg_file.download_as_bytearray())
+
+            if stk.is_video:
+                pack_name = await _find_or_create_sticker_pack(
+                    context.bot, user, raw_bytes, is_video=True
+                )
+            else:
+                sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
                 pack_name = await _find_or_create_sticker_pack(
                     context.bot, user, sticker_bytes, is_video=False
                 )
-                sticker_set = await context.bot.get_sticker_set(pack_name)
-                last_sticker = sticker_set.stickers[-1]
-                await update.message.reply_sticker(sticker=last_sticker.file_id)
+
+            sticker_set = await context.bot.get_sticker_set(pack_name)
+            last_sticker = sticker_set.stickers[-1]
+            await msg.reply_sticker(sticker=last_sticker.file_id)
             return
 
-        # ── Case 4: Sticker reply → add sticker directly (re-sticker) ──
-        if replied and replied.sticker:
-            # Just add the existing sticker to their pack
-            sticker = replied.sticker
-            tg_file = await context.bot.get_file(sticker.file_id)
-            sticker_bytes = bytes(await tg_file.download_as_bytearray())
-            is_video = sticker.is_video
+        # ── Case 4: Text message → Quote card sticker ──
+        if target_msg and (target_msg.text or target_msg.caption):
+            msg_text = target_msg.text or target_msg.caption or ""
+            username, avatar_bytes = await _extract_author_and_avatar(context.bot, target_msg)
+
+            # Check for reply context (who target_msg replied to)
+            reply_username = None
+            reply_text = None
+            reply_avatar_bytes = None
+            if include_reply_context and target_msg.reply_to_message:
+                r_msg = target_msg.reply_to_message
+                reply_text = r_msg.text or r_msg.caption or ""
+                if not reply_text:
+                    if r_msg.photo:
+                        reply_text = "📷 Photo"
+                    elif r_msg.video or r_msg.animation or r_msg.video_note:
+                        reply_text = "🎥 Video"
+                    elif r_msg.sticker:
+                        reply_text = f"{r_msg.sticker.emoji or '💬'} Sticker"
+                    elif r_msg.document:
+                        reply_text = "📄 File"
+                reply_username, reply_avatar_bytes = await _extract_author_and_avatar(context.bot, r_msg)
+
+            sticker_bytes = quote_sticker.generate_quote_card(
+                username=username,
+                text=msg_text,
+                avatar_bytes=avatar_bytes,
+                reply_username=reply_username,
+                reply_text=reply_text,
+                reply_avatar_bytes=reply_avatar_bytes,
+            )
 
             pack_name = await _find_or_create_sticker_pack(
-                context.bot, user, sticker_bytes, is_video=is_video
+                context.bot, user, sticker_bytes, is_video=False
             )
             sticker_set = await context.bot.get_sticker_set(pack_name)
             last_sticker = sticker_set.stickers[-1]
-            await update.message.reply_sticker(sticker=last_sticker.file_id)
+            await msg.reply_sticker(sticker=last_sticker.file_id)
             return
 
-        await update.message.reply_text(
-            fmt_warning("Couldn't find quotable content in that message."),
+        await msg.reply_text(
+            fmt_warning("Couldn't find quotable or stickify-able content in that message."),
             parse_mode="HTML"
         )
 
     except Exception as e:
-        logger.error(f"Quote sticker error: {e}", exc_info=True)
-        await update.message.reply_text(
-            fmt_error(f"Failed to create sticker. Make sure you've started the bot in DM first.\n\n<i>{html.escape(str(e)[:200])}</i>"),
-            parse_mode="HTML"
-        )
+        logger.error(f"Sticker creation error: {e}", exc_info=True)
+        err_str = str(e).lower()
+        bot_me = await context.bot.get_me()
+        bot_username = bot_me.username or "R3dSter_Bot"
+
+        if any(k in err_str for k in ["user not found", "peer_id_invalid", "not found", "chat not found", "user_is_blocked", "forbidden"]):
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("👉 Start Bot in DM", url=f"https://t.me/{bot_username}?start=stickers")
+            ]])
+            await msg.reply_text(
+                fmt_error(
+                    "<b>Action Required:</b> Telegram requires you to start the bot in private chat (DM) at least once before it can create or add stickers to your pack.\n\n"
+                    "Tap below to start the bot, then try again!"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        else:
+            await msg.reply_text(
+                fmt_error(f"Failed to create sticker: <i>{html.escape(str(e)[:200])}</i>"),
+                parse_mode="HTML"
+            )
+
+
+# Alias sticker command to q_command
+sticker_command = q_command
 
 
 # ─── GIF Command (/gif) ──────────────────────────────────────────────────────
@@ -946,6 +878,13 @@ def _extract_url_from_message(message) -> Optional[str]:
     match = re.search(r'https?://[^\s<>"]+', raw_text)
     if match:
         return match.group(0)
+
+    # Check inline keyboard buttons (e.g. 'View on X' buttons)
+    if getattr(message, "reply_markup", None) and hasattr(message.reply_markup, "inline_keyboard"):
+        for row in message.reply_markup.inline_keyboard:
+            for btn in row:
+                if getattr(btn, "url", None) and btn.url.startswith(("http://", "https://")):
+                    return btn.url
 
     return None
 
@@ -1182,7 +1121,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     config = get_user_config(user.id)
-    engine = config["engine"]
     target_lang = config["target"]
     text = update.message.text
 
@@ -1193,8 +1131,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     translated_text = None
     fallback = False
 
-    # 1. Try AI engine
-    if engine == "ai" and has_ai:
+    # 1. Try AI engine if available
+    if has_ai:
         try:
             translated_text = await translate_ai(text, target_lang)
         except Exception as e:
@@ -1446,9 +1384,9 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         ("start", "Start the bot and see configuration"),
         ("downloads", "Configure media download permissions (Admins)"),
-        ("tr", "Translate text, or an image (reply)"),
+        ("tr", "Translate text or reply"),
         ("target", "Set translation target language"),
-        ("engine", "Switch AI / Free engine"),
+        ("sticker", "Add image/sticker to your pack (or /q)"),
         ("q", "Quote a message as a sticker"),
         ("gif", "Convert a video to GIF"),
         ("voice", "Amharic Voice Assistant"),
@@ -1535,7 +1473,6 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("target", target_command))
     application.add_handler(CommandHandler(["languages", "langs", "settings"], languages_command))
-    application.add_handler(CommandHandler("engine", engine_command))
     application.add_handler(CommandHandler("warn", warn_command))
     application.add_handler(CommandHandler("warns", warns_command))
     application.add_handler(CommandHandler(["unwarn", "rmwarn"], unwarn_command))
@@ -1548,6 +1485,7 @@ def main() -> None:
     application.add_handler(CommandHandler("setcookies", setcookies_command))
     application.add_handler(CommandHandler(["maintenance", "admin"], maintenance_command))
     application.add_handler(CommandHandler("q", q_command, block=False))
+    application.add_handler(CommandHandler(["sticker", "addsticker", "kang"], sticker_command, block=False))
     application.add_handler(CommandHandler("gif", gif_command, block=False))
     application.add_handler(MessageHandler(filters.CaptionRegex(r"^/gif(?:\s|$)"), gif_command, block=False))
     application.add_handler(CommandHandler("voice", voice_command))

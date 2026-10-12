@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import html
 import asyncio
 import tempfile
 import uuid
-import time
-import logging
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional
+import card
 
 import httpx
 import yt_dlp
@@ -35,22 +35,18 @@ from config import (
     YOUTUBE_COOKIES_FILE,
     YOUTUBE_PROXY,
     YOUTUBE_RELAY_URL,
-    LOCAL_BOT_API_URL,
     MAX_UPLOAD_SIZE_MB,
     MAX_VIDEO_DURATION,
     should_skip_message,
     safe_answer_query,
     is_maintenance_active_for_user,
     MAINTENANCE_NOTICE,
-    get_chat_config,
     is_downloader_enabled,
     get_download_mode,
     pending_downloads,
     store_pending_download,
-    fmt_card,
     fmt_error,
     fmt_warning,
-    fmt_success,
     classify_media_error,
     YOUTUBE_URL_PATTERN,
     TWITCH_CLIP_PATTERN,
@@ -59,6 +55,7 @@ from config import (
     THREADS_URL_PATTERN,
     THREADS_CANONICAL_PATTERN,
     REDDIT_URL_PATTERN,
+    media_cache,
     logger,
 )
 
@@ -359,7 +356,7 @@ _active_yt_downloads = set()
 
 async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=720) -> None:
     """Execute download and upload for YouTube video or audio with queue management and memory streaming."""
-    global _queued_downloads_count, _active_yt_downloads
+    global _queued_downloads_count
     is_audio = str(quality).lower() in ("audio", "mp3")
     label = "audio (MP3)" if is_audio else f"{quality}p"
     key = (target_message.chat_id, yt_url, str(quality))
@@ -499,7 +496,7 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
         error_lower = error_str.lower()
         if 'too large' in error_lower or '413' in error_lower or 'file is too big' in error_lower:
             try:
-                await status_msg.edit_text(fmt_warning(f"This file exceeds Telegram's upload limits for this server."))
+                await status_msg.edit_text(fmt_warning("This file exceeds Telegram's upload limits for this server."))
             except Exception:
                 pass
         elif 'timed out' in error_lower:

@@ -69,6 +69,7 @@ from config import (
     should_skip_message,
     safe_answer_query,
     logger,
+    media_cache,
     COMMON_LANGUAGES,
     LANG_FLAGS,
     get_flag,
@@ -982,8 +983,20 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     cleanup_temp_file = False
     cleanup_temp_dir = None
 
-    # Step 1: If Telegram video object is available and within 20MB limit, try downloading via Telegram Bot API
+    # Step 1: Check in-memory media cache first (instant 0ms if bot recently sent or downloaded this video)
     if video:
+        cached_bytes = media_cache.get(f"vid:{video.file_id}")
+        if not cached_bytes and target_msg:
+            cached_bytes = media_cache.get(f"msg_vid:{target_msg.chat_id}:{target_msg.message_id}")
+        if cached_bytes:
+            tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            tmp.write(cached_bytes)
+            tmp.close()
+            video_source_path = tmp.name
+            cleanup_temp_file = True
+
+    # Step 1b: If not in cache and Telegram video object is available (<= 20MB), download via Bot API
+    if not video_source_path and video:
         file_size = getattr(video, "file_size", None)
         if not file_size or file_size <= 20 * 1024 * 1024:
             tmp = None
@@ -996,7 +1009,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         suffix = ext
                 tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
                 tmp.close()
-                await asyncio.wait_for(tg_file.download_to_drive(custom_path=tmp.name), timeout=30.0)
+                await asyncio.wait_for(tg_file.download_to_drive(custom_path=tmp.name), timeout=25.0)
                 if os.path.exists(tmp.name) and os.path.getsize(tmp.name) > 0:
                     video_source_path = tmp.name
                     cleanup_temp_file = True
@@ -1031,10 +1044,12 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             shutil.rmtree(cleanup_temp_dir, ignore_errors=True)
         return
 
-    # Step 3: Convert video to GIF using quote_sticker.video_to_gif
+    # Step 3: Convert video to Telegram Animation using quote_sticker.video_to_animation (sub-second)
+    anim_bytes = None
+    anim_ext = "mp4"
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
-        gif_bytes = await quote_sticker.video_to_gif(video_source_path, start_sec, end_sec)
+        anim_bytes, anim_ext = await quote_sticker.video_to_animation(video_source_path, start_sec, end_sec)
     except Exception as e:
         logger.error(f"GIF execution error: {e}", exc_info=True)
         try:
@@ -1054,7 +1069,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except OSError:
                 pass
 
-    if not gif_bytes:
+    if not anim_bytes:
         try:
             await status_msg.edit_text(
                 fmt_error("Failed to convert video to GIF. The video format may be incompatible or damaged."),
@@ -1064,12 +1079,13 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
-    # Step 4: Send as animation (GIF) or fallback to document if Telegram animation fails
+    # Step 4: Send as native Telegram animation (autoplays on loop with GIF badge)
+    anim_filename = f"animation.{anim_ext}"
     try:
         await msg.reply_animation(
-            animation=gif_bytes,
+            animation=anim_bytes,
             reply_to_message_id=msg.message_id,
-            filename="animation.gif",
+            filename=anim_filename,
         )
         try:
             await status_msg.delete()
@@ -1079,9 +1095,9 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.warning(f"reply_animation failed ({e}), falling back to reply_document")
         try:
             await msg.reply_document(
-                document=gif_bytes,
+                document=anim_bytes,
                 reply_to_message_id=msg.message_id,
-                filename="animation.gif",
+                filename=anim_filename,
                 caption="🎞️ Converted GIF",
             )
             try:

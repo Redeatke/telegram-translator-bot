@@ -240,7 +240,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
         if video_bytes:
             try:
-                await update.message.reply_video(
+                sent_msg = await update.message.reply_video(
                     video=video_bytes,
                     caption=caption,
                     parse_mode="HTML",
@@ -248,6 +248,10 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                     supports_streaming=True,
                     reply_to_message_id=update.message.message_id
                 )
+                if sent_msg and sent_msg.video:
+                    media_cache.set(f"vid:{sent_msg.video.file_id}", video_bytes)
+                if sent_msg:
+                    media_cache.set(f"msg_vid:{sent_msg.chat_id}:{sent_msg.message_id}", video_bytes)
                 logger.info(f"Sent auto-playing Twitter video for @{username}/status/{tweet_id}")
                 return
             except Exception as e:

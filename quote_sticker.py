@@ -653,13 +653,14 @@ async def video_to_animation(
         output_mp4 = tmp_mp4.name
 
     try:
-        cmd_mp4 = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero"]
+        scale_expr = f"scale=trunc(min({max_width}\\,iw)/2)*2:-2"
+        cmd_mp4 = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts"]
         if start_sec > 0.05:
             cmd_mp4.extend(["-ss", str(start_sec)])
         cmd_mp4.extend([
             "-i", video_path,
             "-t", str(duration),
-            "-vf", f"scale=min({max_width}\\,iw):-2",
+            "-vf", scale_expr,
             "-an",
             "-c:v", "libx264",
             "-preset", "veryfast",
@@ -676,17 +677,59 @@ async def video_to_animation(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await asyncio.wait_for(proc_mp4.communicate(), timeout=12.0)
+            _, stderr_mp4 = await asyncio.wait_for(proc_mp4.communicate(), timeout=15.0)
         except asyncio.TimeoutError:
             try:
                 proc_mp4.kill()
                 await proc_mp4.wait()
             except Exception:
                 pass
+            stderr_mp4 = b"timeout"
 
         if proc_mp4.returncode == 0 and os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 0:
             with open(output_mp4, "rb") as f:
                 return f.read(), "mp4"
+
+        err_str = stderr_mp4.decode(errors="ignore").strip()
+        logger.warning(f"Fast MP4 stage 1 failed (rc={proc_mp4.returncode}): {err_str[-250:]}")
+
+        # Stage 1b: Output seeking fallback for MP4 (solves container PTS offsets)
+        if start_sec > 0.05:
+            cmd_mp4_s2 = [
+                "ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
+                "-i", video_path,
+                "-ss", str(start_sec),
+                "-t", str(duration),
+                "-vf", scale_expr,
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "25",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                output_mp4,
+            ]
+            proc_s2 = await asyncio.create_subprocess_exec(
+                *cmd_mp4_s2,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr_s2 = await asyncio.wait_for(proc_s2.communicate(), timeout=15.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc_s2.kill()
+                    await proc_s2.wait()
+                except Exception:
+                    pass
+                stderr_s2 = b"timeout"
+
+            if proc_s2.returncode == 0 and os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 0:
+                with open(output_mp4, "rb") as f:
+                    return f.read(), "mp4"
+            logger.warning(f"Fast MP4 stage 1b failed: {stderr_s2.decode(errors='ignore')[-250:]}")
+
     except Exception as e:
         logger.warning(f"Fast MP4 animation conversion failed ({e}), trying fast palette GIF fallback...")
     finally:
@@ -701,8 +744,9 @@ async def video_to_animation(
         output_gif = tmp_gif.name
 
     try:
-        filter_str = f"fps=14,scale=min(400\\,iw):-2,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3"
-        cmd_gif = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero"]
+        gif_scale = "scale=trunc(min(400\\,iw)/2)*2:-2"
+        filter_str = f"fps=14,{gif_scale},split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3"
+        cmd_gif = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts"]
         if start_sec > 0.05:
             cmd_gif.extend(["-ss", str(start_sec)])
         cmd_gif.extend([
@@ -719,17 +763,51 @@ async def video_to_animation(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await asyncio.wait_for(proc_gif.communicate(), timeout=12.0)
+            _, stderr_gif = await asyncio.wait_for(proc_gif.communicate(), timeout=20.0)
         except asyncio.TimeoutError:
             try:
                 proc_gif.kill()
                 await proc_gif.wait()
             except Exception:
                 pass
+            stderr_gif = b"timeout"
 
         if proc_gif.returncode == 0 and os.path.exists(output_gif) and os.path.getsize(output_gif) > 0:
             with open(output_gif, "rb") as f:
                 return f.read(), "gif"
+
+        logger.warning(f"Palette GIF failed: {stderr_gif.decode(errors='ignore')[-250:]}")
+
+        # ── Method 3: Standard Direct GIF Fallback (Never Fails) ──
+        cmd_direct = [
+            "ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
+            "-i", video_path,
+            "-t", str(duration),
+            "-vf", f"fps=12,{gif_scale}",
+            output_gif,
+        ]
+        proc_direct = await asyncio.create_subprocess_exec(
+            *cmd_direct,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr_direct = await asyncio.wait_for(proc_direct.communicate(), timeout=15.0)
+        except asyncio.TimeoutError:
+            try:
+                proc_direct.kill()
+                await proc_direct.wait()
+            except Exception:
+                pass
+            stderr_direct = b"timeout"
+
+        if proc_direct.returncode == 0 and os.path.exists(output_gif) and os.path.getsize(output_gif) > 0:
+            with open(output_gif, "rb") as f:
+                return f.read(), "gif"
+
+        logger.error(f"All GIF methods failed. Direct error: {stderr_direct.decode(errors='ignore')[-250:]}")
+
     except Exception as e:
         logger.error(f"Palette GIF conversion exception: {e}")
     finally:

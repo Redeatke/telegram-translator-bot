@@ -132,6 +132,7 @@ from twitter_handler import handle_twitter_message
 from voice_agent import handle_voice_message, voice_command
 import quote_sticker
 import card
+import telethon_downloader
 
 
 
@@ -753,8 +754,43 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
                     )
                     v_end = v_start + 3.0
 
-                tg_file = await context.bot.get_file(video_obj.file_id)
-                video_bytes = bytes(await tg_file.download_as_bytearray())
+                video_bytes = None
+                # 1. Standard Bot API download (if under 20MB)
+                if not v_size or v_size <= 20 * 1024 * 1024:
+                    try:
+                        tg_file = await context.bot.get_file(video_obj.file_id)
+                        video_bytes = bytes(await tg_file.download_as_bytearray())
+                    except Exception as ve:
+                        logger.warning(f"Bot API video download for sticker failed ({ve}), attempting Telethon fallback...")
+
+                # 2. Telethon MTProto download fallback (up to 2GB)
+                if not video_bytes and telethon_downloader.is_telethon_available():
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_tt:
+                        tmp_tt_path = tmp_tt.name
+                    ok = await telethon_downloader.download_message_media(
+                        target_msg.chat_id, target_msg.message_id, tmp_tt_path
+                    )
+                    if ok and os.path.exists(tmp_tt_path) and os.path.getsize(tmp_tt_path) > 0:
+                        with open(tmp_tt_path, "rb") as f:
+                            video_bytes = f.read()
+                    try:
+                        os.unlink(tmp_tt_path)
+                    except OSError:
+                        pass
+
+                if not video_bytes:
+                    if v_size and v_size > 20 * 1024 * 1024:
+                        await msg.reply_text(
+                            fmt_error(f"Video is too large ({v_size / (1024 * 1024):.1f} MB). Telegram's Bot API limits bot downloads to 20 MB. Please send a shorter or compressed clip."),
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await msg.reply_text(
+                            fmt_error("Failed to retrieve video for sticker."),
+                            parse_mode="HTML"
+                        )
+                    return
 
                 import tempfile
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -1087,14 +1123,13 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 with open(input_video_path, "wb") as f:
                     f.write(cached_bytes)
 
-        # 2. Telegram download (<= 20MB)
+        # 2. Telegram download
         download_err_detail = None
         if not input_video_path and video:
             file_size = getattr(video, "file_size", None)
-            if file_size and file_size > 20 * 1024 * 1024:
-                download_err_detail = f"Video is {file_size / (1024 * 1024):.1f} MB (exceeds Telegram Bot API's 20 MB limit)"
-                logger.warning(f"/gif download skipped: {download_err_detail}")
-            else:
+
+            # 2a. If under 20MB, try standard Bot API get_file first
+            if not file_size or file_size <= 20 * 1024 * 1024:
                 try:
                     tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=45.0)
                     input_video_path = os.path.join(tmp_dir, "input.mp4")
@@ -1116,8 +1151,30 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         input_video_path = None
                 except Exception as e:
                     download_err_detail = f"{type(e).__name__}: {e}"
-                    logger.warning(f"/gif download failed: {type(e).__name__}: {e} | file_size={getattr(video, 'file_size', None)}")
+                    logger.warning(f"/gif Bot API download failed: {type(e).__name__}: {e} | file_size={file_size}")
                     input_video_path = None
+
+            # 2b. Telethon MTProto download fallback (up to 2GB) when > 20MB or when Bot API download failed
+            if not input_video_path and target_msg:
+                if telethon_downloader.is_telethon_available():
+                    try:
+                        tt_path = os.path.join(tmp_dir, "input.mp4")
+                        ok = await telethon_downloader.download_message_media(
+                            chat_id=target_msg.chat_id,
+                            message_id=target_msg.message_id,
+                            output_path=tt_path,
+                            timeout=90.0,
+                        )
+                        if ok and os.path.exists(tt_path) and os.path.getsize(tt_path) > 0:
+                            input_video_path = tt_path
+                            logger.info(f"/gif successfully retrieved {file_size or 'unknown'} byte video via Telethon MTProto!")
+                        else:
+                            download_err_detail = "Telethon MTProto download did not produce a valid file"
+                    except Exception as t_err:
+                        download_err_detail = f"Telethon download error: {t_err}"
+                        logger.warning(f"/gif Telethon download failed: {t_err}")
+                elif file_size and file_size > 20 * 1024 * 1024:
+                    download_err_detail = f"Video is {file_size / (1024 * 1024):.1f} MB (exceeds Telegram Bot API's 20 MB limit)"
 
         # 3. Fallback URL download (Twitter, Instagram, TikTok, Reddit, YouTube, Direct)
         if not input_video_path and fallback_url:

@@ -9,3 +9,4 @@ pytubefix>=10.0.0
 requests>=2.31.0
 pillow>=10.0.0
 gTTS>=2.5.0
+telethon>=1.36.0

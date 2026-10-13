@@ -708,6 +708,45 @@ async def convert_video_to_animation(
     return False
 
 
+async def extract_audio_from_video(
+    video_path: str,
+    output_audio_path: str,
+    start_sec: float = 0.0,
+    duration: float = 10.0,
+) -> bool:
+    """
+    Extract audio track from video clip as MP3.
+    Returns True if audio track was extracted, False if video has no audio or on error.
+    """
+    start_sec = max(0.0, float(start_sec))
+    duration = min(float(duration), 15.0)
+
+    cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-i", video_path,
+    ]
+    if start_sec > 0.05:
+        cmd.extend(["-ss", str(start_sec)])
+    cmd.extend([
+        "-t", str(duration),
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-q:a", "2",
+        output_audio_path,
+    ])
+
+    loop = asyncio.get_running_loop()
+    def _run():
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=25.0)
+        return res.returncode == 0 and os.path.exists(output_audio_path) and os.path.getsize(output_audio_path) > 0
+
+    try:
+        return await loop.run_in_executor(None, _run)
+    except Exception as e:
+        logger.warning(f"Audio extraction error: {e}")
+        return False
+
+
 async def video_to_gif(
     video_path: str,
     start_sec: float = 0,

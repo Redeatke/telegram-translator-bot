@@ -1097,8 +1097,10 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await msg.reply_text(fmt_error(err_msg), parse_mode="HTML")
             return
 
-        # 4. Convert video to Animation (clean H.264 silent MP4 / GIF)
+        # 4. Convert video to Animation (clean H.264 silent MP4 / GIF) & extract audio track
         output_anim_path = os.path.join(tmp_dir, "animation.mp4")
+        output_audio_path = os.path.join(tmp_dir, "audio.mp3")
+
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
             success = await quote_sticker.convert_video_to_animation(
@@ -1111,6 +1113,19 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.error(f"Animation conversion error: {e}", exc_info=True)
             success = False
 
+        # Extract audio track if present
+        has_audio = False
+        try:
+            has_audio = await quote_sticker.extract_audio_from_video(
+                input_video_path,
+                output_audio_path,
+                start_sec=start_sec,
+                duration=duration,
+            )
+        except Exception as e:
+            logger.warning(f"Audio extraction failed: {e}")
+            has_audio = False
+
         if not success or not os.path.exists(output_anim_path) or os.path.getsize(output_anim_path) == 0:
             try:
                 await status_msg.edit_text(
@@ -1121,7 +1136,8 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
             return
 
-        # 5. Send as native Telegram Animation (plays with GIF badge)
+        # 5. Send as native Telegram Animation (plays muted with GIF badge)
+        anim_sent = False
         try:
             with open(output_anim_path, "rb") as anim_file:
                 await msg.reply_animation(
@@ -1129,10 +1145,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     caption="Here is your GIF clip!",
                     reply_to_message_id=msg.message_id,
                 )
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+            anim_sent = True
         except Exception as e:
             logger.warning(f"reply_animation failed ({e}), falling back to video/document")
             try:
@@ -1143,10 +1156,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         reply_to_message_id=msg.message_id,
                         supports_streaming=True,
                     )
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                anim_sent = True
             except Exception as e2:
                 try:
                     with open(output_anim_path, "rb") as anim_file:
@@ -1155,16 +1165,46 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                             caption="Here is your GIF clip!",
                             reply_to_message_id=msg.message_id,
                         )
-                    try:
-                        await status_msg.delete()
-                    except Exception:
-                        pass
+                    anim_sent = True
                 except Exception as e3:
                     logger.error(f"Failed to send GIF: {e3}")
                     try:
                         await status_msg.edit_text(fmt_error(f"Failed to send GIF: {str(e3)[:120]}"), parse_mode="HTML")
                     except Exception:
                         pass
+                    return
+
+        # 6. If original video had audio, send extracted audio as a separate file
+        if has_audio and os.path.exists(output_audio_path) and os.path.getsize(output_audio_path) > 0:
+            try:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_voice")
+                with open(output_audio_path, "rb") as a_file:
+                    await msg.reply_audio(
+                        audio=a_file,
+                        filename="audio.mp3",
+                        title="Audio Clip",
+                        performer="Extracted Audio",
+                        caption="🎵 Extracted audio from video",
+                        reply_to_message_id=msg.message_id,
+                    )
+            except Exception as a_err:
+                logger.warning(f"reply_audio failed ({a_err}), falling back to document")
+                try:
+                    with open(output_audio_path, "rb") as a_file:
+                        await msg.reply_document(
+                            document=a_file,
+                            filename="audio.mp3",
+                            caption="🎵 Extracted audio from video",
+                            reply_to_message_id=msg.message_id,
+                        )
+                except Exception as a_err2:
+                    logger.warning(f"Failed to send extracted audio: {a_err2}")
+
+        if anim_sent:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Translate incoming text messages in private chats."""

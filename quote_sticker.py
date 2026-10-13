@@ -644,12 +644,15 @@ async def convert_video_to_animation(
     duration = min(float(duration), 15.0)
 
     # Standard H.264 silent MP4 animation filter (ensures even dimensions for yuv420p)
+    # NOTE: -ss is placed AFTER -i (safe/accurate seek) to avoid decode failures on
+    # non-keyframe positions, which is common with Twitter/HLS-sourced fragmented MP4s.
     scale_expr = f"scale=trunc(min({max_dim}\\,iw)/2)*2:trunc(min({max_dim}\\,ih)/2)*2"
-    cmd_mp4 = ["ffmpeg", "-y", "-nostdin"]
+    cmd_mp4 = ["ffmpeg", "-y", "-nostdin",
+        "-i", video_path,
+    ]
     if start_sec > 0.05:
         cmd_mp4.extend(["-ss", str(start_sec)])
     cmd_mp4.extend([
-        "-i", video_path,
         "-t", str(duration),
         "-an",
         "-vf", scale_expr,
@@ -663,9 +666,9 @@ async def convert_video_to_animation(
 
     loop = asyncio.get_running_loop()
     def _run_cmd(c):
-        res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20.0)
+        res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30.0)
         if res.returncode != 0:
-            logger.warning(f"FFmpeg animation failed (rc={res.returncode}): {res.stderr.decode(errors='ignore')[-250:]}")
+            logger.warning(f"FFmpeg animation failed (rc={res.returncode}): {res.stderr.decode(errors='ignore')[-300:]}")
         return res.returncode == 0
 
     ok = await loop.run_in_executor(None, lambda: _run_cmd(cmd_mp4))
@@ -674,11 +677,12 @@ async def convert_video_to_animation(
 
     # Fallback: Direct GIF conversion if H.264 is unavailable
     gif_path = os.path.splitext(output_path)[0] + ".gif"
-    cmd_gif = ["ffmpeg", "-y", "-nostdin"]
+    cmd_gif = ["ffmpeg", "-y", "-nostdin",
+        "-i", video_path,
+    ]
     if start_sec > 0.05:
         cmd_gif.extend(["-ss", str(start_sec)])
     cmd_gif.extend([
-        "-i", video_path,
         "-t", str(duration),
         "-vf", f"fps=12,scale=min(360\\,iw):-1",
         "-loop", "0",

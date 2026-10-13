@@ -805,12 +805,19 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     except Exception as e:
-        logger.error(f"Sticker creation error: {e}", exc_info=True)
+        logger.error(f"Sticker creation error: {type(e).__name__}: {e}", exc_info=True)
         err_str = str(e).lower()
         bot_me = await context.bot.get_me()
         bot_username = bot_me.username or "R3dSter_Bot"
 
-        if any(k in err_str for k in ["user not found", "peer_id_invalid", "not found", "chat not found", "user_is_blocked", "forbidden"]):
+        # Only show the DM-start prompt for genuine bot-blocked / user-not-reachable errors.
+        # Avoid false positives from pack-not-found lookups (which also say "not found").
+        _dm_required_keywords = [
+            "forbidden", "bot was blocked", "user_is_blocked",
+            "bot can't initiate", "peer_id_invalid",
+            "user not participant", "chat_write_forbidden",
+        ]
+        if any(k in err_str for k in _dm_required_keywords):
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("👉 Start Bot in DM", url=f"https://t.me/{bot_username}?start=stickers")
@@ -994,9 +1001,9 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             file_size = getattr(video, "file_size", None)
             if not file_size or file_size <= 20 * 1024 * 1024:
                 try:
-                    tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=20.0)
+                    tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=45.0)
                     input_video_path = os.path.join(tmp_dir, "input.mp4")
-                    await asyncio.wait_for(tg_file.download_to_drive(custom_path=input_video_path), timeout=30.0)
+                    await asyncio.wait_for(tg_file.download_to_drive(custom_path=input_video_path), timeout=60.0)
                     if os.path.exists(input_video_path) and os.path.getsize(input_video_path) > 0:
                         try:
                             with open(input_video_path, "rb") as f:

@@ -601,14 +601,15 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
     raise RuntimeError("Could not find or create a sticker pack")
 
 
-async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_TYPE, is_quote_cmd: bool = False) -> None:
     """Quote a message or convert media/stickers into sticker pack.
 
     Usage:
-      /sticker     – Convert replied image/sticker/video to sticker pack
-      /q           – Quote the replied text message as a card sticker
+      /sticker     – Convert replied image/video/sticker to sticker pack
+      /q           – Quote the replied text message (or media caption) as a card sticker
       /q r         – Quote with reply context (shows who they replied to)
-      /q 1 3       – For video: clip from 1s to 3s as a video sticker
+      /sticker 1 3 – For video: clip from 1s to 3s as a video sticker
+      /q 2 5       – Video sticker clip
     """
     user = update.effective_user
     msg = update.effective_message
@@ -619,11 +620,38 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
         return
 
+    # Check whether invoking command was explicitly /q or /sticker
+    raw_cmd_text = (msg.text or msg.caption or "").strip()
+    if raw_cmd_text.startswith("/q"):
+        is_quote_cmd = True
+    elif raw_cmd_text.startswith(("/sticker", "/addsticker", "/kang")):
+        is_quote_cmd = False
+
     replied = msg.reply_to_message
-    target_msg = replied or (msg if (msg.photo or msg.document) else None)
+    # Target message is replied message, OR current message if media was attached directly
+    target_msg = replied or (
+        msg if (
+            msg.photo
+            or msg.video
+            or msg.video_note
+            or msg.animation
+            or msg.sticker
+            or (msg.document and msg.document.mime_type and (
+                msg.document.mime_type.lower().startswith("image/")
+                or msg.document.mime_type.lower().startswith("video/")
+            ))
+        ) else None
+    )
 
     # ── Parse arguments ──
     args = context.args or []
+    if not args and (msg.text or msg.caption):
+        tokens = (msg.text or msg.caption).split()
+        for idx, t in enumerate(tokens):
+            if t.startswith(("/sticker", "/addsticker", "/kang", "/q")):
+                args = tokens[idx + 1:]
+                break
+
     include_reply_context = False
     multi_count = 0
     video_start = None
@@ -634,13 +662,12 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             include_reply_context = True
         elif len(args) == 1 and args[0].isdigit():
             num = int(args[0])
-            # If replying to a video, treat single number as video end time
             if target_msg and (target_msg.video or target_msg.video_note or target_msg.animation):
-                video_start = 0
+                video_start = 0.0
                 video_end = float(num)
             else:
                 multi_count = min(num, 10)
-        elif len(args) == 2:
+        elif len(args) >= 2:
             try:
                 video_start = float(args[0])
                 video_end = float(args[1])
@@ -651,11 +678,12 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(
             fmt_card("🎨 /sticker & /q — Sticker Creator",
                 f"  <b>Reply to any message with:</b>\n"
-                f"  <code>/sticker</code> — Convert photo/sticker to your pack\n"
-                f"  <code>/q</code> — Quote text message as a sticker\n"
+                f"  <code>/sticker</code> — Convert photo/video/sticker to your pack\n"
+                f"  <code>/q</code> — Quote text message or media caption as a sticker\n"
                 f"  <code>/q r</code> — Quote with replied message context\n"
                 f"\n"
                 f"  <b>For videos:</b>\n"
+                f"  <code>/sticker</code> — Video sticker (first 3s)\n"
                 f"  <code>/sticker 1 3</code> — Video sticker (1s to 3s)\n"
                 f"  <code>/q 2 5</code> — Video sticker clip"
             ),
@@ -666,102 +694,123 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="choose_sticker")
 
     try:
-        # ── Case 1: Video reply with time range → video sticker ──
-        if target_msg and (target_msg.video or target_msg.video_note or target_msg.animation) and video_start is not None and video_end is not None:
-            duration = video_end - video_start
-            if duration <= 0:
-                await msg.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
-                return
-            if duration > 3:
-                await msg.reply_text(
-                    fmt_warning(f"Video stickers can be max 3 seconds. Trimming to {video_start}s → {video_start + 3}s."),
-                    parse_mode="HTML"
-                )
-                video_end = video_start + 3
+        # Detect media types on target message
+        video_obj = target_msg.video or target_msg.video_note or target_msg.animation
+        if not video_obj and target_msg.document and target_msg.document.mime_type:
+            if target_msg.document.mime_type.lower().startswith("video/"):
+                video_obj = target_msg.document
 
-            video = target_msg.video or target_msg.video_note or target_msg.animation
-            tg_file = await context.bot.get_file(video.file_id)
-            video_bytes = bytes(await tg_file.download_as_bytearray())
-
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                tmp.write(video_bytes)
-                tmp_path = tmp.name
-
-            try:
-                sticker_bytes = await quote_sticker.video_to_sticker(tmp_path, video_start, video_end)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
-            if not sticker_bytes:
-                await msg.reply_text(
-                    fmt_error("Failed to convert video to sticker. The video may be too large or incompatible."),
-                    parse_mode="HTML"
-                )
-                return
-
-            pack_name = await _find_or_create_sticker_pack(
-                context.bot, user, sticker_bytes, is_video=True
-            )
-            sticker_set = await context.bot.get_sticker_set(pack_name)
-            last_sticker = sticker_set.stickers[-1]
-            await msg.reply_sticker(sticker=last_sticker.file_id)
-            return
-
-        # ── Case 2: Image / Photo reply → 512px sticker ──
-        is_photo = bool(target_msg and target_msg.photo)
+        is_photo = bool(target_msg.photo)
         is_doc_img = bool(
-            target_msg and target_msg.document and target_msg.document.mime_type
+            target_msg.document and target_msg.document.mime_type
             and target_msg.document.mime_type.lower().startswith("image/")
         )
-        if (is_photo or is_doc_img) and not multi_count:
-            file_obj = target_msg.photo[-1] if is_photo else target_msg.document
-            tg_file = await context.bot.get_file(file_obj.file_id)
-            raw_bytes = bytes(await tg_file.download_as_bytearray())
-            sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
+        photo_obj = (target_msg.photo[-1] if is_photo else (target_msg.document if is_doc_img else None))
 
-            pack_name = await _find_or_create_sticker_pack(
-                context.bot, user, sticker_bytes, is_video=False
-            )
-            sticker_set = await context.bot.get_sticker_set(pack_name)
-            last_sticker = sticker_set.stickers[-1]
-            await msg.reply_sticker(sticker=last_sticker.file_id)
-            return
+        sticker_obj = target_msg.sticker
+        has_media = bool(video_obj or photo_obj or sticker_obj)
+        msg_text = (target_msg.text or target_msg.caption or "").strip()
 
-        # ── Case 3: Existing sticker reply → re-sticker / add to pack ──
-        if target_msg and target_msg.sticker:
-            stk = target_msg.sticker
-            if stk.is_animated:
-                await msg.reply_text(
-                    fmt_warning("⚠️ Telegram animated (.tgs vector) stickers cannot be added to standard packs.\n\nOnly static image stickers, photos, videos, and quote cards can be added."),
-                    parse_mode="HTML"
+        # Decision rule:
+        # - /q: If there is text/caption, QUOTE it into a card sticker! Only fallback to media if no text.
+        # - /sticker: If there is media, CREATE STICKER FROM MEDIA! Only fallback to quote text if no media.
+        should_convert_media = (has_media and not is_quote_cmd) or (has_media and not msg_text)
+
+        if should_convert_media:
+            # ── 1. Video sticker ──
+            if video_obj:
+                v_start = video_start if video_start is not None else 0.0
+                if video_end is not None:
+                    v_end = video_end
+                else:
+                    v_end = v_start + 3.0
+
+                duration = v_end - v_start
+                if duration <= 0:
+                    await msg.reply_text(fmt_error("End time must be after start time."), parse_mode="HTML")
+                    return
+                if duration > 3:
+                    await msg.reply_text(
+                        fmt_warning(f"Video stickers can be max 3 seconds. Trimming to {v_start}s → {v_start + 3}s."),
+                        parse_mode="HTML"
+                    )
+                    v_end = v_start + 3.0
+
+                tg_file = await context.bot.get_file(video_obj.file_id)
+                video_bytes = bytes(await tg_file.download_as_bytearray())
+
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                    tmp.write(video_bytes)
+                    tmp_path = tmp.name
+
+                try:
+                    sticker_bytes = await quote_sticker.video_to_sticker(tmp_path, v_start, v_end)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+                if not sticker_bytes:
+                    await msg.reply_text(
+                        fmt_error("Failed to convert video to sticker. The video may be too large or incompatible."),
+                        parse_mode="HTML"
+                    )
+                    return
+
+                pack_name = await _find_or_create_sticker_pack(
+                    context.bot, user, sticker_bytes, is_video=True
                 )
+                sticker_set = await context.bot.get_sticker_set(pack_name)
+                last_sticker = sticker_set.stickers[-1]
+                await msg.reply_sticker(sticker=last_sticker.file_id)
                 return
 
-            tg_file = await context.bot.get_file(stk.file_id)
-            raw_bytes = bytes(await tg_file.download_as_bytearray())
-
-            if stk.is_video:
-                pack_name = await _find_or_create_sticker_pack(
-                    context.bot, user, raw_bytes, is_video=True
-                )
-            else:
+            # ── 2. Photo / Image sticker ──
+            if photo_obj and not multi_count:
+                tg_file = await context.bot.get_file(photo_obj.file_id)
+                raw_bytes = bytes(await tg_file.download_as_bytearray())
                 sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
+
                 pack_name = await _find_or_create_sticker_pack(
                     context.bot, user, sticker_bytes, is_video=False
                 )
+                sticker_set = await context.bot.get_sticker_set(pack_name)
+                last_sticker = sticker_set.stickers[-1]
+                await msg.reply_sticker(sticker=last_sticker.file_id)
+                return
 
-            sticker_set = await context.bot.get_sticker_set(pack_name)
-            last_sticker = sticker_set.stickers[-1]
-            await msg.reply_sticker(sticker=last_sticker.file_id)
-            return
+            # ── 3. Sticker reply → add to pack (fetch from another pack) ──
+            if sticker_obj:
+                stk = sticker_obj
+                if stk.is_animated:
+                    await msg.reply_text(
+                        fmt_warning("⚠️ Telegram animated (.tgs vector) stickers cannot be added to standard packs.\n\nOnly static image stickers, photos, videos, and quote cards can be added."),
+                        parse_mode="HTML"
+                    )
+                    return
 
-        # ── Case 4: Text message → Quote card sticker ──
-        if target_msg and (target_msg.text or target_msg.caption):
-            msg_text = target_msg.text or target_msg.caption or ""
+                tg_file = await context.bot.get_file(stk.file_id)
+                raw_bytes = bytes(await tg_file.download_as_bytearray())
+
+                if stk.is_video:
+                    pack_name = await _find_or_create_sticker_pack(
+                        context.bot, user, raw_bytes, is_video=True
+                    )
+                else:
+                    sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
+                    pack_name = await _find_or_create_sticker_pack(
+                        context.bot, user, sticker_bytes, is_video=False
+                    )
+
+                sticker_set = await context.bot.get_sticker_set(pack_name)
+                last_sticker = sticker_set.stickers[-1]
+                await msg.reply_sticker(sticker=last_sticker.file_id)
+                return
+
+        # ── Quote Card Sticker (from text / caption) ──
+        if msg_text:
             username, avatar_bytes = await _extract_author_and_avatar(context.bot, target_msg)
 
             # Check for reply context (who target_msg replied to)
@@ -837,8 +886,14 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
 
-# Alias sticker command to q_command
-sticker_command = q_command
+async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quote command: quotes text/caption by default, falls back to media."""
+    await handle_sticker_or_quote(update, context, is_quote_cmd=True)
+
+
+async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sticker command: converts media to sticker by default, falls back to text."""
+    await handle_sticker_or_quote(update, context, is_quote_cmd=False)
 
 
 # ─── GIF Command (/gif) ──────────────────────────────────────────────────────
@@ -1003,7 +1058,14 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 try:
                     tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=45.0)
                     input_video_path = os.path.join(tmp_dir, "input.mp4")
-                    await asyncio.wait_for(tg_file.download_to_drive(custom_path=input_video_path), timeout=60.0)
+                    try:
+                        await asyncio.wait_for(tg_file.download_to_drive(custom_path=input_video_path), timeout=60.0)
+                    except Exception as d_err:
+                        logger.warning(f"download_to_drive failed ({d_err}), trying download_as_bytearray fallback...")
+                        b_data = bytes(await asyncio.wait_for(tg_file.download_as_bytearray(), timeout=60.0))
+                        with open(input_video_path, "wb") as f:
+                            f.write(b_data)
+
                     if os.path.exists(input_video_path) and os.path.getsize(input_video_path) > 0:
                         try:
                             with open(input_video_path, "rb") as f:
@@ -1013,7 +1075,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     else:
                         input_video_path = None
                 except Exception as e:
-                    logger.warning(f"Telegram file download failed for /gif ({e})")
+                    logger.warning(f"Telegram file download failed for /gif ({type(e).__name__}: {e})")
                     input_video_path = None
 
         # 3. Fallback URL download (Twitter, Instagram, TikTok, Reddit, YouTube, Direct)
@@ -1021,7 +1083,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             try:
                 input_video_path = await asyncio.wait_for(
                     download_video_source(fallback_url, tmp_dir),
-                    timeout=35.0
+                    timeout=60.0
                 )
             except Exception as e:
                 logger.error(f"URL video download failed for /gif ({fallback_url}): {e}")
@@ -1072,24 +1134,37 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 pass
         except Exception as e:
-            logger.warning(f"reply_animation failed ({e}), falling back to document")
+            logger.warning(f"reply_animation failed ({e}), falling back to video/document")
             try:
                 with open(output_anim_path, "rb") as anim_file:
-                    await msg.reply_document(
-                        document=anim_file,
+                    await msg.reply_video(
+                        video=anim_file,
                         caption="Here is your GIF clip!",
                         reply_to_message_id=msg.message_id,
+                        supports_streaming=True,
                     )
                 try:
                     await status_msg.delete()
                 except Exception:
                     pass
             except Exception as e2:
-                logger.error(f"Failed to send GIF: {e2}")
                 try:
-                    await status_msg.edit_text(fmt_error(f"Failed to send GIF: {str(e2)[:120]}"), parse_mode="HTML")
-                except Exception:
-                    pass
+                    with open(output_anim_path, "rb") as anim_file:
+                        await msg.reply_document(
+                            document=anim_file,
+                            caption="Here is your GIF clip!",
+                            reply_to_message_id=msg.message_id,
+                        )
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                except Exception as e3:
+                    logger.error(f"Failed to send GIF: {e3}")
+                    try:
+                        await status_msg.edit_text(fmt_error(f"Failed to send GIF: {str(e3)[:120]}"), parse_mode="HTML")
+                    except Exception:
+                        pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Translate incoming text messages in private chats."""
@@ -1418,8 +1493,8 @@ def main() -> None:
     )
     request_kwargs = {
         "connect_timeout": 30.0,
-        "read_timeout": 30.0,
-        "write_timeout": 30.0,
+        "read_timeout": 90.0,
+        "write_timeout": 90.0,
         "pool_timeout": 30.0,
     }
     if proxy_url:
@@ -1480,6 +1555,8 @@ def main() -> None:
     application.add_handler(CommandHandler(["maintenance", "admin"], maintenance_command))
     application.add_handler(CommandHandler("q", q_command, block=False))
     application.add_handler(CommandHandler(["sticker", "addsticker", "kang"], sticker_command, block=False))
+    application.add_handler(MessageHandler(filters.CaptionRegex(r"^/q(?:\s|$)"), q_command, block=False))
+    application.add_handler(MessageHandler(filters.CaptionRegex(r"^/(?:sticker|addsticker|kang)(?:\s|$)"), sticker_command, block=False))
     application.add_handler(CommandHandler("gif", gif_command, block=False))
     application.add_handler(MessageHandler(filters.CaptionRegex(r"^/gif(?:\s|$)"), gif_command, block=False))
     application.add_handler(CommandHandler("voice", voice_command))

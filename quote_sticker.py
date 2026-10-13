@@ -556,18 +556,23 @@ async def video_to_sticker(
         output_path = tmp.name
 
     try:
+        scale_expr = f"scale=w={STICKER_SIZE}:h={STICKER_SIZE}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,fps={MAX_VIDEO_STICKER_FPS}"
         cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start_sec),
+            "ffmpeg", "-y", "-nostdin",
             "-i", video_path,
+        ]
+        if start_sec > 0.05:
+            cmd.extend(["-ss", str(start_sec)])
+        cmd.extend([
             "-t", str(duration),
-            "-vf", f"scale='if(gt(iw,ih),{STICKER_SIZE},-2)':'if(gt(iw,ih),-2,{STICKER_SIZE})',fps={MAX_VIDEO_STICKER_FPS}",
+            "-map", "0:v:0",
+            "-vf", scale_expr,
             "-c:v", "libvpx-vp9",
             "-b:v", "200k",
             "-an",  # No audio
             "-pix_fmt", "yuva420p",
             output_path,
-        ]
+        ])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -586,8 +591,9 @@ async def video_to_sticker(
             # Re-encode with lower bitrate
             output_path_2 = output_path + "_small.webm"
             cmd2 = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-y", "-nostdin",
                 "-i", output_path,
+                "-map", "0:v:0",
                 "-c:v", "libvpx-vp9",
                 "-b:v", "100k",
                 "-an",
@@ -643,17 +649,17 @@ async def convert_video_to_animation(
     start_sec = max(0.0, float(start_sec))
     duration = min(float(duration), 15.0)
 
-    # Standard H.264 silent MP4 animation filter (ensures even dimensions for yuv420p)
-    # NOTE: -ss is placed AFTER -i (safe/accurate seek) to avoid decode failures on
-    # non-keyframe positions, which is common with Twitter/HLS-sourced fragmented MP4s.
-    scale_expr = f"scale=trunc(min({max_dim}\\,iw)/2)*2:trunc(min({max_dim}\\,ih)/2)*2"
-    cmd_mp4 = ["ffmpeg", "-y", "-nostdin",
+    # Standard H.264 silent MP4 animation filter (preserves aspect ratio and ensures even dimensions for yuv420p)
+    scale_expr = f"scale=w={max_dim}:h={max_dim}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    cmd_mp4 = [
+        "ffmpeg", "-y", "-nostdin",
         "-i", video_path,
     ]
     if start_sec > 0.05:
         cmd_mp4.extend(["-ss", str(start_sec)])
     cmd_mp4.extend([
         "-t", str(duration),
+        "-map", "0:v:0",
         "-an",
         "-vf", scale_expr,
         "-c:v", "libx264",
@@ -677,14 +683,16 @@ async def convert_video_to_animation(
 
     # Fallback: Direct GIF conversion if H.264 is unavailable
     gif_path = os.path.splitext(output_path)[0] + ".gif"
-    cmd_gif = ["ffmpeg", "-y", "-nostdin",
+    cmd_gif = [
+        "ffmpeg", "-y", "-nostdin",
         "-i", video_path,
     ]
     if start_sec > 0.05:
         cmd_gif.extend(["-ss", str(start_sec)])
     cmd_gif.extend([
         "-t", str(duration),
-        "-vf", f"fps=12,scale=min(360\\,iw):-1",
+        "-map", "0:v:0",
+        "-vf", f"fps=12,scale=w=360:h=360:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-loop", "0",
         gif_path,
     ])

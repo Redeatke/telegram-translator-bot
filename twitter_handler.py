@@ -146,9 +146,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
     screen_name = tweet_data.get("author_screen_name") or username
     main_text = tweet_data.get("text", "").strip()
     quote = tweet_data.get("quote")
-    likes = tweet_data.get("likes", 0)
-    retweets = tweet_data.get("retweets", 0)
-    views = tweet_data.get("views")
 
     caption_parts = [f"𝕏 <b>{html.escape(author_name)}</b> (<code>@{html.escape(screen_name)}</code>)\n"]
     if main_text:
@@ -162,17 +159,6 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
             caption_parts.append(
                 f"\n💬 <b>Quoting {html.escape(q_author)} (@{html.escape(q_screen)}):</b>\n<i>{html.escape(q_text[:300])}</i>"
             )
-
-    stats = []
-    if likes:
-        stats.append(f"❤️ {card.format_count(likes)}")
-    if retweets:
-        stats.append(f"🔁 {card.format_count(retweets)}")
-    if views:
-        stats.append(f"👁️ {card.format_count(views)}")
-
-    if stats:
-        caption_parts.append(f"\n{'  •  '.join(stats)}")
 
     caption = "\n".join(caption_parts)
     if len(caption) > 1024:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import html
+import uuid
 import shutil
 import asyncio
 import tempfile

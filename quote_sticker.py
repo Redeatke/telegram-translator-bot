@@ -19,6 +19,8 @@ import re
 import logging
 import asyncio
 import tempfile
+import uuid
+import subprocess
 from typing import Optional, List, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
@@ -626,210 +628,91 @@ async def video_to_sticker(
 
 # ─── Video to GIF ──────────────────────────────────────────────────────────────
 
-async def video_to_animation(
+async def video_to_gif(
     video_path: str,
     start_sec: float = 0,
     end_sec: Optional[float] = None,
-    max_width: int = 480,
-) -> Tuple[Optional[bytes], str]:
+    max_width: int = 360,
+    fps: int = 10,
+) -> Optional[bytes]:
     """
-    Convert a video to an ultra-fast Telegram Animation (silent MP4) or GIF.
-    Telegram natively displays silent H.264 MP4 videos as looping GIFs (with the GIF badge).
-    This completes in ~0.2-0.5s and is 10x-20x smaller than legacy CompuServe .gif files.
-    Returns (bytes, "mp4"|"gif") or (None, "").
+    Standard high-performance Video to GIF converter using FFmpeg palettegen + paletteuse.
+    Generates a crisp, compact, universally supported looping GIF in ~0.2-0.5s.
     """
     start_sec = max(0.0, float(start_sec))
     if end_sec is not None:
         duration = float(end_sec) - start_sec
         if duration <= 0:
-            return None, ""
+            return None
         if duration > MAX_GIF_DURATION:
             duration = MAX_GIF_DURATION
     else:
         duration = DEFAULT_GIF_DURATION
 
-    # ── Method 1: Ultra-Fast Native Telegram Animation (Silent H.264 MP4) ──
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_mp4:
-        output_mp4 = tmp_mp4.name
-
+    output_path = os.path.join(tempfile.gettempdir(), f"gif_{uuid.uuid4().hex}.gif")
     try:
-        scale_expr = f"scale=trunc(min({max_width}\\,iw)/2)*2:-2"
-        cmd_mp4 = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts"]
+        # Standard 1-pass split palettegen/paletteuse filter
+        filter_str = f"fps={fps},scale={max_width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+        cmd = ["ffmpeg", "-y", "-nostdin"]
         if start_sec > 0.05:
-            cmd_mp4.extend(["-ss", str(start_sec)])
-        cmd_mp4.extend([
-            "-i", video_path,
-            "-t", str(duration),
-            "-vf", scale_expr,
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "25",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            output_mp4,
-        ])
-
-        proc_mp4 = await asyncio.create_subprocess_exec(
-            *cmd_mp4,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr_mp4 = await asyncio.wait_for(proc_mp4.communicate(), timeout=15.0)
-        except asyncio.TimeoutError:
-            try:
-                proc_mp4.kill()
-                await proc_mp4.wait()
-            except Exception:
-                pass
-            stderr_mp4 = b"timeout"
-
-        if proc_mp4.returncode == 0 and os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 0:
-            with open(output_mp4, "rb") as f:
-                return f.read(), "mp4"
-
-        err_str = stderr_mp4.decode(errors="ignore").strip()
-        logger.warning(f"Fast MP4 stage 1 failed (rc={proc_mp4.returncode}): {err_str[-250:]}")
-
-        # Stage 1b: Output seeking fallback for MP4 (solves container PTS offsets)
-        if start_sec > 0.05:
-            cmd_mp4_s2 = [
-                "ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
-                "-i", video_path,
-                "-ss", str(start_sec),
-                "-t", str(duration),
-                "-vf", scale_expr,
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "25",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                output_mp4,
-            ]
-            proc_s2 = await asyncio.create_subprocess_exec(
-                *cmd_mp4_s2,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr_s2 = await asyncio.wait_for(proc_s2.communicate(), timeout=15.0)
-            except asyncio.TimeoutError:
-                try:
-                    proc_s2.kill()
-                    await proc_s2.wait()
-                except Exception:
-                    pass
-                stderr_s2 = b"timeout"
-
-            if proc_s2.returncode == 0 and os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 0:
-                with open(output_mp4, "rb") as f:
-                    return f.read(), "mp4"
-            logger.warning(f"Fast MP4 stage 1b failed: {stderr_s2.decode(errors='ignore')[-250:]}")
-
-    except Exception as e:
-        logger.warning(f"Fast MP4 animation conversion failed ({e}), trying fast palette GIF fallback...")
-    finally:
-        try:
-            if os.path.exists(output_mp4):
-                os.unlink(output_mp4)
-        except OSError:
-            pass
-
-    # ── Method 2: Fast Palette GIF Fallback ──
-    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp_gif:
-        output_gif = tmp_gif.name
-
-    try:
-        gif_scale = "scale=trunc(min(400\\,iw)/2)*2:-2"
-        filter_str = f"fps=14,{gif_scale},split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3"
-        cmd_gif = ["ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts"]
-        if start_sec > 0.05:
-            cmd_gif.extend(["-ss", str(start_sec)])
-        cmd_gif.extend([
+            cmd.extend(["-ss", str(start_sec)])
+        cmd.extend([
             "-i", video_path,
             "-t", str(duration),
             "-vf", filter_str,
-            output_gif,
+            "-loop", "0",
+            output_path,
         ])
 
-        proc_gif = await asyncio.create_subprocess_exec(
-            *cmd_gif,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15.0)
         )
-        try:
-            _, stderr_gif = await asyncio.wait_for(proc_gif.communicate(), timeout=20.0)
-        except asyncio.TimeoutError:
-            try:
-                proc_gif.kill()
-                await proc_gif.wait()
-            except Exception:
-                pass
-            stderr_gif = b"timeout"
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            with open(output_path, "rb") as f:
+                return f.read()
 
-        if proc_gif.returncode == 0 and os.path.exists(output_gif) and os.path.getsize(output_gif) > 0:
-            with open(output_gif, "rb") as f:
-                return f.read(), "gif"
-
-        logger.warning(f"Palette GIF failed: {stderr_gif.decode(errors='ignore')[-250:]}")
-
-        # ── Method 3: Standard Direct GIF Fallback (Never Fails) ──
-        cmd_direct = [
-            "ffmpeg", "-y", "-nostdin", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
+        # Instant fallback: direct scale without palettegen
+        cmd_fallback = ["ffmpeg", "-y", "-nostdin"]
+        if start_sec > 0.05:
+            cmd_fallback.extend(["-ss", str(start_sec)])
+        cmd_fallback.extend([
             "-i", video_path,
             "-t", str(duration),
-            "-vf", f"fps=12,{gif_scale}",
-            output_gif,
-        ]
-        proc_direct = await asyncio.create_subprocess_exec(
-            *cmd_direct,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            "-vf", f"fps={fps},scale={max_width}:-1",
+            "-loop", "0",
+            output_path,
+        ])
+        res_fb = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10.0)
         )
-        try:
-            _, stderr_direct = await asyncio.wait_for(proc_direct.communicate(), timeout=15.0)
-        except asyncio.TimeoutError:
-            try:
-                proc_direct.kill()
-                await proc_direct.wait()
-            except Exception:
-                pass
-            stderr_direct = b"timeout"
+        if res_fb.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            with open(output_path, "rb") as f:
+                return f.read()
 
-        if proc_direct.returncode == 0 and os.path.exists(output_gif) and os.path.getsize(output_gif) > 0:
-            with open(output_gif, "rb") as f:
-                return f.read(), "gif"
-
-        logger.error(f"All GIF methods failed. Direct error: {stderr_direct.decode(errors='ignore')[-250:]}")
-
+        return None
     except Exception as e:
-        logger.error(f"Palette GIF conversion exception: {e}")
+        logger.error(f"video_to_gif conversion error: {e}")
+        return None
     finally:
-        try:
-            if os.path.exists(output_gif):
-                os.unlink(output_gif)
-        except OSError:
-            pass
-
-    return None, ""
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
 
 
-async def video_to_gif(
+async def video_to_animation(
     video_path: str,
     start_sec: float = 0,
     end_sec: Optional[float] = None,
-    max_width: int = 400,
-    fps: int = 12,
-) -> Optional[bytes]:
-    """Compatibility wrapper that returns animation bytes."""
-    data, _ = await video_to_animation(video_path, start_sec, end_sec, max_width)
-    return data
+    max_width: int = 360,
+) -> Tuple[Optional[bytes], str]:
+    """Compatibility wrapper returning (gif_bytes, 'gif')."""
+    data = await video_to_gif(video_path, start_sec, end_sec, max_width)
+    return data, "gif"
 
 
 # ─── Sticker Pack Naming ───────────────────────────────────────────────────────

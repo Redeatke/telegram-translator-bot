@@ -989,17 +989,16 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not cached_bytes and target_msg:
             cached_bytes = media_cache.get(f"msg_vid:{target_msg.chat_id}:{target_msg.message_id}")
         if cached_bytes:
-            tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-            tmp.write(cached_bytes)
-            tmp.close()
-            video_source_path = tmp.name
+            temp_path = os.path.join(tempfile.gettempdir(), f"vid_{uuid.uuid4().hex[:10]}.mp4")
+            with open(temp_path, "wb") as f:
+                f.write(cached_bytes)
+            video_source_path = temp_path
             cleanup_temp_file = True
 
     # Step 1b: If not in cache and Telegram video object is available (<= 20MB), download via Bot API
     if not video_source_path and video:
         file_size = getattr(video, "file_size", None)
         if not file_size or file_size <= 20 * 1024 * 1024:
-            tmp = None
             try:
                 tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=15.0)
                 suffix = ".mp4"
@@ -1007,19 +1006,18 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     _, ext = os.path.splitext(video.file_name)
                     if ext:
                         suffix = ext
-                tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-                tmp.close()
-                await asyncio.wait_for(tg_file.download_to_drive(custom_path=tmp.name), timeout=25.0)
-                if os.path.exists(tmp.name) and os.path.getsize(tmp.name) > 0:
-                    video_source_path = tmp.name
+                temp_path = os.path.join(tempfile.gettempdir(), f"vid_{uuid.uuid4().hex[:10]}{suffix}")
+                await asyncio.wait_for(tg_file.download_to_drive(custom_path=temp_path), timeout=25.0)
+                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    video_source_path = temp_path
                     cleanup_temp_file = True
-            except Exception as e:
-                logger.warning(f"Telegram get_file failed for /gif ({e}), checking for fallback URL...")
-                if tmp and os.path.exists(tmp.name):
                     try:
-                        os.unlink(tmp.name)
-                    except OSError:
+                        with open(temp_path, "rb") as f:
+                            media_cache.set(f"vid:{video.file_id}", f.read())
+                    except Exception:
                         pass
+            except Exception as e:
+                logger.warning(f"Telegram get_file/download failed for /gif ({e}), checking for fallback URL...")
                 video_source_path = None
                 cleanup_temp_file = False
 
@@ -1027,7 +1025,10 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not video_source_path and fallback_url:
         try:
             cleanup_temp_dir = tempfile.mkdtemp()
-            video_source_path = await download_video_source(fallback_url, cleanup_temp_dir)
+            video_source_path = await asyncio.wait_for(
+                download_video_source(fallback_url, cleanup_temp_dir),
+                timeout=30.0
+            )
         except Exception as e:
             logger.error(f"URL video download failed for /gif ({fallback_url}): {e}")
 
@@ -1044,12 +1045,11 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             shutil.rmtree(cleanup_temp_dir, ignore_errors=True)
         return
 
-    # Step 3: Convert video to Telegram Animation using quote_sticker.video_to_animation (sub-second)
-    anim_bytes = None
-    anim_ext = "mp4"
+    # Step 3: Convert video to GIF using quote_sticker.video_to_gif (sub-second standard GitHub palettegen)
+    gif_bytes = None
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
-        anim_bytes, anim_ext = await quote_sticker.video_to_animation(video_source_path, start_sec, end_sec)
+        gif_bytes = await quote_sticker.video_to_gif(video_source_path, start_sec, end_sec)
     except Exception as e:
         logger.error(f"GIF execution error: {e}", exc_info=True)
         try:
@@ -1069,7 +1069,7 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except OSError:
                 pass
 
-    if not anim_bytes:
+    if not gif_bytes:
         try:
             await status_msg.edit_text(
                 fmt_error("Failed to convert video to GIF. The video format may be incompatible or damaged."),
@@ -1080,12 +1080,11 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Step 4: Send as native Telegram animation (autoplays on loop with GIF badge)
-    anim_filename = f"animation.{anim_ext}"
     try:
         await msg.reply_animation(
-            animation=anim_bytes,
+            animation=gif_bytes,
             reply_to_message_id=msg.message_id,
-            filename=anim_filename,
+            filename="animation.gif",
         )
         try:
             await status_msg.delete()
@@ -1095,9 +1094,9 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.warning(f"reply_animation failed ({e}), falling back to reply_document")
         try:
             await msg.reply_document(
-                document=anim_bytes,
+                document=gif_bytes,
                 reply_to_message_id=msg.message_id,
-                filename=anim_filename,
+                filename="animation.gif",
                 caption="🎞️ Converted GIF",
             )
             try:

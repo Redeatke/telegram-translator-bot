@@ -55,6 +55,7 @@ from config import (
     THREADS_URL_PATTERN,
     THREADS_CANONICAL_PATTERN,
     REDDIT_URL_PATTERN,
+    TWITTER_URL_PATTERN,
     media_cache,
     logger,
 )
@@ -862,7 +863,38 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
         except Exception as e:
             logger.warning(f"Direct video download failed ({e}), continuing fallback...")
 
-    # 2. Instagram: Fast direct extraction of CDN video URL
+    # 2. Twitter / X: Fast direct extraction of video MP4
+    if TWITTER_URL_PATTERN.search(url):
+        tw_match = TWITTER_URL_PATTERN.search(url)
+        username, tweet_id = tw_match.groups()
+        headers = {"User-Agent": "TelegramBot (like TwitterBot)"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                resp = await client.get(f"https://api.fxtwitter.com/{username}/status/{tweet_id}", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    tweet = data.get("tweet") or {}
+                    media = tweet.get("media") or {}
+                    videos = media.get("videos") or []
+                    if videos:
+                        v_obj = videos[0]
+                        v_url = v_obj.get("url")
+                        variants = v_obj.get("variants") or []
+                        mp4_variants = [v for v in variants if v.get("content_type") == "video/mp4" or ".mp4" in v.get("url", "")]
+                        if mp4_variants:
+                            mp4_variants.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                            v_url = mp4_variants[0].get("url") or v_url
+                        if v_url:
+                            v_resp = await client.get(v_url, timeout=25.0)
+                            if v_resp.status_code == 200 and len(v_resp.content) > 0:
+                                out_path = os.path.join(output_dir, f"tw_{uuid.uuid4().hex[:8]}.mp4")
+                                with open(out_path, "wb") as f:
+                                    f.write(v_resp.content)
+                                return out_path
+        except Exception as tw_err:
+            logger.warning(f"Fast Twitter extraction failed for GIF ({tw_err}), falling back...")
+
+    # 3. Instagram: Fast direct extraction of CDN video URL
     if INSTAGRAM_URL_PATTERN.search(url):
         try:
             loop = asyncio.get_running_loop()
@@ -891,7 +923,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
             if video_cdn_url:
                 out_path = os.path.join(output_dir, f"ig_{uuid.uuid4().hex[:8]}.mp4")
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
                     resp = await client.get(video_cdn_url, headers=headers)
                     if resp.status_code == 200 and len(resp.content) > 0:
                         with open(out_path, "wb") as f:
@@ -900,11 +932,11 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
         except Exception as ig_err:
             logger.warning(f"Fast Instagram extraction failed for GIF ({ig_err}), falling back to yt-dlp...")
 
-    # 3. Generic media download with reasonable 45-second timeout
+    # 4. Generic media download with safe timeout
     try:
         info = await asyncio.wait_for(
             download_generic_media(url, output_dir, platform_name="Video"),
-            timeout=45.0
+            timeout=25.0
         )
         return info.get("filepath")
     except Exception as e:

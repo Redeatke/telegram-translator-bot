@@ -822,8 +822,48 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
 
             # ── 2. Photo / Image sticker ──
             if photo_obj and not multi_count:
-                tg_file = await context.bot.get_file(photo_obj.file_id)
-                raw_bytes = bytes(await tg_file.download_as_bytearray())
+                raw_bytes = None
+                # 1. Try standard Bot API download across available photo sizes (largest first)
+                if is_photo and target_msg.photo:
+                    for p in reversed(target_msg.photo):
+                        try:
+                            tg_file = await context.bot.get_file(p.file_id)
+                            raw_bytes = bytes(await tg_file.download_as_bytearray())
+                            if raw_bytes and len(raw_bytes) > 0:
+                                break
+                        except Exception as pe:
+                            logger.warning(f"Bot API download failed for photo size {p.file_id}: {type(pe).__name__}: {pe}")
+                elif photo_obj:
+                    try:
+                        tg_file = await context.bot.get_file(photo_obj.file_id)
+                        raw_bytes = bytes(await tg_file.download_as_bytearray())
+                    except Exception as pe:
+                        logger.warning(f"Bot API download failed for doc image {photo_obj.file_id}: {type(pe).__name__}: {pe}")
+
+                # 2. Telethon MTProto download fallback if Bot API returned 404 / InvalidToken
+                if not raw_bytes and telethon_downloader.is_telethon_available():
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_p:
+                        tmp_p_path = tmp_p.name
+                    ok = await telethon_downloader.download_message_media(
+                        target_msg.chat_id, target_msg.message_id, tmp_p_path
+                    )
+                    if ok and os.path.exists(tmp_p_path) and os.path.getsize(tmp_p_path) > 0:
+                        with open(tmp_p_path, "rb") as f:
+                            raw_bytes = f.read()
+                        logger.info("Successfully downloaded photo via Telethon MTProto fallback!")
+                    try:
+                        os.unlink(tmp_p_path)
+                    except OSError:
+                        pass
+
+                if not raw_bytes:
+                    await msg.reply_text(
+                        fmt_error("Failed to retrieve image from Telegram. Please try sending it again or upload as an uncompressed file."),
+                        parse_mode="HTML"
+                    )
+                    return
+
                 sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
 
                 pack_name = await _find_or_create_sticker_pack(

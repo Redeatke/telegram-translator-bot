@@ -78,7 +78,7 @@ async def safe_answer_query(query, *args, **kwargs) -> bool:
 
 # ─── API Configuration ───────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 
 _config_channel_id_raw = os.getenv("CONFIG_CHANNEL_ID", "").strip()
 CONFIG_CHANNEL_ID = int(_config_channel_id_raw) if _config_channel_id_raw else None

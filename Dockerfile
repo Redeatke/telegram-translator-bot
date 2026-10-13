@@ -11,14 +11,14 @@ RUN deno --version
 
 # Install the bgutil PO Token provider so yt-dlp can generate the PO tokens YouTube
 # now requires for most formats. Without this, YouTube serves a hard bot-check wall
-# ("Sign in to confirm you're not a bot") to datacenter IPs like Render's, regardless
+# ("Sign in to confirm you're not a bot") to datacenter IPs like Northflank's, regardless
 # of how fresh the cookies are. Cloned to yt-dlp's default script-mode search path.
 RUN git clone --single-branch --branch 2.0.0 \
     https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
     /root/bgutil-ytdlp-pot-provider && \
     cd /root/bgutil-ytdlp-pot-provider/server && \
-    npm ci && \
-    npx tsc
+    NODE_OPTIONS="--max-old-space-size=512" npm ci --prefer-offline && \
+    NODE_OPTIONS="--max-old-space-size=512" npx tsc
 
 # Prime Deno's and Node's compile/module caches by running the provider script
 # once at build time (generous time budget here vs. none at request time), so
@@ -42,6 +42,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
 
 COPY . .
-RUN chmod +x start.sh
 
-CMD ["bash", "start.sh"]
+CMD ["python", "bot.py"]

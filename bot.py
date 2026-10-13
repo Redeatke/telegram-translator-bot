@@ -7,7 +7,7 @@ media message handlers, and manages application lifecycle.
 Submodules:
 - config.py: Configuration, environment variables, in-memory state & formatting helpers
 - translation.py: Free & AI translation engines, language detection & picker keyboards
-- moderation.py: Group admin commands (/ban, /promote, /demote, /report, /setcookies, /maintenance)
+- moderation.py: Group admin commands (/ban, /promote, /demote, /report, /maintenance)
 - downloaders.py: YouTube, Twitch, Instagram, Threads, TikTok, Reddit media downloaders
 - twitter_handler.py: Twitter/X media extraction with photo albums and captions
 - quote_sticker.py: Glassmorphism quote stickers with emoji support & dynamic compact width
@@ -111,7 +111,6 @@ from moderation import (
     clearwarns_command,
     set_warn_limit_command,
     report_command,
-    setcookies_command,
     maintenance_command,
     handle_maintenance_callback,
 )
@@ -1383,7 +1382,6 @@ async def post_init(application: Application) -> None:
         ("status", "Show settings and status"),
         ("help", "Full help guide"),
         ("report", "Report a problem to admins"),
-        ("setcookies", "Update YouTube cookies (DM only)"),
         ("warn", "Warn a user (Admins)"),
         ("warns", "Check warnings and lives"),
         ("unwarn", "Remove 1 warning (Admins)"),
@@ -1472,7 +1470,6 @@ def main() -> None:
     application.add_handler(CommandHandler("promote", promote_command))
     application.add_handler(CommandHandler("demote", demote_command))
     application.add_handler(CommandHandler("report", report_command))
-    application.add_handler(CommandHandler("setcookies", setcookies_command))
     application.add_handler(CommandHandler(["maintenance", "admin"], maintenance_command))
     application.add_handler(CommandHandler("q", q_command, block=False))
     application.add_handler(CommandHandler(["sticker", "addsticker", "kang"], sticker_command, block=False))
@@ -1480,10 +1477,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.CaptionRegex(r"^/gif(?:\s|$)"), gif_command, block=False))
     application.add_handler(CommandHandler("voice", voice_command))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message, block=False))
-    application.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.Document.ALL,
-        setcookies_command
-    ))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)
     application.add_handler(CallbackQueryHandler(handle_maintenance_callback, pattern="^maint:", block=False))

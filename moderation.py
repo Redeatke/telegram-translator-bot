@@ -4,7 +4,6 @@ Group Moderation & Bot Administration Commands
 Handles group admin commands:
 - /ban, /promote, /demote
 - /report (sends issue reports to configured admins)
-- /setcookies (loads YouTube cookies via chat)
 - /maintenance (interactive maintenance toggle)
 """
 from __future__ import annotations
@@ -24,7 +23,6 @@ from config import (
     ADMIN_USER_IDS,
     get_maintenance_mode,
     set_maintenance_mode,
-    set_youtube_cookies_file,
     safe_answer_query,
     logger,
     fmt_card,
@@ -384,81 +382,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await update.message.reply_text(
             fmt_error("Couldn't reach administrators right now. Try again later."),
-            parse_mode="HTML"
-        )
-
-
-async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Update YouTube cookies by sending a cookies.txt file or pasting content."""
-    user = update.effective_user
-    if not user:
-        return
-
-    if update.effective_chat.type != "private":
-        await update.message.reply_text(
-            fmt_error("This command can only be used in private chat for security."),
-            parse_mode="HTML"
-        )
-        return
-
-    cookie_content = None
-
-    doc = update.message.document or (update.message.reply_to_message.document if update.message.reply_to_message else None)
-    if doc:
-        is_explicit_cmd = (update.message.text and update.message.text.startswith("/setcookies")) or \
-                           (update.message.caption and "/setcookies" in update.message.caption)
-        if not is_explicit_cmd and doc.file_name and not doc.file_name.lower().endswith(".txt"):
-            return
-
-        try:
-            file = await context.bot.get_file(doc.file_id)
-            raw = await file.download_as_bytearray()
-            cookie_content = raw.decode("utf-8")
-        except Exception as e:
-            await update.message.reply_text(
-                fmt_error(f"Failed to read file: {e}"),
-                parse_mode="HTML"
-            )
-            return
-
-    elif context.args:
-        cookie_content = " ".join(context.args)
-
-    if not cookie_content:
-        await update.message.reply_text(
-            fmt_card("🍪 Update YouTube Cookies",
-                "Send your <code>cookies.txt</code> file to this chat,\n"
-                "then reply to it with /setcookies\n\n"
-                "Or paste cookie content directly:\n"
-                "<code>/setcookies &lt;paste here&gt;</code>\n\n"
-                "<i>Use the 'Get cookies.txt LOCALLY' browser\n"
-                "extension, or run refresh_cookies.py locally.</i>"
-            ),
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-        tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        with open(tmp_cookie_path, "w", encoding="utf-8") as f:
-            f.write(cookie_content.strip())
-        set_youtube_cookies_file(tmp_cookie_path)
-
-        cookie_lines = [l for l in cookie_content.strip().split('\n') if l.strip() and not l.startswith('#')]
-        cookie_count = len(cookie_lines)
-
-        await update.message.reply_text(
-            fmt_success(
-                f"YouTube cookies updated! ({cookie_count} cookies loaded)\n\n"
-                "These will be used for future YouTube downloads."
-            ),
-            parse_mode="HTML"
-        )
-        logger.info(f"YouTube cookies updated via /setcookies by user {user.id} ({cookie_count} cookies)")
-    except Exception as e:
-        logger.error(f"Failed to update cookies via /setcookies: {e}")
-        await update.message.reply_text(
-            fmt_error(f"Failed to save cookies: {e}"),
             parse_mode="HTML"
         )
 

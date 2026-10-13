@@ -504,8 +504,11 @@ def generate_quote_card(
         new_w = max(int(w * (STICKER_SIZE / h)), 1)
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    buffer = io.BytesIO()
-    img.save(buffer, format="WEBP", quality=95)
+    for q in (95, 85, 75, 60, 45):
+        buffer = io.BytesIO()
+        img.save(buffer, format="WEBP", quality=q)
+        if buffer.tell() <= 512 * 1024:
+            return buffer.getvalue()
     return buffer.getvalue()
 
 
@@ -514,23 +517,23 @@ def generate_quote_card(
 def image_to_sticker(image_bytes: bytes) -> bytes:
     """
     Convert an image to a 512px WEBP sticker without any card frame.
-    Preserves aspect ratio — no stretching.
+    Preserves aspect ratio — no stretching. Ensures output <= 512KB for Telegram.
     """
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     w, h = img.size
 
-    # Scale so the longest side is 512px, preserving aspect ratio
-    if w >= h:
-        new_w = STICKER_SIZE
-        new_h = int(h * (STICKER_SIZE / w))
-    else:
-        new_h = STICKER_SIZE
-        new_w = int(w * (STICKER_SIZE / h))
+    scale = STICKER_SIZE / max(w, h)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
 
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    buffer = io.BytesIO()
-    img.save(buffer, format="WEBP", quality=95)
+    for q in (95, 85, 75, 60, 45):
+        buffer = io.BytesIO()
+        img.save(buffer, format="WEBP", quality=q)
+        if buffer.tell() <= 512 * 1024:
+            return buffer.getvalue()
+
     return buffer.getvalue()
 
 

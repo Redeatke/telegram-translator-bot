@@ -538,8 +538,11 @@ async def _extract_author_and_avatar(bot, msg) -> tuple[str, Optional[bytes]]:
     return author_name, avatar_bytes
 
 
-async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False) -> str:
-    """Find existing pack or create a new one. Returns the pack name. Handles full packs and user isolation."""
+async def _find_or_create_sticker_pack(bot, user, sticker_input, is_video=False, emoji: Optional[str] = None) -> str:
+    """Find existing pack or create a new one. Returns the pack name.
+    sticker_input can be bytes (raw data) or str (existing Telegram file_id).
+    Handles full packs, emoji assignment, and user isolation.
+    """
     from telegram import InputSticker
     from telegram.constants import StickerFormat
 
@@ -548,9 +551,10 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
     user_name = user.first_name or "User"
 
     sticker_format = StickerFormat.VIDEO if is_video else StickerFormat.STATIC
+    emoji_list = [emoji] if emoji else ["💬"]
     input_sticker = InputSticker(
-        sticker=sticker_bytes,
-        emoji_list=["💬"],
+        sticker=sticker_input,
+        emoji_list=emoji_list,
         format=sticker_format,
     )
 
@@ -564,8 +568,13 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
         try:
             sticker_set = await bot.get_sticker_set(pack_name)
             exists = True
-        except Exception:
-            exists = False
+        except Exception as set_err:
+            set_err_str = str(set_err).lower()
+            if "stickerset_invalid" in set_err_str or "not found" in set_err_str or "invalidtoken" in set_err_str:
+                exists = False
+            else:
+                logger.warning(f"Error checking pack '{pack_name}': {type(set_err).__name__}: {set_err}")
+                exists = False
 
         if exists and sticker_set:
             if len(sticker_set.stickers) >= quote_sticker.MAX_STICKERS_PER_PACK:
@@ -582,7 +591,7 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
                 err_str = str(e).lower()
                 if "stickers_too_much" in err_str or "full" in err_str:
                     continue
-                logger.error(f"Failed to add sticker to existing pack '{pack_name}': {e}")
+                logger.error(f"Failed to add sticker to existing pack '{pack_name}': {type(e).__name__}: {e}")
                 raise e
         else:
             # Create new pack
@@ -595,7 +604,7 @@ async def _find_or_create_sticker_pack(bot, user, sticker_bytes, is_video=False)
                 )
                 return pack_name
             except Exception as e2:
-                logger.error(f"Failed to create new sticker pack '{pack_name}': {e2}")
+                logger.error(f"Failed to create new sticker pack '{pack_name}': {type(e2).__name__}: {e2}")
                 raise e2
 
     raise RuntimeError("Could not find or create a sticker pack")
@@ -719,6 +728,14 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
         if should_convert_media:
             # ── 1. Video sticker ──
             if video_obj:
+                v_size = getattr(video_obj, "file_size", None)
+                if v_size and v_size > 20 * 1024 * 1024:
+                    await msg.reply_text(
+                        fmt_error(f"Video is too large ({v_size / (1024 * 1024):.1f} MB). Telegram's Bot API limits bot downloads to 20 MB. Please send a shorter or compressed clip."),
+                        parse_mode="HTML"
+                    )
+                    return
+
                 v_start = video_start if video_start is not None else 0.0
                 if video_end is not None:
                     v_end = video_end
@@ -784,6 +801,7 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
             # ── 3. Sticker reply → add to pack (fetch from another pack) ──
             if sticker_obj:
                 stk = sticker_obj
+                stk_emoji = stk.emoji or "💬"
                 if stk.is_animated:
                     await msg.reply_text(
                         fmt_warning("⚠️ Telegram animated (.tgs vector) stickers cannot be added to standard packs.\n\nOnly static image stickers, photos, videos, and quote cards can be added."),
@@ -791,18 +809,36 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
                     )
                     return
 
-                tg_file = await context.bot.get_file(stk.file_id)
-                raw_bytes = bytes(await tg_file.download_as_bytearray())
+                # Prefer passing stk.file_id directly to Telegram.
+                # Telegram's servers already hold the file, avoiding get_file 404 / 'Not Found' errors.
+                pack_name = None
+                try:
+                    pack_name = await _find_or_create_sticker_pack(
+                        context.bot, user, stk.file_id, is_video=stk.is_video, emoji=stk_emoji
+                    )
+                except Exception as direct_err:
+                    logger.warning(f"Direct file_id sticker copy failed ({direct_err}), falling back to download and re-encode...")
+                    tg_file = await context.bot.get_file(stk.file_id)
+                    raw_bytes = bytes(await tg_file.download_as_bytearray())
 
-                if stk.is_video:
-                    pack_name = await _find_or_create_sticker_pack(
-                        context.bot, user, raw_bytes, is_video=True
-                    )
-                else:
-                    sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
-                    pack_name = await _find_or_create_sticker_pack(
-                        context.bot, user, sticker_bytes, is_video=False
-                    )
+                    if stk.is_video:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_v:
+                            tmp_v.write(raw_bytes)
+                            tmp_v_path = tmp_v.name
+                        try:
+                            encoded_bytes = await quote_sticker.video_to_sticker(tmp_v_path, 0, 3)
+                        finally:
+                            if os.path.exists(tmp_v_path):
+                                os.remove(tmp_v_path)
+                        pack_name = await _find_or_create_sticker_pack(
+                            context.bot, user, encoded_bytes or raw_bytes, is_video=True, emoji=stk_emoji
+                        )
+                    else:
+                        sticker_bytes = quote_sticker.image_to_sticker(raw_bytes)
+                        pack_name = await _find_or_create_sticker_pack(
+                            context.bot, user, sticker_bytes, is_video=False, emoji=stk_emoji
+                        )
 
                 sticker_set = await context.bot.get_sticker_set(pack_name)
                 last_sticker = sticker_set.stickers[-1]
@@ -860,11 +896,11 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
         bot_username = bot_me.username or "R3dSter_Bot"
 
         # Only show the DM-start prompt for genuine bot-blocked / user-not-reachable errors.
-        # Avoid false positives from pack-not-found lookups (which also say "not found").
         _dm_required_keywords = [
             "forbidden", "bot was blocked", "user_is_blocked",
             "bot can't initiate", "peer_id_invalid",
             "user not participant", "chat_write_forbidden",
+            "user not found",
         ]
         if any(k in err_str for k in _dm_required_keywords):
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -881,7 +917,7 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
             )
         else:
             await msg.reply_text(
-                fmt_error(f"Failed to create sticker: <i>{html.escape(str(e)[:200])}</i>"),
+                fmt_error(f"Failed to create sticker: <i>{html.escape(f'{type(e).__name__}: {str(e)[:200]}')}</i>"),
                 parse_mode="HTML"
             )
 
@@ -1052,9 +1088,13 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f.write(cached_bytes)
 
         # 2. Telegram download (<= 20MB)
+        download_err_detail = None
         if not input_video_path and video:
             file_size = getattr(video, "file_size", None)
-            if not file_size or file_size <= 20 * 1024 * 1024:
+            if file_size and file_size > 20 * 1024 * 1024:
+                download_err_detail = f"Video is {file_size / (1024 * 1024):.1f} MB (exceeds Telegram Bot API's 20 MB limit)"
+                logger.warning(f"/gif download skipped: {download_err_detail}")
+            else:
                 try:
                     tg_file = await asyncio.wait_for(context.bot.get_file(video.file_id), timeout=45.0)
                     input_video_path = os.path.join(tmp_dir, "input.mp4")
@@ -1075,7 +1115,8 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     else:
                         input_video_path = None
                 except Exception as e:
-                    logger.warning(f"Telegram file download failed for /gif ({type(e).__name__}: {e})")
+                    download_err_detail = f"{type(e).__name__}: {e}"
+                    logger.warning(f"/gif download failed: {type(e).__name__}: {e} | file_size={getattr(video, 'file_size', None)}")
                     input_video_path = None
 
         # 3. Fallback URL download (Twitter, Instagram, TikTok, Reddit, YouTube, Direct)
@@ -1086,11 +1127,21 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     timeout=60.0
                 )
             except Exception as e:
+                download_err_detail = f"URL download failed: {e}"
                 logger.error(f"URL video download failed for /gif ({fallback_url}): {e}")
                 input_video_path = None
 
         if not input_video_path or not os.path.exists(input_video_path):
-            err_msg = "Failed to retrieve video. Ensure the video is under 20MB or the link is publicly accessible."
+            if download_err_detail and "exceeds" in download_err_detail:
+                err_msg = (
+                    f"<b>Video is too large:</b> {download_err_detail}.\n\n"
+                    "Telegram's official Bot API server enforces a strict <b>20 MB</b> download limit for bots.\n"
+                    "💡 <i>Tip: Send the video with Telegram compression enabled, or use a web link (Twitter, Instagram, etc.).</i>"
+                )
+            elif download_err_detail:
+                err_msg = f"Failed to retrieve video: <i>{html.escape(download_err_detail)}</i>"
+            else:
+                err_msg = "Failed to retrieve video. Ensure the video is under 20MB or the link is publicly accessible."
             try:
                 await status_msg.edit_text(fmt_error(err_msg), parse_mode="HTML")
             except Exception:

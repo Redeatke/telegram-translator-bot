@@ -685,7 +685,8 @@ async def convert_video_to_animation(
         logger.warning(f"convert_video_to_animation: no video stream detected in {video_path!r}, skipping.")
         return False
 
-    # HLS / network protocol whitelist flags (harmless for regular MP4 files too)
+    # HLS / network protocol whitelist flags — must be GLOBAL options (before -y/-nostdin)
+    # so ffmpeg accepts them for both local MP4 files and HLS .m3u8 playlists.
     protocol_flags = [
         "-allowed_extensions", "ALL",
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
@@ -694,8 +695,9 @@ async def convert_video_to_animation(
     # Standard H.264 silent MP4 animation filter (preserves aspect ratio and ensures even dimensions for yuv420p)
     scale_expr = f"scale=w={max_dim}:h={max_dim}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
     cmd_mp4 = [
-        "ffmpeg", "-y", "-nostdin",
-        *protocol_flags,
+        "ffmpeg",
+        *protocol_flags,   # global options FIRST, before -y/-nostdin/-i
+        "-y", "-nostdin",
         "-i", video_path,
     ]
     if start_sec > 0.05:
@@ -720,8 +722,9 @@ async def convert_video_to_animation(
     # Fallback: Direct GIF conversion if H.264 is unavailable
     gif_path = os.path.splitext(output_path)[0] + ".gif"
     cmd_gif = [
-        "ffmpeg", "-y", "-nostdin",
-        *protocol_flags,
+        "ffmpeg",
+        *protocol_flags,   # global options FIRST
+        "-y", "-nostdin",
         "-i", video_path,
     ]
     if start_sec > 0.05:

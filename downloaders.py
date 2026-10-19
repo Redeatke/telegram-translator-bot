@@ -808,8 +808,11 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
         logger.info(f"Downloading {platform_name} video: {url}...")
         ydl_opts = {
             'outtmpl': output_template,
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            # Prefer a direct progressive MP4 stream; fall back to merging best video+audio into MP4.
+            # Explicitly avoid HLS-only selections that leave ffmpeg with a .m3u8 playlist file.
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
+            'hls_prefer_native': False,   # use ffmpeg for HLS muxing — produces a proper MP4 on disk
             'socket_timeout': 20,
             'retries': 3,
             'quiet': True,

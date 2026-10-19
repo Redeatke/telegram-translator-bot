@@ -652,10 +652,50 @@ async def convert_video_to_animation(
     start_sec = max(0.0, float(start_sec))
     duration = min(float(duration), 15.0)
 
+    loop = asyncio.get_running_loop()
+
+    def _run_cmd(c):
+        res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30.0)
+        if res.returncode != 0:
+            logger.warning(f"FFmpeg animation failed (rc={res.returncode}): {res.stderr.decode(errors='ignore')[-300:]}")
+        return res.returncode == 0
+
+    # Pre-check: confirm the input file actually has a video stream before spending time on conversion
+    def _probe_has_video():
+        try:
+            res = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-allowed_extensions", "ALL",
+                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_type",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    video_path,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0,
+            )
+            return b"video" in res.stdout
+        except Exception as probe_err:
+            logger.warning(f"ffprobe pre-check failed ({probe_err}), attempting conversion anyway")
+            return True  # optimistic: let ffmpeg try
+
+    has_video = await loop.run_in_executor(None, _probe_has_video)
+    if not has_video:
+        logger.warning(f"convert_video_to_animation: no video stream detected in {video_path!r}, skipping.")
+        return False
+
+    # HLS / network protocol whitelist flags (harmless for regular MP4 files too)
+    protocol_flags = [
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
+    ]
+
     # Standard H.264 silent MP4 animation filter (preserves aspect ratio and ensures even dimensions for yuv420p)
     scale_expr = f"scale=w={max_dim}:h={max_dim}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
     cmd_mp4 = [
         "ffmpeg", "-y", "-nostdin",
+        *protocol_flags,
         "-i", video_path,
     ]
     if start_sec > 0.05:
@@ -673,13 +713,6 @@ async def convert_video_to_animation(
         output_path,
     ])
 
-    loop = asyncio.get_running_loop()
-    def _run_cmd(c):
-        res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30.0)
-        if res.returncode != 0:
-            logger.warning(f"FFmpeg animation failed (rc={res.returncode}): {res.stderr.decode(errors='ignore')[-300:]}")
-        return res.returncode == 0
-
     ok = await loop.run_in_executor(None, lambda: _run_cmd(cmd_mp4))
     if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return True
@@ -688,6 +721,7 @@ async def convert_video_to_animation(
     gif_path = os.path.splitext(output_path)[0] + ".gif"
     cmd_gif = [
         "ffmpeg", "-y", "-nostdin",
+        *protocol_flags,
         "-i", video_path,
     ]
     if start_sec > 0.05:
@@ -709,6 +743,7 @@ async def convert_video_to_animation(
         except Exception:
             pass
     return False
+
 
 
 async def extract_audio_from_video(

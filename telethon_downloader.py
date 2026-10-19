@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _client = None
-_client_lock = asyncio.Lock()
+_client_lock = None  # lazily initialized inside get_telethon_client() once a loop is running
 
 
 def get_telethon_credentials() -> Tuple[Optional[int], Optional[str], Optional[str]]:
@@ -53,7 +53,10 @@ def is_telethon_available() -> bool:
 
 async def get_telethon_client():
     """Lazily initialize and connect the Telethon MTProto bot client."""
-    global _client
+    global _client, _client_lock
+    # Lazily create the lock the first time we're called inside a running loop
+    if _client_lock is None:
+        _client_lock = asyncio.Lock()
     if _client is not None and _client.is_connected():
         return _client
 

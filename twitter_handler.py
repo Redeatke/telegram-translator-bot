@@ -79,8 +79,23 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                     media = raw_tweet.get("media") or {}
                     quote_media = quote.get("media") or {}
 
-                    videos = (media.get("videos") or []) + (quote_media.get("videos") or [])
-                    photos = (media.get("photos") or []) + (quote_media.get("photos") or [])
+                    # Tag each video/photo with its source so yt-dlp fallback uses the right URL
+                    main_videos = media.get("videos") or []
+                    quote_videos = quote_media.get("videos") or []
+                    for v in quote_videos:
+                        v["_from_quote"] = True
+                    videos = main_videos + quote_videos
+
+                    main_photos = media.get("photos") or []
+                    quote_photos = quote_media.get("photos") or []
+                    photos = main_photos + quote_photos
+
+                    # Build the quote tweet URL for yt-dlp fallback
+                    quote_url = quote.get("url") or ""
+                    if not quote_url and quote.get("id"):
+                        q_screen = (quote.get("author") or {}).get("screen_name", "")
+                        if q_screen:
+                            quote_url = f"https://x.com/{q_screen}/status/{quote['id']}"
 
                     tweet_data = {
                         "author_name": author.get("name") or username,
@@ -96,6 +111,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                         "views": raw_tweet.get("views"),
                         "url": raw_tweet.get("url") or f"https://x.com/{username}/status/{tweet_id}",
                         "quote": quote,
+                        "quote_url": quote_url,
                         "videos": videos,
                         "photos": photos,
                     }
@@ -199,30 +215,44 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                 logger.warning(f"Direct Twitter video download failed for @{username}/{tweet_id}: {e}")
 
         if not video_bytes:
-            try:
-                loop = asyncio.get_running_loop()
-                def _yt_dlp_tw():
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
-                        ydl_opts = {
-                            "outtmpl": out_template,
-                            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                            "quiet": True,
-                            "no_warnings": True,
-                        }
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.extract_info(tweet_url, download=True)
-                        for f in os.listdir(tmp_dir):
-                            if f.endswith((".mp4", ".mkv", ".webm")):
-                                with open(os.path.join(tmp_dir, f), "rb") as vf:
-                                    return vf.read()
-                        return None
+            # If video comes from a quote tweet, try the quote URL first for yt-dlp,
+            # then fall back to the main tweet URL
+            is_from_quote = v_obj.get("_from_quote", False)
+            quote_tweet_url = tweet_data.get("quote_url", "")
+            yt_dlp_urls = []
+            if is_from_quote and quote_tweet_url:
+                yt_dlp_urls.append(quote_tweet_url)
+            yt_dlp_urls.append(tweet_url)
 
-                tw_b = await loop.run_in_executor(None, _yt_dlp_tw)
-                if tw_b and len(tw_b) <= 50 * 1024 * 1024:
-                    video_bytes = tw_b
-            except Exception as e:
-                logger.error(f"yt-dlp fallback failed for Twitter video @{username}/{tweet_id}: {e}")
+            for dl_url in yt_dlp_urls:
+                try:
+                    loop = asyncio.get_running_loop()
+                    def _yt_dlp_tw(target_url=dl_url):
+                        with tempfile.TemporaryDirectory() as tmp_dir:
+                            out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+                            ydl_opts = {
+                                "outtmpl": out_template,
+                                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                                "quiet": True,
+                                "no_warnings": True,
+                            }
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                ydl.extract_info(target_url, download=True)
+                            for f in os.listdir(tmp_dir):
+                                if f.endswith((".mp4", ".mkv", ".webm")):
+                                    with open(os.path.join(tmp_dir, f), "rb") as vf:
+                                        return vf.read()
+                            return None
+
+                    tw_b = await loop.run_in_executor(None, _yt_dlp_tw)
+                    if tw_b and len(tw_b) <= 50 * 1024 * 1024:
+                        video_bytes = tw_b
+                        break
+                except Exception as e:
+                    logger.warning(f"yt-dlp fallback failed for {dl_url}: {e}")
+
+            if not video_bytes:
+                logger.error(f"All yt-dlp fallback attempts failed for Twitter video @{username}/{tweet_id}")
 
         if video_bytes:
             try:

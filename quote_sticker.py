@@ -637,17 +637,35 @@ async def video_to_sticker(
 
 # ─── Video to GIF ──────────────────────────────────────────────────────────────
 
+def probe_has_audio(video_path: str) -> bool:
+    """Quick check if input media contains an audio stream."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_path,
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5.0)
+        return res.returncode == 0 and b"audio" in res.stdout
+    except Exception as e:
+        logger.debug(f"probe_has_audio exception: {e}")
+        return False
+
+
 async def convert_video_to_animation(
     video_path: str,
     output_path: str,
     start_sec: float = 0.0,
     duration: float = 10.0,
     max_dim: int = 480,
-) -> bool:
+) -> Tuple[bool, Optional[str]]:
     """
     Convert video to a fast, lightweight soundless H.264 animation for Telegram's reply_animation.
     Telegram natively renders silent H.264 MP4 videos as looping GIFs (with the GIF badge).
-    Ultra-fast (<0.2s), tiny file size, 100% reliable across all devices and aspect ratios.
+    Ultra-fast (<0.5s), tiny file size, 100% reliable across all devices and aspect ratios.
+    Returns (success: bool, error_message: Optional[str]).
     """
     start_sec = max(0.0, float(start_sec))
     duration = min(float(duration), 15.0)
@@ -655,64 +673,41 @@ async def convert_video_to_animation(
     loop = asyncio.get_running_loop()
 
     def _run_cmd(c):
-        res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30.0)
-        if res.returncode != 0:
-            logger.warning(f"FFmpeg animation failed (rc={res.returncode}): {res.stderr.decode(errors='ignore')[-300:]}")
-        return res.returncode == 0
-
-    # Pre-check: confirm the input file actually has a video stream before spending time on conversion
-    def _probe_has_video():
         try:
-            probe_cmd = [
-                "ffprobe", "-v", "error",
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
-            ]
-            if ".m3u8" in video_path.lower():
-                probe_cmd.extend(["-allowed_extensions", "ALL"])
-            probe_cmd.extend([
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                video_path,
-            ])
-            res = subprocess.run(
-                probe_cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0,
-            )
-            if res.returncode == 0:
-                return b"video" in res.stdout
-            return True  # If ffprobe exited with error or unrecognized format, let ffmpeg attempt conversion
-        except Exception as probe_err:
-            logger.warning(f"ffprobe pre-check failed ({probe_err}), attempting conversion anyway")
-            return True  # optimistic: let ffmpeg try
+            res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=25.0)
+            stderr_text = res.stderr.decode(errors="ignore").strip()
+            if res.returncode != 0:
+                logger.error(f"FFmpeg animation failed (rc={res.returncode}):\nCmd: {' '.join(c)}\nStderr: {stderr_text}")
+                return False, stderr_text
+            return True, None
+        except subprocess.TimeoutExpired:
+            err = "FFmpeg conversion timed out after 25s"
+            logger.error(err)
+            return False, err
+        except Exception as e:
+            err = f"Execution error: {e}"
+            logger.error(err, exc_info=True)
+            return False, err
 
-    has_video = await loop.run_in_executor(None, _probe_has_video)
-    if not has_video:
-        logger.warning(f"convert_video_to_animation: no video stream detected in {video_path!r}, skipping.")
-        return False
+    # Extra network protocol flags only if reading from a remote/HLS playlist URL
+    extra_input_flags = []
+    if video_path.lower().startswith(("http://", "https://")) or ".m3u8" in video_path.lower():
+        extra_input_flags.extend(["-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp"])
+        if ".m3u8" in video_path.lower():
+            extra_input_flags.extend(["-allowed_extensions", "ALL"])
 
-    # Protocol whitelist flags for ffmpeg.
-    # Note: -allowed_extensions is a demuxer-specific option for HLS (.m3u8).
-    # Passing it on standard files (MP4, WebM, etc.) causes ffmpeg to fail with 'Option not found'.
-    protocol_flags = [
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
-    ]
-    if ".m3u8" in video_path.lower():
-        protocol_flags.extend(["-allowed_extensions", "ALL"])
-
-    # Standard H.264 silent MP4 animation filter (preserves aspect ratio and ensures even dimensions for yuv420p)
-    scale_expr = f"scale=w={max_dim}:h={max_dim}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
-    cmd_mp4 = [
-        "ffmpeg",
-        "-y", "-nostdin",
-        *protocol_flags,
-        "-i", video_path,
-    ]
+    # 1. Primary: Fast H.264 silent MP4 with input seeking (-ss before -i)
+    # -map 0:V:0? selects the primary moving video stream, ignoring cover/thumbnail images
+    scale_expr = f"scale='min({max_dim},iw)':-2"
+    cmd_mp4 = ["ffmpeg", "-y", "-nostdin"]
+    if extra_input_flags:
+        cmd_mp4.extend(extra_input_flags)
     if start_sec > 0.05:
         cmd_mp4.extend(["-ss", str(start_sec)])
     cmd_mp4.extend([
+        "-i", video_path,
         "-t", str(duration),
-        "-map", "0:v:0",
+        "-map", "0:V:0?",
         "-an",
         "-vf", scale_expr,
         "-c:v", "libx264",
@@ -723,38 +718,37 @@ async def convert_video_to_animation(
         output_path,
     ])
 
-    ok = await loop.run_in_executor(None, lambda: _run_cmd(cmd_mp4))
+    ok, err_detail = await loop.run_in_executor(None, lambda: _run_cmd(cmd_mp4))
     if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        return True
+        return True, None
 
-    # Fallback: Direct GIF conversion if H.264 is unavailable
+    # 2. Fallback: Direct GIF conversion if H.264 MP4 is unavailable
+    logger.warning(f"H.264 animation failed, attempting GIF fallback. Primary error: {err_detail}")
     gif_path = os.path.splitext(output_path)[0] + ".gif"
-    cmd_gif = [
-        "ffmpeg",
-        "-y", "-nostdin",
-        *protocol_flags,
-        "-i", video_path,
-    ]
+    cmd_gif = ["ffmpeg", "-y", "-nostdin"]
+    if extra_input_flags:
+        cmd_gif.extend(extra_input_flags)
     if start_sec > 0.05:
         cmd_gif.extend(["-ss", str(start_sec)])
     cmd_gif.extend([
+        "-i", video_path,
         "-t", str(duration),
-        "-map", "0:v:0",
-        "-vf", f"fps=12,scale=w=360:h=360:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-map", "0:V:0?",
+        "-vf", "fps=12,scale='min(360,iw)':-2",
         "-loop", "0",
         gif_path,
     ])
-    ok_gif = await loop.run_in_executor(None, lambda: _run_cmd(cmd_gif))
+    ok_gif, gif_err = await loop.run_in_executor(None, lambda: _run_cmd(cmd_gif))
     if ok_gif and os.path.exists(gif_path) and os.path.getsize(gif_path) > 0:
         try:
             if os.path.exists(output_path):
                 os.remove(output_path)
             os.rename(gif_path, output_path)
-            return True
+            return True, None
         except Exception:
             pass
-    return False
 
+    return False, err_detail or gif_err or "Unknown FFmpeg encoding failure"
 
 
 async def extract_audio_from_video(
@@ -770,13 +764,11 @@ async def extract_audio_from_video(
     start_sec = max(0.0, float(start_sec))
     duration = min(float(duration), 15.0)
 
-    cmd = [
-        "ffmpeg", "-y", "-nostdin",
-        "-i", video_path,
-    ]
+    cmd = ["ffmpeg", "-y", "-nostdin"]
     if start_sec > 0.05:
         cmd.extend(["-ss", str(start_sec)])
     cmd.extend([
+        "-i", video_path,
         "-t", str(duration),
         "-vn",
         "-c:a", "libmp3lame",
@@ -786,7 +778,9 @@ async def extract_audio_from_video(
 
     loop = asyncio.get_running_loop()
     def _run():
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=25.0)
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20.0)
+        if res.returncode != 0:
+            logger.warning(f"Audio extraction failed (rc={res.returncode}): {res.stderr.decode(errors='ignore')[-200:]}")
         return res.returncode == 0 and os.path.exists(output_audio_path) and os.path.getsize(output_audio_path) > 0
 
     try:
@@ -807,7 +801,7 @@ async def video_to_gif(
     duration = (float(end_sec) - float(start_sec)) if end_sec else 10.0
     out = os.path.join(tempfile.gettempdir(), f"anim_{uuid.uuid4().hex[:10]}.mp4")
     try:
-        ok = await convert_video_to_animation(video_path, out, start_sec, duration, max_width)
+        ok, _ = await convert_video_to_animation(video_path, out, start_sec, duration, max_width)
         if ok and os.path.exists(out):
             with open(out, "rb") as f:
                 return f.read()

@@ -1249,9 +1249,10 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         output_anim_path = os.path.join(tmp_dir, "animation.mp4")
         output_audio_path = os.path.join(tmp_dir, "audio.mp3")
 
+        err_detail = None
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
-            success = await quote_sticker.convert_video_to_animation(
+            success, err_detail = await quote_sticker.convert_video_to_animation(
                 input_video_path,
                 output_anim_path,
                 start_sec=start_sec,
@@ -1260,24 +1261,27 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             logger.error(f"Animation conversion error: {e}", exc_info=True)
             success = False
+            err_detail = str(e)
 
-        # Extract audio track if present
+        # Extract audio track only if input actually contains an audio stream
         has_audio = False
-        try:
-            has_audio = await quote_sticker.extract_audio_from_video(
-                input_video_path,
-                output_audio_path,
-                start_sec=start_sec,
-                duration=duration,
-            )
-        except Exception as e:
-            logger.warning(f"Audio extraction failed: {e}")
-            has_audio = False
+        if quote_sticker.probe_has_audio(input_video_path):
+            try:
+                has_audio = await quote_sticker.extract_audio_from_video(
+                    input_video_path,
+                    output_audio_path,
+                    start_sec=start_sec,
+                    duration=duration,
+                )
+            except Exception as e:
+                logger.warning(f"Audio extraction failed: {e}")
+                has_audio = False
 
         if not success or not os.path.exists(output_anim_path) or os.path.getsize(output_anim_path) == 0:
+            err_snippet = f":\n<code>{html.escape(err_detail[-250:])}</code>" if err_detail else ""
             try:
                 await status_msg.edit_text(
-                    fmt_error("Failed to convert video to GIF. The video format may be incompatible or damaged."),
+                    fmt_error(f"Failed to convert video to GIF{err_snippet}"),
                     parse_mode="HTML"
                 )
             except Exception:

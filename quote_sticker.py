@@ -663,19 +663,25 @@ async def convert_video_to_animation(
     # Pre-check: confirm the input file actually has a video stream before spending time on conversion
     def _probe_has_video():
         try:
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
+            ]
+            if ".m3u8" in video_path.lower():
+                probe_cmd.extend(["-allowed_extensions", "ALL"])
+            probe_cmd.extend([
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ])
             res = subprocess.run(
-                [
-                    "ffprobe", "-v", "error",
-                    "-allowed_extensions", "ALL",
-                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=codec_type",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    video_path,
-                ],
+                probe_cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0,
             )
-            return b"video" in res.stdout
+            if res.returncode == 0:
+                return b"video" in res.stdout
+            return True  # If ffprobe exited with error or unrecognized format, let ffmpeg attempt conversion
         except Exception as probe_err:
             logger.warning(f"ffprobe pre-check failed ({probe_err}), attempting conversion anyway")
             return True  # optimistic: let ffmpeg try
@@ -685,19 +691,21 @@ async def convert_video_to_animation(
         logger.warning(f"convert_video_to_animation: no video stream detected in {video_path!r}, skipping.")
         return False
 
-    # HLS / network protocol whitelist flags — must be GLOBAL options (before -y/-nostdin)
-    # so ffmpeg accepts them for both local MP4 files and HLS .m3u8 playlists.
+    # Protocol whitelist flags for ffmpeg.
+    # Note: -allowed_extensions is a demuxer-specific option for HLS (.m3u8).
+    # Passing it on standard files (MP4, WebM, etc.) causes ffmpeg to fail with 'Option not found'.
     protocol_flags = [
-        "-allowed_extensions", "ALL",
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls,applehttp",
     ]
+    if ".m3u8" in video_path.lower():
+        protocol_flags.extend(["-allowed_extensions", "ALL"])
 
     # Standard H.264 silent MP4 animation filter (preserves aspect ratio and ensures even dimensions for yuv420p)
     scale_expr = f"scale=w={max_dim}:h={max_dim}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
     cmd_mp4 = [
         "ffmpeg",
-        *protocol_flags,   # global options FIRST, before -y/-nostdin/-i
         "-y", "-nostdin",
+        *protocol_flags,
         "-i", video_path,
     ]
     if start_sec > 0.05:
@@ -723,8 +731,8 @@ async def convert_video_to_animation(
     gif_path = os.path.splitext(output_path)[0] + ".gif"
     cmd_gif = [
         "ffmpeg",
-        *protocol_flags,   # global options FIRST
         "-y", "-nostdin",
+        *protocol_flags,
         "-i", video_path,
     ]
     if start_sec > 0.05:

@@ -711,7 +711,7 @@ async def convert_video_to_animation(
         "-an",
         "-vf", scale_expr,
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "ultrafast",
         "-crf", "26",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",

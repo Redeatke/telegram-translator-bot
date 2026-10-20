@@ -1245,9 +1245,8 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await msg.reply_text(fmt_error(err_msg), parse_mode="HTML")
             return
 
-        # 4. Convert video to Animation (clean H.264 silent MP4 / GIF) & extract audio track
+        # 4. Convert video to Animation (clean H.264 silent MP4 / GIF)
         output_anim_path = os.path.join(tmp_dir, "animation.mp4")
-        output_audio_path = os.path.join(tmp_dir, "audio.mp3")
 
         err_detail = None
         try:
@@ -1262,20 +1261,6 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.error(f"Animation conversion error: {e}", exc_info=True)
             success = False
             err_detail = str(e)
-
-        # Extract audio track only if input actually contains an audio stream
-        has_audio = False
-        if quote_sticker.probe_has_audio(input_video_path):
-            try:
-                has_audio = await quote_sticker.extract_audio_from_video(
-                    input_video_path,
-                    output_audio_path,
-                    start_sec=start_sec,
-                    duration=duration,
-                )
-            except Exception as e:
-                logger.warning(f"Audio extraction failed: {e}")
-                has_audio = False
 
         if not success or not os.path.exists(output_anim_path) or os.path.getsize(output_anim_path) == 0:
             err_snippet = f":\n<code>{html.escape(err_detail[-250:])}</code>" if err_detail else ""
@@ -1325,32 +1310,6 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     except Exception:
                         pass
                     return
-
-        # 6. If original video had audio, send extracted audio as a separate file
-        if has_audio and os.path.exists(output_audio_path) and os.path.getsize(output_audio_path) > 0:
-            try:
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_voice")
-                with open(output_audio_path, "rb") as a_file:
-                    await msg.reply_audio(
-                        audio=a_file,
-                        filename="audio.mp3",
-                        title="Audio Clip",
-                        performer="Extracted Audio",
-                        caption="🎵 Extracted audio from video",
-                        reply_to_message_id=msg.message_id,
-                    )
-            except Exception as a_err:
-                logger.warning(f"reply_audio failed ({a_err}), falling back to document")
-                try:
-                    with open(output_audio_path, "rb") as a_file:
-                        await msg.reply_document(
-                            document=a_file,
-                            filename="audio.mp3",
-                            caption="🎵 Extracted audio from video",
-                            reply_to_message_id=msg.message_id,
-                        )
-                except Exception as a_err2:
-                    logger.warning(f"Failed to send extracted audio: {a_err2}")
 
         if anim_sent:
             try:

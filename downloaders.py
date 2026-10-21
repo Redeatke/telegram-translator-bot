@@ -33,6 +33,7 @@ from telegram.ext import ContextTypes
 from config import (
     IS_TERMUX,
     YOUTUBE_COOKIES_FILE,
+    INSTAGRAM_COOKIES_FILE,
     YOUTUBE_PROXY,
     YOUTUBE_RELAY_URL,
     MAX_UPLOAD_SIZE_MB,
@@ -797,7 +798,7 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
 
 # ─── Universal Generic Downloader (TikTok, Instagram, Reddit) ─────────────────
 
-async def download_generic_media(url: str, output_dir: str, platform_name: str = "Media") -> dict:
+async def download_generic_media(url: str, output_dir: str, platform_name: str = "Media", cookiefile: str = None) -> dict:
     """Download video from TikTok, Instagram, Reddit, etc. using yt-dlp. Returns dict with filepath, title, duration, uploader."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
@@ -818,6 +819,8 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
             'quiet': True,
             'nocheckcertificate': True,
         }
+        if cookiefile and os.path.exists(cookiefile):
+            ydl_opts['cookiefile'] = cookiefile
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
@@ -909,6 +912,8 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                     'no_warnings': True,
                     'skip_download': True,
                 }
+                if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
+                    ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
@@ -947,7 +952,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
         return None
 
 
-async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
+async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, cookiefile: str = None) -> None:
     """Execute download and upload for generic media (TikTok, Instagram, Reddit)."""
     if not status_msg:
         status_msg = await target_message.reply_text(f"⏳ Downloading {platform_name} media...", reply_to_message_id=target_message.message_id)
@@ -959,7 +964,7 @@ async def execute_generic_media_download(target_message, url: str, platform_name
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            info = await download_generic_media(url, tmp_dir, platform_name)
+            info = await download_generic_media(url, tmp_dir, platform_name, cookiefile=cookiefile)
             filepath = info['filepath']
             title = info.get('title', f'{platform_name} Media')
             uploader = info.get('uploader', platform_name)
@@ -1009,7 +1014,7 @@ async def execute_generic_media_download(target_message, url: str, platform_name
         error_msg = str(e)
         logger.error(f"{platform_name} download failed for {url}: {type(e).__name__}: {e}")
         try:
-            await status_msg.edit_text(fmt_error(classify_media_error(error_msg)))
+            await status_msg.edit_text(fmt_error(classify_media_error(error_msg)), parse_mode="HTML")
         except Exception:
             pass
 
@@ -1034,6 +1039,8 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
                 'no_warnings': True,
                 'skip_download': True,
             }
+            if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
+                ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
@@ -1063,7 +1070,11 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
         # A single video is handled by the generic yt-dlp downloader, which
         # merges best video+audio and enforces the 50MB size check properly.
         if len(items) == 1 and items[0]['is_video']:
-            await execute_generic_media_download(target_message, url, "Instagram", context, status_msg=status_msg)
+            await execute_generic_media_download(
+                target_message, url, "Instagram", context,
+                status_msg=status_msg,
+                cookiefile=INSTAGRAM_COOKIES_FILE,
+            )
             return
 
         caption = (
@@ -1120,7 +1131,7 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
     except Exception as e:
         logger.error(f"Instagram download failed for {url}: {type(e).__name__}: {e}")
         try:
-            await status_msg.edit_text(fmt_error(classify_media_error(str(e))))
+            await status_msg.edit_text(fmt_error(classify_media_error(str(e))), parse_mode="HTML")
         except Exception:
             pass
 
@@ -1365,7 +1376,7 @@ async def execute_threads_download(target_message, url: str, context: ContextTyp
     except Exception as e:
         logger.error(f"Threads download failed for {url}: {type(e).__name__}: {e}")
         try:
-            await status_msg.edit_text(fmt_error(classify_media_error(str(e))))
+            await status_msg.edit_text(fmt_error(classify_media_error(str(e))), parse_mode="HTML")
         except Exception:
             pass
 

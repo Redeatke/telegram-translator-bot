@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _client = None
-_client_lock = None  # lazily initialized inside get_telethon_client() once a loop is running
+_client_lock: Optional[asyncio.Lock] = None  # lazily initialized once a loop is running
 
 
 def get_telethon_credentials() -> Tuple[Optional[int], Optional[str], Optional[str]]:
@@ -57,6 +57,9 @@ async def get_telethon_client():
     # Lazily create the lock the first time we're called inside a running loop
     if _client_lock is None:
         _client_lock = asyncio.Lock()
+    # Narrow type for the static checker — the branch above guarantees it's set
+    assert _client_lock is not None
+
     if _client is not None and _client.is_connected():
         return _client
 
@@ -87,6 +90,7 @@ async def download_message_media(chat_id: int, message_id: int, output_path: str
     Download media from a Telegram message using Telethon MTProto.
     Bypasses the Bot API 20MB limit and supports files up to 2GB.
     """
+    global _client
     try:
         client = await get_telethon_client()
         if not client:
@@ -104,6 +108,16 @@ async def download_message_media(chat_id: int, message_id: int, output_path: str
         )
 
         return bool(res and os.path.exists(output_path) and os.path.getsize(output_path) > 0)
+
+    except asyncio.TimeoutError:
+        # The download_media coroutine was cancelled by wait_for — the client
+        # connection may be in an inconsistent state, so force a reconnect next time.
+        logger.error(
+            f"Telethon download_media timed out after {timeout}s for "
+            f"{chat_id}:{message_id}. Resetting client for next call."
+        )
+        _client = None
+        return False
     except Exception as e:
         logger.error(f"Telethon download_media failed for {chat_id}:{message_id}: {type(e).__name__}: {e}")
         return False

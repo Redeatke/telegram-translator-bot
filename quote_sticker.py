@@ -670,18 +670,22 @@ async def convert_video_to_animation(
     start_sec = max(0.0, float(start_sec))
     duration = min(float(duration), 15.0)
 
+    # Allow at least 60s, or 8× the clip duration — whichever is greater.
+    # This prevents spurious timeouts for longer clips or slow CPUs/Termux.
+    _ffmpeg_timeout = max(60.0, duration * 8)
+
     loop = asyncio.get_running_loop()
 
     def _run_cmd(c):
         try:
-            res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=25.0)
+            res = subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=_ffmpeg_timeout)
             stderr_text = res.stderr.decode(errors="ignore").strip()
             if res.returncode != 0:
                 logger.error(f"FFmpeg animation failed (rc={res.returncode}):\nCmd: {' '.join(c)}\nStderr: {stderr_text}")
                 return False, stderr_text
             return True, None
         except subprocess.TimeoutExpired:
-            err = "FFmpeg conversion timed out after 25s"
+            err = f"FFmpeg conversion timed out after {_ffmpeg_timeout:.0f}s"
             logger.error(err)
             return False, err
         except Exception as e:

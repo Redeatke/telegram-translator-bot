@@ -157,6 +157,33 @@ def set_youtube_cookies_file(path: str) -> None:
     global YOUTUBE_COOKIES_FILE
     YOUTUBE_COOKIES_FILE = path
 
+# ─── Instagram Cookies Setup ──────────────────────────────────────────────────
+# Instagram requires login for almost all yt-dlp requests since 2025.
+# Set INSTAGRAM_COOKIES env var to a Netscape-format cookie string, or place
+# instagram_cookies.txt next to the bot. Export from your browser with the
+# "Get cookies.txt LOCALLY" extension while logged into instagram.com.
+
+INSTAGRAM_COOKIES_FILE = None
+_ig_cookies_env = os.getenv("INSTAGRAM_COOKIES") or os.getenv("INSTAGRAM_COOKIE")
+if _ig_cookies_env:
+    try:
+        _ig_cookie_path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
+        with open(_ig_cookie_path, "w", encoding="utf-8") as f:
+            f.write(_ig_cookies_env.strip())
+        INSTAGRAM_COOKIES_FILE = _ig_cookie_path
+        logger.info("Loaded Instagram cookies from INSTAGRAM_COOKIES environment variable.")
+    except Exception as e:
+        logger.error(f"Failed to write INSTAGRAM_COOKIES to temp file: {e}")
+elif os.path.exists("instagram_cookies.txt"):
+    INSTAGRAM_COOKIES_FILE = os.path.abspath("instagram_cookies.txt")
+    logger.info("Loaded Instagram cookies from local instagram_cookies.txt file.")
+
+if not INSTAGRAM_COOKIES_FILE:
+    logger.warning(
+        "No Instagram cookies configured. Instagram Reels/posts may fail. "
+        "Set INSTAGRAM_COOKIES env var or place instagram_cookies.txt next to the bot."
+    )
+
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
 YOUTUBE_RELAY_URL = os.getenv("YOUTUBE_RELAY_URL", "").strip().rstrip("/") or None
 
@@ -463,4 +490,6 @@ def classify_media_error(error_str: str) -> str:
     low = error_str.lower()
     if any(marker in low for marker in _RESTRICTED_MEDIA_ERROR_MARKERS):
         return "This content isn't available due to restrictions (private, age-restricted, or region-locked)."
-    return "Failed to download this media. The link may be broken or the content may have been removed."
+    # Include a short snippet of the raw error so the cause is visible for diagnosis.
+    snippet = error_str.strip()[:200]
+    return f"Failed to download this media. The link may be broken or the content may have been removed.\n<code>{snippet}</code>"

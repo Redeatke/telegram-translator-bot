@@ -1010,6 +1010,10 @@ async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ─── GIF Command (/gif) ──────────────────────────────────────────────────────
 
+# Cache of last link or video sent in DM per chat (chat_id -> (url, video_obj, timestamp))
+_last_dm_media: Dict[int, tuple] = {}
+
+
 def _extract_video_media(message):
     """Extract a video, animation, video note, or video document from a Telegram message."""
     if not message:
@@ -1133,6 +1137,15 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         or _extract_url_from_message(replied)
         or _extract_url_from_message(msg)
     )
+
+    # In private chats (DM), if no video/url found, check recently sent media in this DM
+    if not video and not fallback_url and update.effective_chat.type == "private":
+        recent = _last_dm_media.get(update.effective_chat.id)
+        if recent:
+            r_url, r_vid, r_ts = recent
+            if (time.time() - r_ts) < 300:  # within last 5 minutes
+                fallback_url = r_url
+                video = r_vid
 
     if not video and not fallback_url:
         await msg.reply_text(
@@ -1336,7 +1349,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Do not auto-translate if message contains HTTP/HTTPS URLs
     text_lower = update.message.text.lower()
     if "http://" in text_lower or "https://" in text_lower:
+        if update.effective_chat.type == "private":
+            extracted_url = _extract_url_from_message(update.message)
+            if extracted_url:
+                _last_dm_media[update.effective_chat.id] = (extracted_url, None, time.time())
         return
+
+
+async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Track videos, animations, and media in private chats so /gif commands can be sent without replying."""
+    if not update.effective_message or update.effective_chat.type != "private":
+        return
+    msg = update.effective_message
+    vid = _extract_video_media(msg)
+    url = _extract_url_from_message(msg)
+    if vid or url:
+        _last_dm_media[update.effective_chat.id] = (url, vid, time.time())
 
     # Only auto-translate in private chats
     if update.effective_chat.type != "private":
@@ -1768,6 +1796,16 @@ def main() -> None:
 
     # Register text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
+
+    # Register DM media tracker in group 1 (passively tracks media/links in private chats for /gif without interrupting group 0 handlers)
+    application.add_handler(
+        MessageHandler(
+            (filters.VIDEO | filters.ANIMATION | filters.ATTACHMENT | filters.TEXT) & filters.ChatType.PRIVATE,
+            handle_dm_media_tracker,
+            block=False
+        ),
+        group=1
+    )
 
     # Register global error handler (catches unexpected crashes and sends patching notice)
     application.add_error_handler(global_error_handler)

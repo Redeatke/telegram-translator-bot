@@ -76,7 +76,9 @@ async def get_telethon_client():
 
             session_path = os.path.join(tempfile.gettempdir(), "r3dster_telethon_bot.session")
             client = TelegramClient(session_path, api_id, api_hash)
-            await client.start(bot_token=bot_token)
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.sign_in(bot_token=bot_token)
             _client = client
             logger.info("Telethon MTProto client connected successfully for high-capacity downloads (up to 2GB).")
             return _client

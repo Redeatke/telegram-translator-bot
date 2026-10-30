@@ -49,6 +49,7 @@ from config import (
     fmt_error,
     fmt_warning,
     classify_media_error,
+    send_media_error_dm,
     YOUTUBE_URL_PATTERN,
     TWITCH_CLIP_PATTERN,
     TIKTOK_URL_PATTERN,
@@ -58,6 +59,7 @@ from config import (
     REDDIT_URL_PATTERN,
     TWITTER_URL_PATTERN,
     media_cache,
+    url_media_cache,
     logger,
 )
 
@@ -80,6 +82,159 @@ def _ig_extract_product_media_with_photos(self, product_media):
     return result
 
 InstagramBaseIE._extract_product_media = _ig_extract_product_media_with_photos
+
+
+def sanitize_instagram_url(url: str) -> str:
+    """Normalize Instagram post/reel URL to a clean canonical format without tracking queries."""
+    if not url:
+        return ""
+    m = INSTAGRAM_URL_PATTERN.search(url.strip())
+    if m:
+        shortcode = m.group(1)
+        post_type = "reel" if "/reel/" in url.lower() or "/reels/" in url.lower() else "p"
+        return f"https://www.instagram.com/{post_type}/{shortcode}/"
+    return url.split("?")[0].split("#")[0]
+
+
+# ─── URL to Telegram file_id Media Cache Helpers ──────────────────────────────
+
+def get_canonical_media_cache_key(url: str, platform_name: str = "") -> Optional[str]:
+    """Generate a stable, query-stripped cache key for media deduplication."""
+    if not url:
+        return None
+    url_str = url.strip()
+
+    # 1. Instagram: extract post/reel shortcode
+    ig_match = INSTAGRAM_URL_PATTERN.search(url_str)
+    if ig_match:
+        return f"fid:ig:{ig_match.group(1)}"
+
+    # 2. TikTok: extract video or short ID
+    tt_match = TIKTOK_URL_PATTERN.search(url_str)
+    if tt_match:
+        return f"fid:tt:{tt_match.group(1)}"
+
+    # 3. Twitch: extract clip slug
+    tw_match = TWITCH_CLIP_PATTERN.search(url_str)
+    if tw_match:
+        return f"fid:twitch:{tw_match.group(1)}"
+
+    # 4. Twitter/X: extract tweet ID
+    x_match = TWITTER_URL_PATTERN.search(url_str)
+    if x_match:
+        return f"fid:tw:{x_match.group(2)}"
+
+    # 5. Threads: extract post slug
+    th_match = THREADS_CANONICAL_PATTERN.search(url_str)
+    if th_match:
+        return f"fid:threads:{th_match.group(2)}"
+
+    # 6. Fallback (e.g. Reddit or generic): strip query params and trailing slash
+    clean = url_str.split("?")[0].split("#")[0].rstrip("/").lower()
+    prefix = platform_name.lower().replace(" ", "_") if platform_name else "gen"
+    return f"fid:{prefix}:{clean}"
+
+
+async def send_cached_media(target_message, cached: dict, original_url: str, platform_name: str, status_msg=None) -> bool:
+    """Send previously uploaded media using Telegram file_id. Returns True if sent successfully, False otherwise."""
+    if not cached or not target_message:
+        return False
+    try:
+        title = cached.get('title') or f"{platform_name} Media"
+        uploader = cached.get('uploader') or platform_name
+        caption = (
+            f"<b>{html.escape(title)}</b>\n"
+            f"👤 <i>Source: {html.escape(uploader)}</i>\n\n"
+            f"🔗 <a href='{original_url}'>{platform_name} Link</a>"
+        )
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
+
+        media_type = cached.get("type", "video")
+        if media_type == "video":
+            await target_message.reply_video(
+                video=cached["file_id"],
+                caption=caption,
+                parse_mode="HTML",
+                duration=cached.get("duration", 0),
+                supports_streaming=True,
+                reply_to_message_id=target_message.message_id
+            )
+        elif media_type == "photo":
+            await target_message.reply_photo(
+                photo=cached["file_id"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_to_message_id=target_message.message_id
+            )
+        elif media_type == "media_group":
+            items = cached.get("items", [])
+            if not items:
+                return False
+            media_group = []
+            for i, it in enumerate(items):
+                kw = {'caption': caption, 'parse_mode': 'HTML'} if i == 0 else {}
+                if it.get("type") == "video":
+                    media_group.append(InputMediaVideo(media=it["file_id"], **kw))
+                else:
+                    media_group.append(InputMediaPhoto(media=it["file_id"], **kw))
+            await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
+        else:
+            return False
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        logger.info(f"Instant cache hit for {platform_name} media: {original_url}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send cached media for {original_url} ({e}); falling back to fresh download.")
+        return False
+
+
+def cache_uploaded_media(cache_key: Optional[str], media_type: str, sent_message_or_list, title: str = "", uploader: str = "", duration: int = 0) -> None:
+    """Store Telegram file_id in url_media_cache for instantaneous retrieval in future requests."""
+    if not cache_key or not sent_message_or_list:
+        return
+    try:
+        if media_type == "media_group":
+            items = []
+            msgs = sent_message_or_list if isinstance(sent_message_or_list, list) else [sent_message_or_list]
+            for m in msgs:
+                if getattr(m, 'video', None):
+                    items.append({"type": "video", "file_id": m.video.file_id})
+                elif getattr(m, 'photo', None):
+                    items.append({"type": "photo", "file_id": m.photo[-1].file_id})
+            if items:
+                url_media_cache.set(cache_key, {
+                    "type": "media_group",
+                    "items": items,
+                    "title": title,
+                    "uploader": uploader,
+                })
+        elif media_type == "video":
+            msg = sent_message_or_list
+            if getattr(msg, 'video', None):
+                url_media_cache.set(cache_key, {
+                    "type": "video",
+                    "file_id": msg.video.file_id,
+                    "title": title,
+                    "uploader": uploader,
+                    "duration": duration,
+                })
+        elif media_type == "photo":
+            msg = sent_message_or_list
+            if getattr(msg, 'photo', None):
+                url_media_cache.set(cache_key, {
+                    "type": "photo",
+                    "file_id": msg.photo[-1].file_id,
+                    "title": title,
+                    "uploader": uploader,
+                })
+    except Exception as e:
+        logger.warning(f"Failed to cache uploaded media for {cache_key}: {e}")
 
 try:
     from pytubefix import YouTube as PytubeFixYouTube
@@ -738,6 +893,12 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
         )
         return
 
+    cache_key = get_canonical_media_cache_key(clip_url, "Twitch")
+    if cache_key:
+        cached = url_media_cache.get(cache_key)
+        if cached and await send_cached_media(update.message, cached, clip_url, "Twitch"):
+            return
+
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_video")
     except Exception:
@@ -770,7 +931,7 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
 
             with open(filepath, "rb") as video_file:
                 input_video = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
-                await update.message.reply_video(
+                sent_msg = await update.message.reply_video(
                     video=input_video,
                     caption=caption,
                     parse_mode="HTML",
@@ -778,6 +939,7 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
                     supports_streaming=True,
                     reply_to_message_id=update.message.message_id
                 )
+            cache_uploaded_media(cache_key, "video", sent_msg, title, uploader, duration)
 
             try:
                 await status_msg.delete()
@@ -793,7 +955,8 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
         elif 'private' in error_lower or 'unavailable' in error_lower:
             await status_msg.edit_text(fmt_error("This clip is private or restricted."))
         else:
-            await status_msg.edit_text(fmt_error(f"Failed to download Twitch clip: {html.escape(error_msg)}"))
+            await status_msg.edit_text(fmt_error(classify_media_error(error_msg)), parse_mode="HTML")
+        await send_media_error_dm(context, update.message, clip_url, "Twitch", error_msg)
 
 
 # ─── Universal Generic Downloader (TikTok, Instagram, Reddit) ─────────────────
@@ -857,10 +1020,11 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
 
     # 1. Direct video file URL
     clean_url = url.split("?")[0].lower()
-    if clean_url.endswith((".mp4", ".mov", ".mkv", ".webm")):
+    if clean_url.endswith((".mp4", ".mov", ".mkv", ".webm", ".gif", ".webp", ".m4v")):
         try:
-            out_path = os.path.join(output_dir, f"video_{uuid.uuid4().hex[:8]}.mp4")
-            async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            ext = os.path.splitext(clean_url)[1] or ".mp4"
+            out_path = os.path.join(output_dir, f"video_{uuid.uuid4().hex[:8]}{ext}")
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 resp = await client.get(url)
                 if resp.status_code == 200 and len(resp.content) > 0:
                     with open(out_path, "wb") as f:
@@ -902,6 +1066,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
 
     # 3. Instagram: Fast direct extraction of CDN video URL
     if INSTAGRAM_URL_PATTERN.search(url):
+        clean_ig_url = sanitize_instagram_url(url)
         try:
             loop = asyncio.get_running_loop()
 
@@ -911,11 +1076,12 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                     'quiet': True,
                     'no_warnings': True,
                     'skip_download': True,
+                    'socket_timeout': 20,
                 }
                 if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
                     ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                    info = ydl.extract_info(clean_ig_url, download=False)
                     entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
                     for e in entries:
                         if not e:
@@ -927,7 +1093,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                             return item_url
                 return None
 
-            video_cdn_url = await loop.run_in_executor(None, _extract_ig)
+            video_cdn_url = await asyncio.wait_for(loop.run_in_executor(None, _extract_ig), timeout=35.0)
             if video_cdn_url:
                 out_path = os.path.join(output_dir, f"ig_{uuid.uuid4().hex[:8]}.mp4")
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -944,7 +1110,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
     try:
         info = await asyncio.wait_for(
             download_generic_media(url, output_dir, platform_name="Video"),
-            timeout=25.0
+            timeout=75.0
         )
         return info.get("filepath")
     except Exception as e:
@@ -954,6 +1120,12 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
 
 async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, cookiefile: str = None) -> None:
     """Execute download and upload for generic media (TikTok, Instagram, Reddit)."""
+    cache_key = get_canonical_media_cache_key(url, platform_name)
+    if cache_key:
+        cached = url_media_cache.get(cache_key)
+        if cached and await send_cached_media(target_message, cached, url, platform_name, status_msg):
+            return
+
     if not status_msg:
         status_msg = await target_message.reply_text(f"⏳ Downloading {platform_name} media...", reply_to_message_id=target_message.message_id)
     else:
@@ -986,17 +1158,19 @@ async def execute_generic_media_download(target_message, url: str, platform_name
             await status_msg.edit_text("📤 Uploading to Telegram...")
 
             is_image = filepath.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+            sent_msg = None
             if is_image:
                 with open(filepath, "rb") as photo_file:
-                    await target_message.reply_photo(
+                    sent_msg = await target_message.reply_photo(
                         photo=photo_file,
                         caption=caption,
                         parse_mode="HTML",
                         reply_to_message_id=target_message.message_id
                     )
+                cache_uploaded_media(cache_key, "photo", sent_msg, title, uploader)
             else:
                 with open(filepath, "rb") as video_file:
-                    await target_message.reply_video(
+                    sent_msg = await target_message.reply_video(
                         video=video_file,
                         caption=caption,
                         parse_mode="HTML",
@@ -1004,6 +1178,7 @@ async def execute_generic_media_download(target_message, url: str, platform_name
                         supports_streaming=True,
                         reply_to_message_id=target_message.message_id
                     )
+                cache_uploaded_media(cache_key, "video", sent_msg, title, uploader, duration)
 
             try:
                 await status_msg.delete()
@@ -1017,10 +1192,18 @@ async def execute_generic_media_download(target_message, url: str, platform_name
             await status_msg.edit_text(fmt_error(classify_media_error(error_msg)), parse_mode="HTML")
         except Exception:
             pass
+        await send_media_error_dm(context, target_message, url, platform_name, error_msg)
 
 
 async def execute_instagram_download(target_message, url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
     """Download and upload Instagram media, including photo-only and multi-item carousel posts."""
+    url = sanitize_instagram_url(url)
+    cache_key = get_canonical_media_cache_key(url, "Instagram")
+    if cache_key:
+        cached = url_media_cache.get(cache_key)
+        if cached and await send_cached_media(target_message, cached, url, "Instagram", status_msg):
+            return
+
     if not status_msg:
         status_msg = await target_message.reply_text("⏳ Downloading Instagram media...", reply_to_message_id=target_message.message_id)
     else:
@@ -1038,6 +1221,7 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
+                'socket_timeout': 20,
             }
             if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
                 ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
@@ -1062,7 +1246,7 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
                     'uploader': info.get('channel') or info.get('uploader') or 'Instagram',
                 }
 
-        data = await loop.run_in_executor(None, _extract)
+        data = await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=45)
         items = data['items']
         if not items:
             raise Exception("No media found in this post.")
@@ -1104,15 +1288,17 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
         if len(media_items) == 1:
             m = media_items[0]
             if m['is_video']:
-                await target_message.reply_video(
+                sent_msg = await target_message.reply_video(
                     video=m['bytes'], caption=caption, parse_mode="HTML",
                     supports_streaming=True, reply_to_message_id=target_message.message_id
                 )
+                cache_uploaded_media(cache_key, "video", sent_msg, data.get('title'), data.get('uploader'))
             else:
-                await target_message.reply_photo(
+                sent_msg = await target_message.reply_photo(
                     photo=m['bytes'], caption=caption, parse_mode="HTML",
                     reply_to_message_id=target_message.message_id
                 )
+                cache_uploaded_media(cache_key, "photo", sent_msg, data.get('title'), data.get('uploader'))
         else:
             media_group = []
             for i, m in enumerate(media_items):
@@ -1121,7 +1307,8 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
                     media_group.append(InputMediaVideo(media=m['bytes'], **kwargs))
                 else:
                     media_group.append(InputMediaPhoto(media=m['bytes'], **kwargs))
-            await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
+            sent_msgs = await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
+            cache_uploaded_media(cache_key, "media_group", sent_msgs, data.get('title'), data.get('uploader'))
 
         try:
             await status_msg.delete()
@@ -1134,6 +1321,7 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
             await status_msg.edit_text(fmt_error(classify_media_error(str(e))), parse_mode="HTML")
         except Exception:
             pass
+        await send_media_error_dm(context, target_message, url, "Instagram", str(e))
 
 
 # ─── Threads Media Handler ─────────────────────────────────────────────────────
@@ -1379,6 +1567,7 @@ async def execute_threads_download(target_message, url: str, context: ContextTyp
             await status_msg.edit_text(fmt_error(classify_media_error(str(e))), parse_mode="HTML")
         except Exception:
             pass
+        await send_media_error_dm(context, target_message, url, "Threads", str(e))
 
 
 async def handle_threads_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1504,6 +1693,12 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("🤖 <b>Reddit Link Detected</b>\n<i>Click below to process:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
         return
 
+    cache_key = get_canonical_media_cache_key(canonical_url, "Reddit")
+    if cache_key:
+        cached = url_media_cache.get(cache_key)
+        if cached and await send_cached_media(update.message, cached, canonical_url, "Reddit"):
+            return
+
     status_msg = await update.message.reply_text("⏳ Processing Reddit link...", reply_to_message_id=update.message.message_id)
 
     try:
@@ -1530,7 +1725,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
 
                     await status_msg.edit_text("📤 Uploading video to Telegram...")
                     with open(filepath, "rb") as video_file:
-                        await update.message.reply_video(
+                        sent_msg = await update.message.reply_video(
                             video=video_file,
                             caption=caption,
                             parse_mode="HTML",
@@ -1538,6 +1733,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
                             supports_streaming=True,
                             reply_to_message_id=update.message.message_id
                         )
+                    cache_uploaded_media(cache_key, "video", sent_msg, title, uploader, duration)
                     try:
                         await status_msg.delete()
                     except Exception:
@@ -1735,6 +1931,7 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
             await status_msg.edit_text(fmt_error("Failed to process Reddit link."))
         except Exception:
             pass
+        await send_media_error_dm(context, update.message, canonical_url, "Reddit", str(e))
 
 
 async def handle_pending_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -353,6 +353,7 @@ class MediaMemoryCache:
             self._cache[key] = (time.time(), val)
 
 media_cache = MediaMemoryCache()
+url_media_cache = MediaMemoryCache(max_items=1000, ttl_seconds=7 * 86400)
 
 # Pending download buttons cache
 pending_downloads: Dict[str, Dict[str, Any]] = {}
@@ -486,10 +487,64 @@ _RESTRICTED_MEDIA_ERROR_MARKERS = (
 )
 
 def classify_media_error(error_str: str) -> str:
-    """Map a raw download error into a user-friendly message, without leaking provider internals."""
+    """Map a raw download error into a clean user-friendly message, without leaking raw stack traces."""
     low = error_str.lower()
     if any(marker in low for marker in _RESTRICTED_MEDIA_ERROR_MARKERS):
         return "This content isn't available due to restrictions (private, age-restricted, or region-locked)."
-    # Include a short snippet of the raw error so the cause is visible for diagnosis.
-    snippet = error_str.strip()[:200]
-    return f"Failed to download this media. The link may be broken or the content may have been removed.\n<code>{snippet}</code>"
+    if "empty media response" in low:
+        return "Failed to download this media. The content may be restricted or requires an active login."
+    if "timeout" in low or "timed out" in low:
+        return "Download timed out. The server or platform took too long to respond."
+    return "Failed to download this media. The link may be broken or unavailable."
+
+
+async def send_media_error_dm(
+    context,
+    target_message,
+    url: str,
+    platform_name: str,
+    raw_error: str,
+) -> None:
+    """Send detailed error diagnostics via DM so chat stays clean."""
+    if not target_message or not raw_error or not context:
+        return
+
+    chat_id = target_message.chat_id
+    is_private = getattr(target_message.chat, "type", "") == "private"
+    requesting_user = getattr(target_message, "from_user", None)
+    clean_err = str(raw_error).strip()[:800]
+
+    dm_text = (
+        f"⚠️ <b>{platform_name} Download Error Diagnostic</b>\n\n"
+        f"🔗 <b>Link:</b> <code>{html.escape(url)}</code>\n"
+        f"💬 <b>Chat:</b> {html.escape(getattr(target_message.chat, 'title', None) or 'Private Chat')} (<code>{chat_id}</code>)\n\n"
+        f"📋 <b>Diagnostic Error:</b>\n"
+        f"<code>{html.escape(clean_err)}</code>"
+    )
+
+    # 1. In groups, try sending DM to the requesting user
+    if not is_private and requesting_user and not requesting_user.is_bot:
+        try:
+            await context.bot.send_message(
+                chat_id=requesting_user.id,
+                text=dm_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.debug(f"Could not DM download error to user {requesting_user.id}: {e}")
+
+    # 2. Try sending DM to admin users
+    for admin_id in ADMIN_USER_IDS:
+        if not is_private and requesting_user and admin_id == requesting_user.id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=dm_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.debug(f"Could not DM download error to admin {admin_id}: {e}")
+

@@ -12,6 +12,7 @@ import uuid
 import time
 from datetime import datetime, timezone
 import json
+import html
 import threading
 from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv

@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import html
+import time
 import uuid
 import shutil
 import asyncio
@@ -1355,17 +1356,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 _last_dm_media[update.effective_chat.id] = (extracted_url, None, time.time())
         return
 
-
-async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Track videos, animations, and media in private chats so /gif commands can be sent without replying."""
-    if not update.effective_message or update.effective_chat.type != "private":
-        return
-    msg = update.effective_message
-    vid = _extract_video_media(msg)
-    url = _extract_url_from_message(msg)
-    if vid or url:
-        _last_dm_media[update.effective_chat.id] = (url, vid, time.time())
-
     # Only auto-translate in private chats
     if update.effective_chat.type != "private":
         return
@@ -1402,6 +1392,18 @@ async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_
 
     response_msg = fmt_translation(src_lang, target_lang, translated_text, fallback=fallback)
     await update.message.reply_text(response_msg, parse_mode="HTML")
+
+
+async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Track videos, animations, and media in private chats so /gif commands can be sent without replying."""
+    if not update.effective_message or update.effective_chat.type != "private":
+        return
+    msg = update.effective_message
+    vid = _extract_video_media(msg)
+    url = _extract_url_from_message(msg)
+    if vid or url:
+        _last_dm_media[update.effective_chat.id] = (url, vid, time.time())
+
 
 def build_downloads_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     """Build interactive inline keyboard for per-chat download settings."""

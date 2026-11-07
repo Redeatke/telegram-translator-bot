@@ -34,6 +34,10 @@ from config import (
     IS_TERMUX,
     YOUTUBE_COOKIES_FILE,
     INSTAGRAM_COOKIES_FILE,
+    INSTAGRAM_PROXY,
+    get_instagram_proxy,
+    INSTAGRAM_MAX_CONCURRENT,
+    INSTAGRAM_REQUEST_DELAY,
     YOUTUBE_PROXY,
     YOUTUBE_RELAY_URL,
     MAX_UPLOAD_SIZE_MB,
@@ -94,6 +98,38 @@ def sanitize_instagram_url(url: str) -> str:
         post_type = "reel" if "/reel/" in url.lower() or "/reels/" in url.lower() else "p"
         return f"https://www.instagram.com/{post_type}/{shortcode}/"
     return url.split("?")[0].split("#")[0]
+
+
+# ─── Instagram Throttling & Rate-Limit Concurrency Guards ─────────────────────
+
+_ig_semaphore: Optional[asyncio.Semaphore] = None
+_ig_throttle_lock: Optional[asyncio.Lock] = None
+_last_ig_request_time: float = 0.0
+
+def _get_ig_semaphore() -> asyncio.Semaphore:
+    global _ig_semaphore
+    if _ig_semaphore is None:
+        _ig_semaphore = asyncio.Semaphore(INSTAGRAM_MAX_CONCURRENT)
+    return _ig_semaphore
+
+def _get_ig_throttle_lock() -> asyncio.Lock:
+    global _ig_throttle_lock
+    if _ig_throttle_lock is None:
+        _ig_throttle_lock = asyncio.Lock()
+    return _ig_throttle_lock
+
+async def _wait_for_instagram_slot() -> None:
+    """Throttle Instagram requests to avoid hitting rate limits and 429 bans."""
+    global _last_ig_request_time
+    lock = _get_ig_throttle_lock()
+    async with lock:
+        now = time.time()
+        elapsed = now - _last_ig_request_time
+        if elapsed < INSTAGRAM_REQUEST_DELAY:
+            delay = INSTAGRAM_REQUEST_DELAY - elapsed
+            logger.info(f"Throttling Instagram request: waiting {delay:.2f}s...")
+            await asyncio.sleep(delay)
+        _last_ig_request_time = time.time()
 
 
 # ─── URL to Telegram file_id Media Cache Helpers ──────────────────────────────
@@ -961,7 +997,7 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
 
 # ─── Universal Generic Downloader (TikTok, Instagram, Reddit) ─────────────────
 
-async def download_generic_media(url: str, output_dir: str, platform_name: str = "Media", cookiefile: str = None) -> dict:
+async def download_generic_media(url: str, output_dir: str, platform_name: str = "Media", cookiefile: str = None, proxy: str = None) -> dict:
     """Download video from TikTok, Instagram, Reddit, etc. using yt-dlp. Returns dict with filepath, title, duration, uploader."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
@@ -984,6 +1020,8 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
         }
         if cookiefile and os.path.exists(cookiefile):
             ydl_opts['cookiefile'] = cookiefile
+        if proxy:
+            ydl_opts['proxy'] = proxy
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
@@ -1069,6 +1107,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
         clean_ig_url = sanitize_instagram_url(url)
         try:
             loop = asyncio.get_running_loop()
+            ig_proxy = get_instagram_proxy()
 
             def _extract_ig():
                 ydl_opts = {
@@ -1078,6 +1117,8 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                     'skip_download': True,
                     'socket_timeout': 20,
                 }
+                if ig_proxy:
+                    ydl_opts['proxy'] = ig_proxy
                 if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
                     ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1094,10 +1135,17 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                 return None
 
             video_cdn_url = await asyncio.wait_for(loop.run_in_executor(None, _extract_ig), timeout=35.0)
+            if not video_cdn_url:
+                fb_data = await fetch_instagram_via_embed_proxy(clean_ig_url)
+                if fb_data and fb_data.get('items') and fb_data['items'][0].get('is_video'):
+                    video_cdn_url = fb_data['items'][0]['url']
             if video_cdn_url:
                 out_path = os.path.join(output_dir, f"ig_{uuid.uuid4().hex[:8]}.mp4")
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+                client_kwargs = {"timeout": 25.0, "follow_redirects": True}
+                if ig_proxy:
+                    client_kwargs["proxy"] = ig_proxy
+                async with httpx.AsyncClient(**client_kwargs) as client:
                     resp = await client.get(video_cdn_url, headers=headers)
                     if resp.status_code == 200 and len(resp.content) > 0:
                         with open(out_path, "wb") as f:
@@ -1108,8 +1156,11 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
 
     # 4. Generic media download with safe timeout
     try:
+        is_ig = bool(INSTAGRAM_URL_PATTERN.search(url))
+        cookiefile = INSTAGRAM_COOKIES_FILE if is_ig else None
+        proxy = get_instagram_proxy() if is_ig else None
         info = await asyncio.wait_for(
-            download_generic_media(url, output_dir, platform_name="Video"),
+            download_generic_media(url, output_dir, platform_name="Video", cookiefile=cookiefile, proxy=proxy),
             timeout=75.0
         )
         return info.get("filepath")
@@ -1118,7 +1169,7 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
         return None
 
 
-async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, cookiefile: str = None) -> None:
+async def execute_generic_media_download(target_message, url: str, platform_name: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, cookiefile: str = None, proxy: str = None) -> None:
     """Execute download and upload for generic media (TikTok, Instagram, Reddit)."""
     cache_key = get_canonical_media_cache_key(url, platform_name)
     if cache_key:
@@ -1136,7 +1187,7 @@ async def execute_generic_media_download(target_message, url: str, platform_name
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            info = await download_generic_media(url, tmp_dir, platform_name, cookiefile=cookiefile)
+            info = await download_generic_media(url, tmp_dir, platform_name, cookiefile=cookiefile, proxy=proxy)
             filepath = info['filepath']
             title = info.get('title', f'{platform_name} Media')
             uploader = info.get('uploader', platform_name)
@@ -1195,6 +1246,85 @@ async def execute_generic_media_download(target_message, url: str, platform_name
         await send_media_error_dm(context, target_message, url, platform_name, error_msg)
 
 
+async def fetch_instagram_via_embed_proxy(url: str) -> Optional[dict]:
+    """Fallback extractor for Instagram reels and posts using embed fixers (ddinstagram, instagramez).
+    Extracts direct CDN media streams and OpenGraph metadata when direct scraping gets 429'd or blocked.
+    """
+    m = INSTAGRAM_URL_PATTERN.search(url.strip())
+    if not m:
+        return None
+    shortcode = m.group(1)
+    is_reel = "/reel/" in url.lower() or "/reels/" in url.lower()
+    path_type = "reel" if is_reel else "p"
+
+    proxy_urls = [
+        f"https://www.ddinstagram.com/{path_type}/{shortcode}/",
+        f"https://instagramez.com/{path_type}/{shortcode}/",
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        for target_url in proxy_urls:
+            try:
+                resp = await client.get(target_url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                html_text = resp.text
+
+                # 1. Look for og:video / og:video:secure_url / twitter:player:stream
+                video_match = (
+                    re.search(r'<meta\s+(?:property|name)=["\'](?:og:video(?::secure_url)?|twitter:player:stream)["\']\s+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                    or re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\'](?:og:video(?::secure_url)?|twitter:player:stream)["\']', html_text, re.IGNORECASE)
+                )
+
+                # 2. Look for og:image / twitter:image
+                image_match = (
+                    re.search(r'<meta\s+(?:property|name)=["\'](?:og:image|twitter:image)["\']\s+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                    or re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\'](?:og:image|twitter:image)["\']', html_text, re.IGNORECASE)
+                )
+
+                # 3. Look for og:title and og:description
+                title_match = (
+                    re.search(r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                    or re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']', html_text, re.IGNORECASE)
+                )
+                desc_match = (
+                    re.search(r'<meta\s+(?:property|name)=["\'](?:og:description|description)["\']\s+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                    or re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\'](?:og:description|description)["\']', html_text, re.IGNORECASE)
+                )
+
+                items = []
+                if video_match:
+                    v_url = html.unescape(video_match.group(1).strip())
+                    items.append({'url': v_url, 'is_video': True})
+                elif image_match:
+                    img_url = html.unescape(image_match.group(1).strip())
+                    items.append({'url': img_url, 'is_video': False})
+                else:
+                    continue
+
+                raw_title = html.unescape(title_match.group(1).strip()) if title_match else ""
+                raw_desc = html.unescape(desc_match.group(1).strip()) if desc_match else ""
+                title = raw_desc or raw_title or "Instagram Post"
+                uploader = raw_title if (raw_title and raw_desc and raw_title != raw_desc) else "Instagram"
+
+                logger.info(f"Embed proxy extracted media from {target_url} for {shortcode}")
+                return {
+                    'items': items,
+                    'title': title,
+                    'uploader': uploader,
+                }
+            except Exception as e:
+                logger.warning(f"Error querying embed proxy {target_url}: {e}")
+                continue
+
+    return None
+
+
 async def execute_instagram_download(target_message, url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None) -> None:
     """Download and upload Instagram media, including photo-only and multi-item carousel posts."""
     url = sanitize_instagram_url(url)
@@ -1212,117 +1342,195 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
         except Exception:
             pass  # e.g. text is already identical to the current status message
 
-    try:
-        loop = asyncio.get_running_loop()
+    sem = _get_ig_semaphore()
+    if sem.locked():
+        try:
+            await status_msg.edit_text("⏳ Queued for Instagram download...")
+        except Exception:
+            pass
 
-        def _extract():
-            ydl_opts = {
-                'format': 'best',
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'socket_timeout': 20,
-            }
-            if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
-                ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
-                items = []
-                for e in entries:
-                    if not e:
-                        continue
-                    item_url = e.get('url')
-                    if not item_url:
-                        formats = e.get('formats') or []
-                        if formats:
-                            item_url = formats[-1].get('url')
-                    if not item_url:
-                        continue
-                    items.append({'url': item_url, 'is_video': e.get('ext') != 'jpg'})
-                return {
-                    'items': items,
-                    'title': info.get('title') or 'Instagram Post',
-                    'uploader': info.get('channel') or info.get('uploader') or 'Instagram',
+    async with sem:
+        await _wait_for_instagram_slot()
+        try:
+            await status_msg.edit_text("⏳ Downloading Instagram media...")
+        except Exception:
+            pass
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _extract(proxy: Optional[str]):
+                ydl_opts = {
+                    'format': 'best',
+                    'quiet': True,
+                    'no_warnings': True,
+                    'skip_download': True,
+                    'socket_timeout': 20,
                 }
+                if proxy:
+                    ydl_opts['proxy'] = proxy
+                if INSTAGRAM_COOKIES_FILE and os.path.exists(INSTAGRAM_COOKIES_FILE):
+                    ydl_opts['cookiefile'] = INSTAGRAM_COOKIES_FILE
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    entries = info.get('entries') if info.get('_type') == 'playlist' else [info]
+                    items = []
+                    for e in entries:
+                        if not e:
+                            continue
+                        item_url = e.get('url')
+                        if not item_url:
+                            formats = e.get('formats') or []
+                            if formats:
+                                item_url = formats[-1].get('url')
+                        if not item_url:
+                            continue
+                        items.append({'url': item_url, 'is_video': e.get('ext') != 'jpg'})
+                    return {
+                        'items': items,
+                        'title': info.get('title') or 'Instagram Post',
+                        'uploader': info.get('channel') or info.get('uploader') or 'Instagram',
+                    }
 
-        data = await asyncio.wait_for(loop.run_in_executor(None, _extract), timeout=45)
-        items = data['items']
-        if not items:
-            raise Exception("No media found in this post.")
-
-        # A single video is handled by the generic yt-dlp downloader, which
-        # merges best video+audio and enforces the 50MB size check properly.
-        if len(items) == 1 and items[0]['is_video']:
-            await execute_generic_media_download(
-                target_message, url, "Instagram", context,
-                status_msg=status_msg,
-                cookiefile=INSTAGRAM_COOKIES_FILE,
-            )
-            return
-
-        caption = (
-            f"<b>{html.escape(data['title'])}</b>\n"
-            f"👤 <i>Source: {html.escape(data['uploader'])}</i>\n\n"
-            f"🔗 <a href='{url}'>Instagram Link</a>"
-        )
-        if len(caption) > 1024:
-            caption = caption[:1020] + "…"
-
-        await status_msg.edit_text("📤 Uploading to Telegram...")
-
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        media_items = []
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            for item in items[:10]:
+            data = None
+            active_proxy = None
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                active_proxy = get_instagram_proxy()
                 try:
-                    resp = await client.get(item['url'], headers=headers)
-                    if resp.status_code == 200 and len(resp.content) <= 50 * 1024 * 1024:
-                        media_items.append({'bytes': resp.content, 'is_video': item['is_video']})
-                except Exception as fetch_err:
-                    logger.warning(f"Failed to fetch Instagram media item: {fetch_err}")
+                    data = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda p=active_proxy: _extract(p)),
+                        timeout=45
+                    )
+                    break
+                except Exception as extract_err:
+                    err_str = str(extract_err).lower()
+                    is_rate_limited = "429" in err_str or "too many requests" in err_str or "timed out" in err_str or "timeout" in err_str
+                    if is_rate_limited and attempt < max_attempts - 1:
+                        backoff = 3.0 * (attempt + 1)
+                        logger.warning(
+                            f"Instagram rate limit or timeout on attempt {attempt + 1}. "
+                            f"Backing off {backoff:.1f}s before retry..."
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
 
-        if not media_items:
-            raise Exception("Failed to download any media from this post.")
+                    # Direct yt-dlp extraction failed (e.g. 429 datacenter IP block or restriction).
+                    # Fall back to embed proxy (ddinstagram / instagramez)
+                    logger.info(f"Direct Instagram extraction failed ({extract_err}). Trying embed proxy fallback for {url}...")
+                    try:
+                        fallback_data = await fetch_instagram_via_embed_proxy(url)
+                        if fallback_data and fallback_data.get('items'):
+                            logger.info(f"Successfully extracted media via embed proxy fallback for {url}")
+                            data = fallback_data
+                            break
+                    except Exception as fb_err:
+                        logger.warning(f"Embed proxy fallback error for {url}: {fb_err}")
 
-        if len(media_items) == 1:
-            m = media_items[0]
-            if m['is_video']:
-                sent_msg = await target_message.reply_video(
-                    video=m['bytes'], caption=caption, parse_mode="HTML",
-                    supports_streaming=True, reply_to_message_id=target_message.message_id
-                )
-                cache_uploaded_media(cache_key, "video", sent_msg, data.get('title'), data.get('uploader'))
+                    raise extract_err
+
+            if not data or not data.get('items'):
+                raise Exception("No media found in this post.")
+
+            items = data['items']
+
+            title_escaped = html.escape(str(data.get('title') or 'Instagram Post'))
+            uploader_escaped = html.escape(str(data.get('uploader') or 'Instagram'))
+            caption = f"<b>{title_escaped}</b>\n👤 <i>Source: {uploader_escaped}</i>\n\n🔗 <a href='{url}'>Instagram Link</a>"
+            if len(caption) > 1024:
+                caption = caption[:1020] + "…"
+
+            await status_msg.edit_text("📤 Uploading to Telegram...")
+
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            client_kwargs = {"timeout": 60.0, "follow_redirects": True}
+            if active_proxy:
+                client_kwargs["proxy"] = active_proxy
+
+            # ── Single Video Stream (direct CDN stream without re-invoking yt-dlp) ──
+            if len(items) == 1 and items[0]['is_video']:
+                v_url = items[0]['url']
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_video_path = os.path.join(tmp_dir, f"ig_{uuid.uuid4().hex[:8]}.mp4")
+                    file_size = 0
+                    async with httpx.AsyncClient(**client_kwargs) as client:
+                        async with client.stream("GET", v_url, headers=headers) as resp:
+                            resp.raise_for_status()
+                            with open(tmp_video_path, "wb") as f:
+                                async for chunk in resp.aiter_bytes(chunk_size=128 * 1024):
+                                    f.write(chunk)
+                                    file_size += len(chunk)
+                                    if file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+                                        break
+
+                    if file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+                        await status_msg.edit_text(
+                            fmt_warning(f"This video exceeds Telegram's {MAX_UPLOAD_SIZE_MB}MB limit ({file_size / (1024*1024):.1f}MB).")
+                        )
+                        return
+
+                    if not os.path.exists(tmp_video_path) or os.path.getsize(tmp_video_path) == 0:
+                        raise Exception("Downloaded Instagram video file is empty.")
+
+                    with open(tmp_video_path, "rb") as video_file:
+                        sent_msg = await target_message.reply_video(
+                            video=video_file, caption=caption, parse_mode="HTML",
+                            supports_streaming=True, reply_to_message_id=target_message.message_id
+                        )
+                    cache_uploaded_media(cache_key, "video", sent_msg, data.get('title'), data.get('uploader'))
+
+            # ── Photos or Multi-item Carousel ──
             else:
-                sent_msg = await target_message.reply_photo(
-                    photo=m['bytes'], caption=caption, parse_mode="HTML",
-                    reply_to_message_id=target_message.message_id
-                )
-                cache_uploaded_media(cache_key, "photo", sent_msg, data.get('title'), data.get('uploader'))
-        else:
-            media_group = []
-            for i, m in enumerate(media_items):
-                kwargs = {'caption': caption, 'parse_mode': 'HTML'} if i == 0 else {}
-                if m['is_video']:
-                    media_group.append(InputMediaVideo(media=m['bytes'], **kwargs))
+                media_items = []
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    for item in items[:10]:
+                        try:
+                            resp = await client.get(item['url'], headers=headers)
+                            if resp.status_code == 200 and len(resp.content) <= MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+                                media_items.append({'bytes': resp.content, 'is_video': item['is_video']})
+                        except Exception as fetch_err:
+                            logger.warning(f"Failed to fetch Instagram media item: {fetch_err}")
+
+                if not media_items:
+                    raise Exception("Failed to download any media from this post.")
+
+                if len(media_items) == 1:
+                    m = media_items[0]
+                    if m['is_video']:
+                        sent_msg = await target_message.reply_video(
+                            video=m['bytes'], caption=caption, parse_mode="HTML",
+                            supports_streaming=True, reply_to_message_id=target_message.message_id
+                        )
+                        cache_uploaded_media(cache_key, "video", sent_msg, data.get('title'), data.get('uploader'))
+                    else:
+                        sent_msg = await target_message.reply_photo(
+                            photo=m['bytes'], caption=caption, parse_mode="HTML",
+                            reply_to_message_id=target_message.message_id
+                        )
+                        cache_uploaded_media(cache_key, "photo", sent_msg, data.get('title'), data.get('uploader'))
                 else:
-                    media_group.append(InputMediaPhoto(media=m['bytes'], **kwargs))
-            sent_msgs = await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
-            cache_uploaded_media(cache_key, "media_group", sent_msgs, data.get('title'), data.get('uploader'))
+                    media_group = []
+                    for i, m in enumerate(media_items):
+                        kwargs = {'caption': caption, 'parse_mode': 'HTML'} if i == 0 else {}
+                        if m['is_video']:
+                            media_group.append(InputMediaVideo(media=m['bytes'], **kwargs))
+                        else:
+                            media_group.append(InputMediaPhoto(media=m['bytes'], **kwargs))
+                    sent_msgs = await target_message.reply_media_group(media=media_group, reply_to_message_id=target_message.message_id)
+                    cache_uploaded_media(cache_key, "media_group", sent_msgs, data.get('title'), data.get('uploader'))
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
-    except Exception as e:
-        logger.error(f"Instagram download failed for {url}: {type(e).__name__}: {e}")
-        try:
-            await status_msg.edit_text(fmt_error(classify_media_error(str(e))), parse_mode="HTML")
-        except Exception:
-            pass
-        await send_media_error_dm(context, target_message, url, "Instagram", str(e))
-
+        except Exception as e:
+            logger.error(f"Instagram download failed for {url}: {type(e).__name__}: {e}")
+            try:
+                await status_msg.edit_text(fmt_error(classify_media_error(str(e))), parse_mode="HTML")
+            except Exception:
+                pass
+            await send_media_error_dm(context, target_message, url, "Instagram", str(e))
 
 # ─── Threads Media Handler ─────────────────────────────────────────────────────
 # Threads has no yt-dlp extractor and its post pages are login-walled for normal

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import json
 import html
 import threading
+import itertools
 from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
 
@@ -184,6 +185,31 @@ if not INSTAGRAM_COOKIES_FILE:
         "No Instagram cookies configured. Instagram Reels/posts may fail. "
         "Set INSTAGRAM_COOKIES env var or place instagram_cookies.txt next to the bot."
     )
+
+# ─── Instagram Proxy & Throttling Setup ───────────────────────────────────────
+_raw_ig_proxies = [
+    p.strip()
+    for p in (os.getenv("INSTAGRAM_PROXY") or os.getenv("INSTAGRAM_PROXIES") or os.getenv("PROXY") or "").split(",")
+    if p.strip()
+]
+_ig_proxy_lock = threading.Lock()
+_ig_proxy_cycle = itertools.cycle(_raw_ig_proxies) if _raw_ig_proxies else None
+
+def get_instagram_proxy() -> Optional[str]:
+    """Get the next Instagram proxy from the configured rotating list, or None if not set."""
+    if not _ig_proxy_cycle:
+        return None
+    with _ig_proxy_lock:
+        return next(_ig_proxy_cycle)
+
+INSTAGRAM_PROXY = _raw_ig_proxies[0] if _raw_ig_proxies else None
+INSTAGRAM_MAX_CONCURRENT = max(1, int(os.getenv("INSTAGRAM_MAX_CONCURRENT", "1")))
+INSTAGRAM_REQUEST_DELAY = max(0.0, float(os.getenv("INSTAGRAM_REQUEST_DELAY", "2.5")))
+
+if INSTAGRAM_PROXY:
+    logger.info(f"Loaded {len(_raw_ig_proxies)} Instagram proxy endpoint(s) (concurrency={INSTAGRAM_MAX_CONCURRENT}, delay={INSTAGRAM_REQUEST_DELAY}s).")
+else:
+    logger.info(f"No Instagram proxy configured (concurrency={INSTAGRAM_MAX_CONCURRENT}, delay={INSTAGRAM_REQUEST_DELAY}s).")
 
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
 YOUTUBE_RELAY_URL = os.getenv("YOUTUBE_RELAY_URL", "").strip().rstrip("/") or None
@@ -492,6 +518,8 @@ def classify_media_error(error_str: str) -> str:
     low = error_str.lower()
     if any(marker in low for marker in _RESTRICTED_MEDIA_ERROR_MARKERS):
         return "This content isn't available due to restrictions (private, age-restricted, or region-locked)."
+    if "429" in low or "too many requests" in low:
+        return "Instagram rate limit reached (HTTP 429). The request was throttled. Please try again shortly or configure a proxy."
     if "empty media response" in low:
         return "Failed to download this media. The content may be restricted or requires an active login."
     if "timeout" in low or "timed out" in low:

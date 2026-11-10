@@ -16,10 +16,12 @@ import os
 import re
 import json
 import html
+import time
 import asyncio
 import tempfile
 import uuid
 from typing import Optional
+from urllib.parse import urljoin
 import card
 
 import httpx
@@ -1298,11 +1300,12 @@ async def fetch_instagram_via_embed_proxy(url: str) -> Optional[dict]:
                 )
 
                 items = []
+                base_url = str(resp.url)
                 if video_match:
-                    v_url = html.unescape(video_match.group(1).strip())
+                    v_url = urljoin(base_url, html.unescape(video_match.group(1).strip()))
                     items.append({'url': v_url, 'is_video': True})
                 elif image_match:
-                    img_url = html.unescape(image_match.group(1).strip())
+                    img_url = urljoin(base_url, html.unescape(image_match.group(1).strip()))
                     items.append({'url': img_url, 'is_video': False})
                 else:
                     continue

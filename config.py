@@ -164,21 +164,114 @@ def set_youtube_cookies_file(path: str) -> None:
 # Set INSTAGRAM_COOKIES env var to a Netscape-format cookie string, or place
 # instagram_cookies.txt next to the bot. Export from your browser with the
 # "Get cookies.txt LOCALLY" extension while logged into instagram.com.
+#
+# The loader accepts:
+#   - A real Netscape cookies.txt (multi-line with tabs)
+#   - A one-line paste with literal \n and \t (from host dashboards)
+#   - Base64-encoded cookies.txt (safest for host dashboards)
+#   - Cookie-Editor JSON export ([{"domain":".instagram.com", ...}])
+#   - A bare "sessionid=...;csrftoken=..." header string
+
+import base64 as _b64
+
+def _normalize_instagram_cookies(raw: str) -> str:
+    """Normalize various cookie formats into a proper Netscape cookies.txt."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+
+    # 1. Try base64 decode first (safest for host dashboards)
+    try:
+        compact_b64 = "".join(raw.split())
+        decoded = _b64.b64decode(compact_b64, validate=True).decode("utf-8", errors="replace")
+        if ".instagram.com" in decoded and "\t" in decoded:
+            logger.info("Decoded Instagram cookies from base64.")
+            return decoded.strip()
+    except Exception:
+        pass
+
+    # 2. Unescape literal \n and \t (host dashboards often do this)
+    if "\\n" in raw or "\\t" in raw:
+        unescaped = raw.replace("\\n", "\n").replace("\\t", "\t")
+        if ".instagram.com" in unescaped and "\t" in unescaped:
+            logger.info("Unescaped literal \\n/\\t in Instagram cookies.")
+            raw = unescaped
+
+    # 3. Cookie-Editor JSON format: [{"domain":".instagram.com","name":"sessionid",...}]
+    if raw.startswith("["):
+        try:
+            cookies_json = json.loads(raw)
+            lines = ["# Netscape HTTP Cookie File", ""]
+            for c in cookies_json:
+                domain = c.get("domain", "")
+                if "instagram.com" not in domain:
+                    continue
+                flag = "TRUE" if domain.startswith(".") else "FALSE"
+                path = c.get("path", "/")
+                secure = "TRUE" if c.get("secure", True) else "FALSE"
+                expiry = str(int(c.get("expirationDate", 0)))
+                name = c.get("name", "")
+                value = c.get("value", "")
+                lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
+            if len(lines) > 2:
+                logger.info(f"Converted Cookie-Editor JSON ({len(lines) - 2} cookies).")
+                return "\n".join(lines)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    # 4. Header-style: "sessionid=abc; csrftoken=xyz; ds_user_id=123"
+    if "sessionid=" in raw and "\t" not in raw and "\n" not in raw.strip():
+        pairs = [p.strip() for p in raw.split(";") if "=" in p]
+        lines = ["# Netscape HTTP Cookie File", ""]
+        for pair in pairs:
+            name, _, value = pair.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name and value:
+                lines.append(f".instagram.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+        if len(lines) > 2:
+            logger.info(f"Converted header-style cookies ({len(lines) - 2} cookies).")
+            return "\n".join(lines)
+
+    # 5. Already a valid Netscape file (has tabs and .instagram.com)
+    return raw
 
 INSTAGRAM_COOKIES_FILE = None
 _ig_cookies_env = os.getenv("INSTAGRAM_COOKIES") or os.getenv("INSTAGRAM_COOKIE")
 if _ig_cookies_env:
     try:
-        _ig_cookie_path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
-        with open(_ig_cookie_path, "w", encoding="utf-8") as f:
-            f.write(_ig_cookies_env.strip())
-        INSTAGRAM_COOKIES_FILE = _ig_cookie_path
-        logger.info("Loaded Instagram cookies from INSTAGRAM_COOKIES environment variable.")
+        _ig_cookie_text = _normalize_instagram_cookies(_ig_cookies_env)
+        if _ig_cookie_text:
+            _ig_cookie_path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
+            with open(_ig_cookie_path, "w", encoding="utf-8") as f:
+                f.write(_ig_cookie_text)
+            INSTAGRAM_COOKIES_FILE = _ig_cookie_path
+            _has_session = "sessionid" in _ig_cookie_text.lower()
+            logger.info(
+                f"Loaded Instagram cookies from env var "
+                f"(sessionid={'present' if _has_session else 'MISSING'})."
+            )
+            if not _has_session:
+                logger.warning(
+                    "Instagram cookies loaded but sessionid is MISSING. "
+                    "Downloads will likely fail. Re-export cookies while logged in."
+                )
+        else:
+            logger.warning("INSTAGRAM_COOKIES env var is set but empty after normalization.")
     except Exception as e:
         logger.error(f"Failed to write INSTAGRAM_COOKIES to temp file: {e}")
 elif os.path.exists("instagram_cookies.txt"):
     INSTAGRAM_COOKIES_FILE = os.path.abspath("instagram_cookies.txt")
-    logger.info("Loaded Instagram cookies from local instagram_cookies.txt file.")
+    try:
+        with open(INSTAGRAM_COOKIES_FILE, "r", encoding="utf-8") as f:
+            _file_text = f.read()
+        _has_session = "sessionid" in _file_text.lower()
+        logger.info(
+            f"Loaded Instagram cookies from local file "
+            f"(sessionid={'present' if _has_session else 'MISSING'})."
+        )
+    except Exception:
+        logger.info("Loaded Instagram cookies from local instagram_cookies.txt file.")
 
 if not INSTAGRAM_COOKIES_FILE:
     logger.warning(

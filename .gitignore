@@ -11,3 +11,5 @@ sample_*.png
 !splash_icon.png
 !webapp/splash_icon.png
 *.exe
+instagram_cookies.txt
+cookies.txt

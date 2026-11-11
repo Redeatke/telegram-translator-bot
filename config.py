@@ -138,17 +138,94 @@ else:
     logger.warning("OPENROUTER_API_KEY not found. AI engine will be unavailable.")
 
 
-# ─── YouTube Cookies & Proxy Setup ───────────────────────────────────────────
+# ─── Cookies Normalization & Setup (YouTube + Instagram) ─────────────────────
+
+import base64 as _b64
+
+def _normalize_cookies(
+    raw: str,
+    domain_markers: Tuple[str, ...],
+    label: str,
+    header_domain: Optional[str] = None,
+) -> str:
+    """Normalize Netscape, escaped \\n/\\t, base64, Cookie-Editor JSON, or header-style cookies."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+
+    # 1. Try base64 decode first (safest for host dashboards)
+    try:
+        compact_b64 = "".join(raw.split())
+        decoded = _b64.b64decode(compact_b64, validate=True).decode("utf-8", errors="replace")
+        if "\t" in decoded and any(m in decoded for m in domain_markers):
+            logger.info(f"Decoded {label} cookies from base64.")
+            return decoded.strip()
+    except Exception:
+        pass
+
+    # 2. Unescape literal \n and \t (host dashboards often do this)
+    if "\\n" in raw or "\\t" in raw:
+        unescaped = raw.replace("\\n", "\n").replace("\\t", "\t")
+        if "\t" in unescaped and any(m in unescaped for m in domain_markers):
+            logger.info(f"Unescaped literal \\n/\\t in {label} cookies.")
+            raw = unescaped
+
+    # 3. Cookie-Editor JSON format: [{"domain":".instagram.com","name":"..."}]
+    if raw.startswith("["):
+        try:
+            cookies_json = json.loads(raw)
+            lines = ["# Netscape HTTP Cookie File", ""]
+            for c in cookies_json:
+                domain = c.get("domain", "")
+                if not any(m in domain for m in domain_markers):
+                    continue
+                flag = "TRUE" if domain.startswith(".") else "FALSE"
+                path = c.get("path", "/")
+                secure = "TRUE" if c.get("secure", True) else "FALSE"
+                expiry = str(int(c.get("expirationDate", 0)))
+                name = c.get("name", "")
+                value = c.get("value", "")
+                lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
+            if len(lines) > 2:
+                logger.info(f"Converted Cookie-Editor JSON for {label} ({len(lines) - 2} cookies).")
+                return "\n".join(lines)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    # 4. Header-style: "key=val; key2=val2"
+    if header_domain and "sessionid=" in raw and "\t" not in raw and "\n" not in raw.strip():
+        pairs = [p.strip() for p in raw.split(";") if "=" in p]
+        lines = ["# Netscape HTTP Cookie File", ""]
+        for pair in pairs:
+            name, _, value = pair.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name and value:
+                lines.append(f"{header_domain}\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+        if len(lines) > 2:
+            logger.info(f"Converted header-style {label} cookies ({len(lines) - 2} cookies).")
+            return "\n".join(lines)
+
+    # 5. Already a valid Netscape file
+    return raw
+
+def _normalize_instagram_cookies(raw: str) -> str:
+    """Normalize various Instagram cookie formats into a proper Netscape cookies.txt."""
+    return _normalize_cookies(raw, ("instagram.com",), "Instagram", header_domain=".instagram.com")
 
 YOUTUBE_COOKIES_FILE = None
 cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("YOUTUBE_COOKIE")
 if cookies_env:
     try:
-        tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        with open(tmp_cookie_path, "w", encoding="utf-8") as f:
-            f.write(cookies_env.strip())
-        YOUTUBE_COOKIES_FILE = tmp_cookie_path
-        logger.info("Loaded YouTube cookies from YOUTUBE_COOKIES environment variable.")
+        _yt_cookie_text = _normalize_cookies(cookies_env, ("youtube.com", "google.com"), "YouTube")
+        if _yt_cookie_text:
+            tmp_cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            with open(tmp_cookie_path, "w", encoding="utf-8") as f:
+                f.write(_yt_cookie_text)
+            YOUTUBE_COOKIES_FILE = tmp_cookie_path
+            logger.info("Loaded YouTube cookies from YOUTUBE_COOKIES environment variable.")
+        else:
+            logger.warning("YOUTUBE_COOKIES env var is set but empty after normalization.")
     except Exception as e:
         logger.error(f"Failed to write YOUTUBE_COOKIES to temp file: {e}")
 elif os.path.exists("cookies.txt"):
@@ -165,76 +242,12 @@ def set_youtube_cookies_file(path: str) -> None:
 # instagram_cookies.txt next to the bot. Export from your browser with the
 # "Get cookies.txt LOCALLY" extension while logged into instagram.com.
 #
-# The loader accepts:
+# Both cookie loaders accept:
 #   - A real Netscape cookies.txt (multi-line with tabs)
 #   - A one-line paste with literal \n and \t (from host dashboards)
 #   - Base64-encoded cookies.txt (safest for host dashboards)
 #   - Cookie-Editor JSON export ([{"domain":".instagram.com", ...}])
-#   - A bare "sessionid=...;csrftoken=..." header string
-
-import base64 as _b64
-
-def _normalize_instagram_cookies(raw: str) -> str:
-    """Normalize various cookie formats into a proper Netscape cookies.txt."""
-    raw = raw.strip()
-    if not raw:
-        return ""
-
-    # 1. Try base64 decode first (safest for host dashboards)
-    try:
-        compact_b64 = "".join(raw.split())
-        decoded = _b64.b64decode(compact_b64, validate=True).decode("utf-8", errors="replace")
-        if ".instagram.com" in decoded and "\t" in decoded:
-            logger.info("Decoded Instagram cookies from base64.")
-            return decoded.strip()
-    except Exception:
-        pass
-
-    # 2. Unescape literal \n and \t (host dashboards often do this)
-    if "\\n" in raw or "\\t" in raw:
-        unescaped = raw.replace("\\n", "\n").replace("\\t", "\t")
-        if ".instagram.com" in unescaped and "\t" in unescaped:
-            logger.info("Unescaped literal \\n/\\t in Instagram cookies.")
-            raw = unescaped
-
-    # 3. Cookie-Editor JSON format: [{"domain":".instagram.com","name":"sessionid",...}]
-    if raw.startswith("["):
-        try:
-            cookies_json = json.loads(raw)
-            lines = ["# Netscape HTTP Cookie File", ""]
-            for c in cookies_json:
-                domain = c.get("domain", "")
-                if "instagram.com" not in domain:
-                    continue
-                flag = "TRUE" if domain.startswith(".") else "FALSE"
-                path = c.get("path", "/")
-                secure = "TRUE" if c.get("secure", True) else "FALSE"
-                expiry = str(int(c.get("expirationDate", 0)))
-                name = c.get("name", "")
-                value = c.get("value", "")
-                lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
-            if len(lines) > 2:
-                logger.info(f"Converted Cookie-Editor JSON ({len(lines) - 2} cookies).")
-                return "\n".join(lines)
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-
-    # 4. Header-style: "sessionid=abc; csrftoken=xyz; ds_user_id=123"
-    if "sessionid=" in raw and "\t" not in raw and "\n" not in raw.strip():
-        pairs = [p.strip() for p in raw.split(";") if "=" in p]
-        lines = ["# Netscape HTTP Cookie File", ""]
-        for pair in pairs:
-            name, _, value = pair.partition("=")
-            name = name.strip()
-            value = value.strip()
-            if name and value:
-                lines.append(f".instagram.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
-        if len(lines) > 2:
-            logger.info(f"Converted header-style cookies ({len(lines) - 2} cookies).")
-            return "\n".join(lines)
-
-    # 5. Already a valid Netscape file (has tabs and .instagram.com)
-    return raw
+#   - A bare "sessionid=...;csrftoken=..." header string (Instagram)
 
 INSTAGRAM_COOKIES_FILE = None
 _ig_cookies_env = os.getenv("INSTAGRAM_COOKIES") or os.getenv("INSTAGRAM_COOKIE")
@@ -279,22 +292,24 @@ if not INSTAGRAM_COOKIES_FILE:
         "Set INSTAGRAM_COOKIES env var or place instagram_cookies.txt next to the bot."
     )
 
-# ─── Instagram Proxy & Throttling Setup ───────────────────────────────────────
-_raw_ig_proxies = [
-    p.strip()
-    for p in (os.getenv("INSTAGRAM_PROXY") or os.getenv("INSTAGRAM_PROXIES") or os.getenv("PROXY") or "").split(",")
-    if p.strip()
-]
-_ig_proxy_lock = threading.Lock()
-_ig_proxy_cycle = itertools.cycle(_raw_ig_proxies) if _raw_ig_proxies else None
+# ─── Proxy & Throttling Setup (Instagram + YouTube) ──────────────────────────
+def _build_proxy_rotator(raw_value: str):
+    """Parse a comma-separated proxy list and return (proxies, next_proxy_fn)."""
+    proxies = [p.strip() for p in (raw_value or "").split(",") if p.strip()]
+    lock = threading.Lock()
+    cycle = itertools.cycle(proxies) if proxies else None
 
-def get_instagram_proxy() -> Optional[str]:
-    """Get the next Instagram proxy from the configured rotating list, or None if not set."""
-    if not _ig_proxy_cycle:
-        return None
-    with _ig_proxy_lock:
-        return next(_ig_proxy_cycle)
+    def _next() -> Optional[str]:
+        if not cycle:
+            return None
+        with lock:
+            return next(cycle)
 
+    return proxies, _next
+
+_raw_ig_proxies, get_instagram_proxy = _build_proxy_rotator(
+    os.getenv("INSTAGRAM_PROXY") or os.getenv("INSTAGRAM_PROXIES") or os.getenv("PROXY") or ""
+)
 INSTAGRAM_PROXY = _raw_ig_proxies[0] if _raw_ig_proxies else None
 INSTAGRAM_MAX_CONCURRENT = max(1, int(os.getenv("INSTAGRAM_MAX_CONCURRENT", "1")))
 INSTAGRAM_REQUEST_DELAY = max(0.0, float(os.getenv("INSTAGRAM_REQUEST_DELAY", "2.5")))
@@ -304,7 +319,13 @@ if INSTAGRAM_PROXY:
 else:
     logger.info(f"No Instagram proxy configured (concurrency={INSTAGRAM_MAX_CONCURRENT}, delay={INSTAGRAM_REQUEST_DELAY}s).")
 
-YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or os.getenv("PROXY", "").strip() or None
+_raw_yt_proxies, get_youtube_proxy = _build_proxy_rotator(
+    os.getenv("YOUTUBE_PROXY") or os.getenv("YOUTUBE_PROXIES") or os.getenv("PROXY") or ""
+)
+YOUTUBE_PROXY = _raw_yt_proxies[0] if _raw_yt_proxies else None
+if YOUTUBE_PROXY:
+    logger.info(f"Loaded {len(_raw_yt_proxies)} YouTube proxy endpoint(s).")
+
 YOUTUBE_RELAY_URL = os.getenv("YOUTUBE_RELAY_URL", "").strip().rstrip("/") or None
 
 LOCAL_BOT_API_URL = os.getenv("TELEGRAM_API_URL", "").strip() or os.getenv("LOCAL_BOT_API_URL", "").strip()

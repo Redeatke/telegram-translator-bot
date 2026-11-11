@@ -42,6 +42,7 @@ from config import (
     INSTAGRAM_MAX_CONCURRENT,
     INSTAGRAM_REQUEST_DELAY,
     YOUTUBE_PROXY,
+    get_youtube_proxy,
     YOUTUBE_RELAY_URL,
     MAX_UPLOAD_SIZE_MB,
     MAX_VIDEO_DURATION,
@@ -391,6 +392,8 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             logger.info("Termux environment detected — using lightweight download settings.")
 
         is_audio = str(quality).lower() in ("audio", "mp3")
+        yt_proxy = get_youtube_proxy()
+        pytube_proxies = {"http": yt_proxy, "https": yt_proxy} if yt_proxy else None
 
         # ─── OPTION A: MP3 Audio Download (Dedicated Single Strategy) ───
         if is_audio:
@@ -399,7 +402,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             if has_pytubefix:
                 try:
                     logger.info(f"Using pytubefix fast audio engine for {url}...")
-                    yt = PytubeFixYouTube(url)
+                    yt = PytubeFixYouTube(url, proxies=pytube_proxies) if pytube_proxies else PytubeFixYouTube(url)
                     audio_streams = yt.streams.filter(only_audio=True)
                     stream = None
                     if audio_streams:
@@ -445,8 +448,8 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 }
                 if not use_fallback_clients:
                     opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
-                if YOUTUBE_PROXY:
-                    opts['proxy'] = YOUTUBE_PROXY
+                if yt_proxy:
+                    opts['proxy'] = yt_proxy
                 if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
                     opts['cookiefile'] = YOUTUBE_COOKIES_FILE
                 return opts
@@ -502,8 +505,8 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             }
             if not use_fallback_clients:
                 opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
-            if YOUTUBE_PROXY:
-                opts['proxy'] = YOUTUBE_PROXY
+            if yt_proxy:
+                opts['proxy'] = yt_proxy
             if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
                 opts['cookiefile'] = YOUTUBE_COOKIES_FILE
             return opts
@@ -522,7 +525,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
         if has_pytubefix:
             try:
                 logger.info(f"Trying pytubefix video fallback for {url}...")
-                yt = PytubeFixYouTube(url)
+                yt = PytubeFixYouTube(url, proxies=pytube_proxies) if pytube_proxies else PytubeFixYouTube(url)
                 stream = yt.streams.filter(progressive=True, file_extension='mp4').get_highest_resolution() or yt.streams.filter(progressive=True).get_highest_resolution()
                 if stream:
                     fp = stream.download(output_path=output_dir, filename=f"{filename}.mp4")
@@ -747,7 +750,11 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
 async def is_youtube_live(url: str) -> bool:
     """Check whether a YouTube URL is a currently-active live stream via a plain page fetch (fast, no yt-dlp/GetPOT involved)."""
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        yt_proxy = get_youtube_proxy()
+        client_kwargs = {"timeout": 8.0, "follow_redirects": True}
+        if yt_proxy:
+            client_kwargs["proxy"] = yt_proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
             resp = await client.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US"},

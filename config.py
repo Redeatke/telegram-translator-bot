@@ -304,7 +304,7 @@ if INSTAGRAM_PROXY:
 else:
     logger.info(f"No Instagram proxy configured (concurrency={INSTAGRAM_MAX_CONCURRENT}, delay={INSTAGRAM_REQUEST_DELAY}s).")
 
-YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or None
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip() or os.getenv("PROXY", "").strip() or None
 YOUTUBE_RELAY_URL = os.getenv("YOUTUBE_RELAY_URL", "").strip().rstrip("/") or None
 
 LOCAL_BOT_API_URL = os.getenv("TELEGRAM_API_URL", "").strip() or os.getenv("LOCAL_BOT_API_URL", "").strip()

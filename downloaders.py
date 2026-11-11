@@ -27,7 +27,10 @@ import card
 import httpx
 import yt_dlp
 import yt_dlp.plugins
-yt_dlp.plugins.load_plugins = lambda *a, **k: None
+# Disable yt-dlp plugin auto-loading on local/Termux runs where bgutil isn't pre-built,
+# so Strategy 1 never stalls waiting on missing local PO-token scripts.
+if not os.path.exists("/root/bgutil-ytdlp-pot-provider"):
+    yt_dlp.plugins.load_plugins = lambda *a, **k: None
 from yt_dlp.extractor.instagram import InstagramBaseIE
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import ContextTypes
@@ -414,36 +417,45 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 except Exception as pe:
                     logger.warning(f"pytubefix audio engine failed: {pe}, falling back to yt-dlp...")
 
-            # Fallback yt-dlp audio strategy (clean, mobile client, strictly selects original audio)
-            ydl_opts = {
-                'outtmpl': output_template,
-                'format': 'bestaudio[format_note*=original]/bestaudio[language=original]/bestaudio[language=en]/bestaudio/best',
-                'format_sort': ['lang:original', 'ext:m4a:10', 'quality'],
-                'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
-                'compat_opts': ['no-plugins'],
-                'source_address': '0.0.0.0',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
-                'concurrent_fragment_downloads': _concurrent_frags,
-                'socket_timeout': _sock_timeout,
-                'retries': 1,
-                'extractor_retries': 0,
-                'quiet': not os.getenv('YT_DEBUG'),
-                'nocheckcertificate': True,
-            }
-            if YOUTUBE_PROXY:
-                ydl_opts['proxy'] = YOUTUBE_PROXY
-            if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-                ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+            def _make_audio_opts(use_fallback_clients: bool = False) -> dict:
+                opts = {
+                    'outtmpl': output_template,
+                    'format': 'bestaudio[format_note*=original]/bestaudio[language=original]/bestaudio[language=en]/bestaudio/best',
+                    'format_sort': ['lang:original', 'ext:m4a:10', 'quality'],
+                    'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
+                    'source_address': '0.0.0.0',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'concurrent_fragment_downloads': _concurrent_frags,
+                    'socket_timeout': _sock_timeout,
+                    'retries': 1,
+                    'extractor_retries': 0,
+                    'quiet': not os.getenv('YT_DEBUG'),
+                    'nocheckcertificate': True,
+                }
+                if not use_fallback_clients:
+                    opts['compat_opts'] = ['no-plugins']
+                    opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+                if YOUTUBE_PROXY:
+                    opts['proxy'] = YOUTUBE_PROXY
+                if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+                    opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+                return opts
 
-            result = _run_single_strategy(ydl_opts, url, 1)
-            if result:
-                return result
-            raise Exception("Failed to download YouTube audio.")
+            last_audio_err = None
+            for idx, fallback_mode in enumerate((False, True), start=1):
+                try:
+                    result = _run_single_strategy(_make_audio_opts(fallback_mode), url, idx)
+                    if result:
+                        return result
+                except Exception as ae:
+                    last_audio_err = ae
+                    logger.warning(f"yt-dlp audio strategy {idx} failed: {ae}")
+
+            raise Exception(f"Failed to download YouTube audio: {last_audio_err or 'unknown error'}")
 
         # ─── OPTION B: Video Download (Dedicated Single Strategy) ───
         try:
@@ -463,35 +475,41 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             f'best[height<={q_val}]/'
             f'best'
         )
-        ydl_opts = {
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4',
-            'format': fast_format,
-            'format_sort': ['lang:original', 'res', 'fps'],
-            'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
-            'compat_opts': ['no-plugins'],
-            'source_address': '0.0.0.0',
-            'postprocessor_args': {'merger': ['-c:v', 'copy', '-c:a', 'aac']},
-            'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
-            'concurrent_fragment_downloads': _concurrent_frags,
-            'socket_timeout': _sock_timeout,
-            'retries': 1,
-            'extractor_retries': 0,
-            'quiet': not os.getenv('YT_DEBUG'),
-            'verbose': bool(os.getenv('YT_DEBUG')),
-            'nocheckcertificate': True,
-        }
-        if YOUTUBE_PROXY:
-            ydl_opts['proxy'] = YOUTUBE_PROXY
-        if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-            ydl_opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+        def _make_video_opts(use_fallback_clients: bool = False) -> dict:
+            opts = {
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'format': fast_format,
+                'format_sort': ['lang:original', 'res', 'fps'],
+                'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
+                'source_address': '0.0.0.0',
+                'postprocessor_args': {'merger': ['-c:v', 'copy', '-c:a', 'aac']},
+                'concurrent_fragment_downloads': _concurrent_frags,
+                'socket_timeout': _sock_timeout,
+                'retries': 1,
+                'extractor_retries': 0,
+                'quiet': not os.getenv('YT_DEBUG'),
+                'verbose': bool(os.getenv('YT_DEBUG')),
+                'nocheckcertificate': True,
+            }
+            if not use_fallback_clients:
+                opts['compat_opts'] = ['no-plugins']
+                opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+            if YOUTUBE_PROXY:
+                opts['proxy'] = YOUTUBE_PROXY
+            if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+                opts['cookiefile'] = YOUTUBE_COOKIES_FILE
+            return opts
 
-        try:
-            result = _run_single_strategy(ydl_opts, url, 1)
-            if result:
-                return result
-        except Exception as e:
-            logger.warning(f"yt-dlp video download failed: {e}")
+        last_err = None
+        for idx, fallback_mode in enumerate((False, True), start=1):
+            try:
+                result = _run_single_strategy(_make_video_opts(fallback_mode), url, idx)
+                if result:
+                    return result
+            except Exception as e:
+                last_err = e
+                logger.warning(f"yt-dlp video strategy {idx} failed: {e}")
 
         # Fallback to pytubefix for video (progressive only to ensure sound)
         if has_pytubefix:
@@ -508,8 +526,10 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                     }
             except Exception as pe:
                 logger.warning(f"pytubefix video fallback failed: {pe}")
+                if not last_err:
+                    last_err = pe
 
-        raise Exception("Failed to download YouTube video after trying available engines.")
+        raise Exception(str(last_err) if last_err else "Failed to download YouTube video after trying available engines.")
 
     try:
         return await asyncio.wait_for(
@@ -679,12 +699,15 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
             await status_msg.edit_text(fmt_warning("This is an active live stream and cannot be downloaded until it ends."))
         elif '429' in error_lower or 'too many requests' in error_lower:
             await status_msg.edit_text(fmt_warning("YouTube is temporarily rate-limiting requests. Please try again in a moment."))
+        elif 'sign in to confirm' in error_lower or 'not a bot' in error_lower:
+            await status_msg.edit_text(fmt_warning("YouTube blocked this server's request (bot verification required)."))
         elif 'private' in error_lower or 'unavailable' in error_lower:
             await status_msg.edit_text(fmt_error("This video is private or unavailable."))
         elif 'age' in error_lower:
             await status_msg.edit_text(fmt_error("This video is age-restricted and cannot be downloaded."))
         else:
             await status_msg.edit_text(fmt_error("Couldn't download this video."))
+        await send_media_error_dm(context, target_message, yt_url, "YouTube", error_str)
     except Exception as e:
         error_str = str(e)
         logger.error(f"YouTube download failed for {yt_url}: {type(e).__name__}: {e}")
@@ -692,6 +715,11 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
         if 'too large' in error_lower or '413' in error_lower or 'file is too big' in error_lower:
             try:
                 await status_msg.edit_text(fmt_warning("This file exceeds Telegram's upload limits for this server."))
+            except Exception:
+                pass
+        elif 'sign in to confirm' in error_lower or 'not a bot' in error_lower:
+            try:
+                await status_msg.edit_text(fmt_warning("YouTube blocked this server's request (bot verification required)."))
             except Exception:
                 pass
         elif 'timed out' in error_lower:
@@ -704,6 +732,7 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                 await status_msg.edit_text(fmt_error("Something went wrong processing this video."))
             except Exception:
                 pass
+        await send_media_error_dm(context, target_message, yt_url, "YouTube", error_str)
     finally:
         _active_yt_downloads.discard(key)
 

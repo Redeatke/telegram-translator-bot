@@ -448,10 +448,12 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 }
                 if not use_fallback_clients:
                     opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+                else:
+                    opts['js_runtimes'] = {'deno': {}, 'node': {}}
+                    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+                        opts['cookiefile'] = YOUTUBE_COOKIES_FILE
                 if yt_proxy:
                     opts['proxy'] = yt_proxy
-                if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-                    opts['cookiefile'] = YOUTUBE_COOKIES_FILE
                 return opts
 
             last_audio_err = None
@@ -505,10 +507,12 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
             }
             if not use_fallback_clients:
                 opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+            else:
+                opts['js_runtimes'] = {'deno': {}, 'node': {}}
+                if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+                    opts['cookiefile'] = YOUTUBE_COOKIES_FILE
             if yt_proxy:
                 opts['proxy'] = yt_proxy
-            if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-                opts['cookiefile'] = YOUTUBE_COOKIES_FILE
             return opts
 
         last_err = None

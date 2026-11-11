@@ -23,6 +23,7 @@ from telegram.ext import ContextTypes
 import card
 from config import (
     TWITTER_URL_PATTERN,
+    LOCAL_BOT_API_URL,
     MAX_UPLOAD_SIZE_MB,
     should_skip_message,
     is_downloader_enabled,
@@ -31,6 +32,7 @@ from config import (
     media_cache,
     logger,
 )
+from telethon_downloader import is_telethon_available, upload_media_via_telethon
 
 
 async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -263,18 +265,37 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
 
         if video_bytes:
             try:
-                sent_msg = await update.message.reply_video(
-                    video=video_bytes,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                    supports_streaming=True,
-                    reply_to_message_id=update.message.message_id
-                )
-                if sent_msg and sent_msg.video:
-                    media_cache.set(f"vid:{sent_msg.video.file_id}", video_bytes)
-                if sent_msg:
-                    media_cache.set(f"msg_vid:{sent_msg.chat_id}:{sent_msg.message_id}", video_bytes)
+                if (not LOCAL_BOT_API_URL) and (len(video_bytes) > 49 * 1024 * 1024) and is_telethon_available():
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                        tf.write(video_bytes)
+                        tmp_tw_path = tf.name
+                    try:
+                        await upload_media_via_telethon(
+                            chat_id=update.message.chat_id,
+                            file_path=tmp_tw_path,
+                            caption=caption,
+                            reply_to_message_id=update.message.message_id,
+                            button_text="↗️ View on 𝕏",
+                            button_url=tweet_url,
+                        )
+                    finally:
+                        try:
+                            os.remove(tmp_tw_path)
+                        except OSError:
+                            pass
+                else:
+                    sent_msg = await update.message.reply_video(
+                        video=video_bytes,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                        supports_streaming=True,
+                        reply_to_message_id=update.message.message_id
+                    )
+                    if sent_msg and sent_msg.video:
+                        media_cache.set(f"vid:{sent_msg.video.file_id}", video_bytes)
+                    if sent_msg:
+                        media_cache.set(f"msg_vid:{sent_msg.chat_id}:{sent_msg.message_id}", video_bytes)
                 logger.info(f"Sent auto-playing Twitter video for @{username}/status/{tweet_id}")
                 return
             except Exception as e:

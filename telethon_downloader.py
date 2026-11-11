@@ -6,9 +6,11 @@ bypassing the standard Telegram Bot API 20MB getFile limit.
 """
 
 import os
+import json
 import logging
 import asyncio
 import tempfile
+import subprocess
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -123,3 +125,109 @@ async def download_message_media(chat_id: int, message_id: int, output_path: str
     except Exception as e:
         logger.error(f"Telethon download_media failed for {chat_id}:{message_id}: {type(e).__name__}: {e}")
         return False
+
+
+def _probe_video_metadata(file_path: str) -> Tuple[int, int, int]:
+    """Return (duration_seconds, width, height) via ffprobe, or (0, 0, 0) on failure."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,duration:format=duration",
+                "-of", "json",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return 0, 0, 0
+        data = json.loads(proc.stdout)
+        streams = data.get("streams") or []
+        fmt = data.get("format") or {}
+        width = int(streams[0].get("width") or 0) if streams else 0
+        height = int(streams[0].get("height") or 0) if streams else 0
+        raw_dur = (streams[0].get("duration") if streams else None) or fmt.get("duration") or 0
+        duration = int(float(raw_dur)) if raw_dur else 0
+        return duration, width, height
+    except Exception:
+        return 0, 0, 0
+
+
+async def upload_media_via_telethon(
+    chat_id: int,
+    file_path: str,
+    caption: str = "",
+    reply_to_message_id: Optional[int] = None,
+    is_audio: bool = False,
+    title: str = "",
+    duration: int = 0,
+    button_text: Optional[str] = None,
+    button_url: Optional[str] = None,
+    timeout: float = 600.0,
+) -> bool:
+    """Upload media up to 2GB directly via Telethon MTProto (bypassing Bot API 50MB limit)."""
+    global _client
+    client = await get_telethon_client()
+    if not client:
+        raise RuntimeError("Telethon MTProto client is unavailable for high-capacity upload.")
+
+    from telethon import Button
+    from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
+
+    attributes = []
+    if is_audio:
+        attributes.append(
+            DocumentAttributeAudio(
+                duration=int(duration or 0),
+                title=title or os.path.basename(file_path),
+            )
+        )
+    elif file_path.lower().endswith((".mp4", ".mov", ".mkv", ".webm", ".m4v")):
+        probed_dur, width, height = await asyncio.get_running_loop().run_in_executor(
+            None, _probe_video_metadata, file_path
+        )
+        final_dur = int(duration or probed_dur or 0)
+        if width > 0 and height > 0:
+            attributes.append(
+                DocumentAttributeVideo(
+                    duration=final_dur,
+                    w=width,
+                    h=height,
+                    supports_streaming=True,
+                )
+            )
+
+    buttons = [[Button.url(button_text, button_url)]] if (button_text and button_url) else None
+
+    try:
+        entity = await client.get_input_entity(chat_id)
+        await asyncio.wait_for(
+            client.send_file(
+                entity=entity,
+                file=file_path,
+                caption=caption or None,
+                parse_mode="html",
+                reply_to=reply_to_message_id,
+                supports_streaming=not is_audio,
+                attributes=attributes or None,
+                buttons=buttons,
+            ),
+            timeout=timeout,
+        )
+        logger.info(
+            f"Uploaded {os.path.getsize(file_path) / (1024 * 1024):.1f} MB via Telethon MTProto to chat {chat_id}"
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"Telethon upload timed out after {timeout}s for chat {chat_id}. Resetting client.")
+        _client = None
+        raise TimeoutError(f"Telegram MTProto upload timed out after {int(timeout)}s.")
+    except Exception as e:
+        logger.error(f"Telethon upload failed for chat {chat_id}: {type(e).__name__}: {e}")
+        if not client.is_connected():
+            _client = None
+        raise

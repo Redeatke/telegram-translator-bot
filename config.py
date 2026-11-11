@@ -17,6 +17,7 @@ import threading
 import itertools
 from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
+from telethon_downloader import is_telethon_available
 
 # Detect Termux environment
 IS_TERMUX = bool(os.getenv("TERMUX_VERSION") or (os.getenv("PREFIX", "").startswith("/data/data/com.termux")))
@@ -329,8 +330,13 @@ if YOUTUBE_PROXY:
 YOUTUBE_RELAY_URL = os.getenv("YOUTUBE_RELAY_URL", "").strip().rstrip("/") or None
 
 LOCAL_BOT_API_URL = os.getenv("TELEGRAM_API_URL", "").strip() or os.getenv("LOCAL_BOT_API_URL", "").strip()
-MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "2000" if LOCAL_BOT_API_URL else "50"))
+HAS_TELETHON_UPLOAD = is_telethon_available()
+MAX_UPLOAD_SIZE_MB = int(
+    os.getenv("MAX_UPLOAD_SIZE_MB", "2000" if (LOCAL_BOT_API_URL or HAS_TELETHON_UPLOAD) else "50")
+)
 MAX_VIDEO_DURATION = 1800  # 30 minutes
+if HAS_TELETHON_UPLOAD and not LOCAL_BOT_API_URL:
+    logger.info(f"Telethon MTProto upload enabled (up to {MAX_UPLOAD_SIZE_MB} MB for files >50 MB).")
 
 
 # ─── User State ───────────────────────────────────────────────────────────────

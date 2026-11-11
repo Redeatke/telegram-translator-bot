@@ -44,6 +44,7 @@ from config import (
     YOUTUBE_PROXY,
     get_youtube_proxy,
     YOUTUBE_RELAY_URL,
+    LOCAL_BOT_API_URL,
     MAX_UPLOAD_SIZE_MB,
     MAX_VIDEO_DURATION,
     should_skip_message,
@@ -70,6 +71,7 @@ from config import (
     url_media_cache,
     logger,
 )
+from telethon_downloader import is_telethon_available, upload_media_via_telethon
 
 # Patch Instagram extractor for photo carousels
 _orig_ig_extract_product_media = InstagramBaseIE._extract_product_media
@@ -243,9 +245,9 @@ def cache_uploaded_media(cache_key: Optional[str], media_type: str, sent_message
             items = []
             msgs = sent_message_or_list if isinstance(sent_message_or_list, list) else [sent_message_or_list]
             for m in msgs:
-                if getattr(m, 'video', None):
+                if getattr(m, 'video', None) and isinstance(getattr(m.video, 'file_id', None), str):
                     items.append({"type": "video", "file_id": m.video.file_id})
-                elif getattr(m, 'photo', None):
+                elif getattr(m, 'photo', None) and isinstance(getattr(m.photo[-1], 'file_id', None), str):
                     items.append({"type": "photo", "file_id": m.photo[-1].file_id})
             if items:
                 url_media_cache.set(cache_key, {
@@ -256,7 +258,7 @@ def cache_uploaded_media(cache_key: Optional[str], media_type: str, sent_message
                 })
         elif media_type == "video":
             msg = sent_message_or_list
-            if getattr(msg, 'video', None):
+            if getattr(msg, 'video', None) and isinstance(getattr(msg.video, 'file_id', None), str):
                 url_media_cache.set(cache_key, {
                     "type": "video",
                     "file_id": msg.video.file_id,
@@ -266,7 +268,7 @@ def cache_uploaded_media(cache_key: Optional[str], media_type: str, sent_message
                 })
         elif media_type == "photo":
             msg = sent_message_or_list
-            if getattr(msg, 'photo', None):
+            if getattr(msg, 'photo', None) and isinstance(getattr(msg.photo[-1], 'file_id', None), str):
                 url_media_cache.set(cache_key, {
                     "type": "photo",
                     "file_id": msg.photo[-1].file_id,
@@ -275,6 +277,119 @@ def cache_uploaded_media(cache_key: Optional[str], media_type: str, sent_message
                 })
     except Exception as e:
         logger.warning(f"Failed to cache uploaded media for {cache_key}: {e}")
+
+
+BOT_API_SAFE_BYTES = 49 * 1024 * 1024
+
+
+async def _send_media_file(
+    target_message,
+    filepath: str,
+    *,
+    media_kind: str = "video",
+    caption: str = "",
+    parse_mode: Optional[str] = "HTML",
+    title: str = "",
+    duration: int = 0,
+    reply_to_message_id: Optional[int] = None,
+):
+    """Send a video, audio, or photo via Bot API, routing >49MB files through Telethon MTProto when available."""
+    file_size = os.path.getsize(filepath)
+    use_mtproto = (not LOCAL_BOT_API_URL) and (file_size > BOT_API_SAFE_BYTES) and is_telethon_available()
+    is_audio = media_kind == "audio"
+
+    if use_mtproto:
+        await upload_media_via_telethon(
+            chat_id=target_message.chat_id,
+            file_path=filepath,
+            caption=caption,
+            reply_to_message_id=reply_to_message_id,
+            is_audio=is_audio,
+            title=title,
+            duration=duration,
+        )
+        return None
+
+    async def _via_bot_api():
+        if media_kind == "photo":
+            with open(filepath, "rb") as f:
+                return await target_message.reply_photo(
+                    photo=InputFile(f, filename=os.path.basename(filepath), read_file_handle=False),
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=reply_to_message_id,
+                    read_timeout=300,
+                    write_timeout=300,
+                )
+        if is_audio:
+            try:
+                with open(filepath, "rb") as f:
+                    return await target_message.reply_audio(
+                        audio=InputFile(f, filename=os.path.basename(filepath), read_file_handle=False),
+                        title=title,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                        duration=int(duration) if duration else None,
+                        reply_to_message_id=reply_to_message_id,
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
+            except Exception as upload_err:
+                if any(m in str(upload_err).lower() for m in ("413", "too large", "too big", "entity")):
+                    raise
+                logger.warning(f"reply_audio failed ({upload_err}), attempting reply_document fallback...")
+                with open(filepath, "rb") as f:
+                    return await target_message.reply_document(
+                        document=InputFile(f, filename=os.path.basename(filepath), read_file_handle=False),
+                        caption=caption,
+                        parse_mode=parse_mode,
+                        reply_to_message_id=reply_to_message_id,
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
+        try:
+            with open(filepath, "rb") as f:
+                return await target_message.reply_video(
+                    video=InputFile(f, filename=os.path.basename(filepath), read_file_handle=False),
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    duration=int(duration) if duration else None,
+                    supports_streaming=True,
+                    reply_to_message_id=reply_to_message_id,
+                    read_timeout=300,
+                    write_timeout=300,
+                )
+        except Exception as upload_err:
+            if any(m in str(upload_err).lower() for m in ("413", "too large", "too big", "entity")):
+                raise
+            logger.warning(f"reply_video failed ({upload_err}), attempting reply_document fallback...")
+            with open(filepath, "rb") as f:
+                return await target_message.reply_document(
+                    document=InputFile(f, filename=os.path.basename(filepath), read_file_handle=False),
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=reply_to_message_id,
+                    read_timeout=300,
+                    write_timeout=300,
+                )
+
+    try:
+        return await _via_bot_api()
+    except Exception as bot_err:
+        err_low = str(bot_err).lower()
+        if any(m in err_low for m in ("413", "too large", "too big", "entity")) and is_telethon_available():
+            logger.warning(f"Bot API hit size limit ({bot_err}); retrying via Telethon MTProto...")
+            await upload_media_via_telethon(
+                chat_id=target_message.chat_id,
+                file_path=filepath,
+                caption=caption,
+                reply_to_message_id=reply_to_message_id,
+                is_audio=is_audio,
+                title=title,
+                duration=duration,
+            )
+            return None
+        raise
 
 try:
     from pytubefix import YouTube as PytubeFixYouTube
@@ -663,51 +778,28 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                     await context.bot.send_chat_action(
                         chat_id=target_message.chat_id, action="upload_document"
                     )
-                    try:
-                        with open(filepath, 'rb') as audio_file:
-                            input_audio = InputFile(audio_file, filename=os.path.basename(filepath), read_file_handle=False)
-                            await target_message.reply_audio(
-                                audio=input_audio,
-                                title=title,
-                                caption=f"🎵 {title}",
-                                duration=int(duration) if duration else None,
-                                read_timeout=300,
-                                write_timeout=300,
-                            )
-                    except Exception as upload_err:
-                        logger.warning(f"reply_audio failed ({upload_err}), attempting reply_document fallback...")
-                        with open(filepath, 'rb') as audio_file:
-                            input_doc = InputFile(audio_file, filename=os.path.basename(filepath), read_file_handle=False)
-                            await target_message.reply_document(
-                                document=input_doc,
-                                caption=f"🎵 {title}",
-                                read_timeout=300,
-                                write_timeout=300,
-                            )
+                    await _send_media_file(
+                        target_message,
+                        filepath,
+                        media_kind="audio",
+                        caption=f"🎵 {html.escape(title)}",
+                        parse_mode="HTML",
+                        title=title,
+                        duration=int(duration) if duration else 0,
+                    )
                 else:
                     await context.bot.send_chat_action(
                         chat_id=target_message.chat_id, action="upload_video"
                     )
-                    try:
-                        with open(filepath, 'rb') as video_file:
-                            input_video = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
-                            await target_message.reply_video(
-                                video=input_video,
-                                caption=f"📹 {title}",
-                                supports_streaming=True,
-                                read_timeout=300,
-                                write_timeout=300,
-                            )
-                    except Exception as upload_err:
-                        logger.warning(f"reply_video failed ({upload_err}), attempting reply_document fallback...")
-                        with open(filepath, 'rb') as video_file:
-                            input_doc = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
-                            await target_message.reply_document(
-                                document=input_doc,
-                                caption=f"📹 {title}",
-                                read_timeout=300,
-                                write_timeout=300,
-                            )
+                    await _send_media_file(
+                        target_message,
+                        filepath,
+                        media_kind="video",
+                        caption=f"📹 {html.escape(title)}",
+                        parse_mode="HTML",
+                        title=title,
+                        duration=int(duration) if duration else 0,
+                    )
 
                 try:
                     await status_msg.delete()
@@ -1011,9 +1103,9 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
             duration = int(clip_info.get('duration', 0))
 
             file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:
+            if file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 await status_msg.edit_text(
-                    fmt_warning(f"This clip exceeds Telegram's 50MB bot upload limit ({file_size / (1024*1024):.1f}MB).")
+                    fmt_warning(f"This clip exceeds Telegram's {MAX_UPLOAD_SIZE_MB}MB bot upload limit ({file_size / (1024*1024):.1f}MB).")
                 )
                 return
 
@@ -1025,16 +1117,16 @@ async def handle_twitch_clip_message(update: Update, context: ContextTypes.DEFAU
 
             await status_msg.edit_text("📤 Uploading clip to Telegram...")
 
-            with open(filepath, "rb") as video_file:
-                input_video = InputFile(video_file, filename=os.path.basename(filepath), read_file_handle=False)
-                sent_msg = await update.message.reply_video(
-                    video=input_video,
-                    caption=caption,
-                    parse_mode="HTML",
-                    duration=duration,
-                    supports_streaming=True,
-                    reply_to_message_id=update.message.message_id
-                )
+            sent_msg = await _send_media_file(
+                update.message,
+                filepath,
+                media_kind="video",
+                caption=caption,
+                parse_mode="HTML",
+                title=title,
+                duration=duration,
+                reply_to_message_id=update.message.message_id,
+            )
             cache_uploaded_media(cache_key, "video", sent_msg, title, uploader, duration)
 
             try:
@@ -1270,27 +1362,18 @@ async def execute_generic_media_download(target_message, url: str, platform_name
             await status_msg.edit_text("📤 Uploading to Telegram...")
 
             is_image = filepath.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
-            sent_msg = None
-            if is_image:
-                with open(filepath, "rb") as photo_file:
-                    sent_msg = await target_message.reply_photo(
-                        photo=photo_file,
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_to_message_id=target_message.message_id
-                    )
-                cache_uploaded_media(cache_key, "photo", sent_msg, title, uploader)
-            else:
-                with open(filepath, "rb") as video_file:
-                    sent_msg = await target_message.reply_video(
-                        video=video_file,
-                        caption=caption,
-                        parse_mode="HTML",
-                        duration=duration,
-                        supports_streaming=True,
-                        reply_to_message_id=target_message.message_id
-                    )
-                cache_uploaded_media(cache_key, "video", sent_msg, title, uploader, duration)
+            media_kind = "photo" if is_image else "video"
+            sent_msg = await _send_media_file(
+                target_message,
+                filepath,
+                media_kind=media_kind,
+                caption=caption,
+                parse_mode="HTML",
+                title=title,
+                duration=duration,
+                reply_to_message_id=target_message.message_id,
+            )
+            cache_uploaded_media(cache_key, media_kind, sent_msg, title, uploader, duration)
 
             try:
                 await status_msg.delete()
@@ -1534,11 +1617,15 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
                     if not os.path.exists(tmp_video_path) or os.path.getsize(tmp_video_path) == 0:
                         raise Exception("Downloaded Instagram video file is empty.")
 
-                    with open(tmp_video_path, "rb") as video_file:
-                        sent_msg = await target_message.reply_video(
-                            video=video_file, caption=caption, parse_mode="HTML",
-                            supports_streaming=True, reply_to_message_id=target_message.message_id
-                        )
+                    sent_msg = await _send_media_file(
+                        target_message,
+                        tmp_video_path,
+                        media_kind="video",
+                        caption=caption,
+                        parse_mode="HTML",
+                        title=data.get('title') or 'Instagram Video',
+                        reply_to_message_id=target_message.message_id,
+                    )
                     cache_uploaded_media(cache_key, "video", sent_msg, data.get('title'), data.get('uploader'))
 
             # ── Photos or Multi-item Carousel ──

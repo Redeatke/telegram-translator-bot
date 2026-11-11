@@ -27,10 +27,8 @@ import card
 import httpx
 import yt_dlp
 import yt_dlp.plugins
-# Disable yt-dlp plugin auto-loading on local/Termux runs where bgutil isn't pre-built,
-# so Strategy 1 never stalls waiting on missing local PO-token scripts.
-if not os.path.exists("/root/bgutil-ytdlp-pot-provider"):
-    yt_dlp.plugins.load_plugins = lambda *a, **k: None
+# Disable yt-dlp plugin auto-loading (bgutil spawns deno/node and stalls/OOMs on constrained container CPUs).
+yt_dlp.plugins.load_plugins = lambda *a, **k: None
 from yt_dlp.extractor.instagram import InstagramBaseIE
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import ContextTypes
@@ -367,18 +365,25 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                     }
                 return None
 
-        # Use a dedicated thread with a timeout guard
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(_inner)
-            try:
-                return fut.result(timeout=_strategy_timeout)
-            except concurrent.futures.TimeoutError:
-                if fut.done() and not fut.exception():
-                    res = fut.result()
-                    if res:
-                        return res
-                logger.warning(f"yt-dlp strategy {strategy_num} timed out after {_strategy_timeout}s for {url}")
-                raise Exception(f"Strategy {strategy_num} timed out after {_strategy_timeout}s")
+        # Use a dedicated thread with a non-blocking timeout guard (never wait on a hung thread)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(_inner)
+        try:
+            res = fut.result(timeout=_strategy_timeout)
+            pool.shutdown(wait=False)
+            return res
+        except concurrent.futures.TimeoutError:
+            if fut.done() and not fut.exception():
+                res = fut.result()
+                pool.shutdown(wait=False)
+                if res:
+                    return res
+            pool.shutdown(wait=False, cancel_futures=True)
+            logger.warning(f"yt-dlp strategy {strategy_num} timed out after {_strategy_timeout}s for {url}")
+            raise Exception(f"Strategy {strategy_num} timed out after {_strategy_timeout}s")
+        except Exception:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
 
     def _download():
         logger.info(f"Downloading YouTube media: {url} (quality={quality})...")
@@ -424,6 +429,8 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                     'format_sort': ['lang:original', 'ext:m4a:10', 'quality'],
                     'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
                     'source_address': '0.0.0.0',
+                    'noplaylist': True,
+                    'compat_opts': ['no-plugins'],
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
@@ -437,7 +444,6 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                     'nocheckcertificate': True,
                 }
                 if not use_fallback_clients:
-                    opts['compat_opts'] = ['no-plugins']
                     opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
                 if YOUTUBE_PROXY:
                     opts['proxy'] = YOUTUBE_PROXY
@@ -483,6 +489,8 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 'format_sort': ['lang:original', 'res', 'fps'],
                 'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
                 'source_address': '0.0.0.0',
+                'noplaylist': True,
+                'compat_opts': ['no-plugins'],
                 'postprocessor_args': {'merger': ['-c:v', 'copy', '-c:a', 'aac']},
                 'concurrent_fragment_downloads': _concurrent_frags,
                 'socket_timeout': _sock_timeout,
@@ -493,7 +501,6 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
                 'nocheckcertificate': True,
             }
             if not use_fallback_clients:
-                opts['compat_opts'] = ['no-plugins']
                 opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
             if YOUTUBE_PROXY:
                 opts['proxy'] = YOUTUBE_PROXY

@@ -282,7 +282,7 @@ try:
 except ImportError:
     has_pytubefix = False
 
-async def download_youtube_via_relay(url: str, output_dir: str, quality=720) -> dict:
+async def download_youtube_via_relay(url: str, output_dir: str, quality=1080) -> dict:
     """Download a YouTube video via the home relay API. The relay runs on a
     residential IP and streams the file back to us."""
     relay_auth = os.getenv("RELAY_AUTH", "").strip()
@@ -333,7 +333,7 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality=720) -> 
         }
 
 
-async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dict:
+async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> dict:
     """Download a YouTube video directly on the local host with optimized mobile clients."""
     filename = f"{uuid.uuid4().hex}"
     output_template = os.path.join(output_dir, f"{filename}.%(ext)s")
@@ -472,26 +472,24 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
         try:
             q_val = int(quality)
         except (ValueError, TypeError):
-            q_val = 720
+            q_val = 1080
 
         logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
-        # Prioritize H.264 video + AAC audio; automatically muxes to standard AAC so audio plays on iOS/Android/Telegram
+        # Prioritize H.264 video + AAC audio; format_sort 'res:{q_val}' handles both landscape and portrait (Shorts) up to q_val
         fast_format = (
-            f'bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[format_note*=original][acodec^=mp4a]/'
-            f'bestvideo[height<={q_val}][vcodec^=avc]+bestaudio[acodec^=mp4a]/'
-            f'bestvideo[height<={q_val}][ext=mp4]+bestaudio[ext=m4a]/'
-            f'bestvideo[height<={q_val}]+bestaudio/'
-            f'bestvideo[width<={q_val}]+bestaudio/'
-            f'best[height<={q_val}][ext=mp4]/'
-            f'best[height<={q_val}]/'
-            f'best'
+            'bestvideo[vcodec^=avc]+bestaudio[format_note*=original][acodec^=mp4a]/'
+            'bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/'
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo+bestaudio/'
+            'best[ext=mp4]/'
+            'best'
         )
         def _make_video_opts(use_fallback_clients: bool = False) -> dict:
             opts = {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': fast_format,
-                'format_sort': ['lang:original', 'res', 'fps'],
+                'format_sort': [f'res:{q_val}', 'lang:original', 'vcodec:avc', 'acodec:mp4a', 'fps'],
                 'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
                 'source_address': '0.0.0.0',
                 'noplaylist': True,
@@ -554,7 +552,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=720) -> dic
         raise Exception("YouTube download timed out after 5 minutes.")
 
 
-async def download_youtube_video(url: str, output_dir: str, quality=720) -> dict:
+async def download_youtube_video(url: str, output_dir: str, quality=1080) -> dict:
     """Download a YouTube video. Tries high-speed direct download on the hosting server first;
     falls back to residential home relay if blocked."""
     # Step 1: Direct fast download on host server (e.g. Northflank 1Gbps connection)
@@ -583,7 +581,7 @@ _queued_downloads_count = 0
 _active_yt_downloads = set()
 
 
-async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=720) -> None:
+async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=1080) -> None:
     """Execute download and upload for YouTube video or audio with queue management and memory streaming."""
     global _queued_downloads_count
     is_audio = str(quality).lower() in ("audio", "mp3")
@@ -639,6 +637,19 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                 file_size = os.path.getsize(filepath)
                 mb_size = file_size / (1024 * 1024)
                 max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+                if file_size > max_bytes and not is_audio and str(quality) == "1080":
+                    logger.info(f"1080p YouTube file ({mb_size:.1f} MB) exceeded {MAX_UPLOAD_SIZE_MB} MB limit; falling back to 720p for {yt_url}")
+                    try:
+                        await status_msg.edit_text(f"⚠️ 1080p exceeded {MAX_UPLOAD_SIZE_MB} MB — retrying at 720p...")
+                    except Exception:
+                        pass
+                    result = await download_youtube_video(yt_url, tmp_dir, quality=720)
+                    filepath = result['filepath']
+                    title = result['title']
+                    duration = result.get('duration', 0)
+                    file_size = os.path.getsize(filepath)
+                    mb_size = file_size / (1024 * 1024)
+
                 if file_size > max_bytes:
                     await status_msg.edit_text(
                         fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is {MAX_UPLOAD_SIZE_MB} MB.")
@@ -806,11 +817,11 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
-    # For standard videos, offer quality choices + MP3
+    # For standard videos, offer quality choices + MP3 (1080p default)
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
             InlineKeyboardButton("⬇️ 1080p", callback_data=f"ytdl:1080:{yt_url}"),
+            InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
             InlineKeyboardButton("🎵 MP3", callback_data=f"ytdl:audio:{yt_url}"),
         ]
     ])
@@ -1060,6 +1071,7 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
             # Prefer a direct progressive MP4 stream; fall back to merging best video+audio into MP4.
             # Explicitly avoid HLS-only selections that leave ffmpeg with a .m3u8 playlist file.
             'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best',
+            'format_sort': ['res:1080', 'ext:mp4:m4a'],
             'merge_output_format': 'mp4',
             'hls_prefer_native': False,   # use ffmpeg for HLS muxing — produces a proper MP4 on disk
             'socket_timeout': 20,
@@ -1243,9 +1255,9 @@ async def execute_generic_media_download(target_message, url: str, platform_name
             duration = int(info.get('duration', 0))
 
             file_size = os.path.getsize(filepath)
-            if file_size > 50 * 1024 * 1024:
+            if file_size > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 await status_msg.edit_text(
-                    fmt_warning(f"This media exceeds Telegram's 50MB bot limit ({file_size / (1024*1024):.1f}MB).")
+                    fmt_warning(f"This media exceeds Telegram's {MAX_UPLOAD_SIZE_MB}MB bot limit ({file_size / (1024*1024):.1f}MB).")
                 )
                 return
 

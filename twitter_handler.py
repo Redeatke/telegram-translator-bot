@@ -23,6 +23,7 @@ from telegram.ext import ContextTypes
 import card
 from config import (
     TWITTER_URL_PATTERN,
+    MAX_UPLOAD_SIZE_MB,
     should_skip_message,
     is_downloader_enabled,
     is_maintenance_active_for_user,
@@ -200,17 +201,22 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
             v for v in variants
             if v.get("content_type") == "video/mp4" or v.get("container") == "mp4" or ".mp4" in v.get("url", "")
         ]
+        candidate_urls = []
         if mp4_variants:
             mp4_variants.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
-            video_url = mp4_variants[0].get("url") or video_url
+            candidate_urls = [v.get("url") for v in mp4_variants if v.get("url")]
+        if video_url and video_url not in candidate_urls:
+            candidate_urls.append(video_url)
 
+        max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
         video_bytes = None
-        if video_url:
+        for cand_url in candidate_urls:
             try:
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as v_client:
-                    v_resp = await v_client.get(video_url, headers=headers)
-                    if v_resp.status_code == 200 and len(v_resp.content) <= 50 * 1024 * 1024:
+                    v_resp = await v_client.get(cand_url, headers=headers)
+                    if v_resp.status_code == 200 and 0 < len(v_resp.content) <= max_bytes:
                         video_bytes = v_resp.content
+                        break
             except Exception as e:
                 logger.warning(f"Direct Twitter video download failed for @{username}/{tweet_id}: {e}")
 
@@ -233,6 +239,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                             ydl_opts = {
                                 "outtmpl": out_template,
                                 "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                                "format_sort": ["res:1080", "ext:mp4:m4a"],
                                 "quiet": True,
                                 "no_warnings": True,
                             }
@@ -245,7 +252,7 @@ async def handle_twitter_message(update: Update, context: ContextTypes.DEFAULT_T
                             return None
 
                     tw_b = await loop.run_in_executor(None, _yt_dlp_tw)
-                    if tw_b and len(tw_b) <= 50 * 1024 * 1024:
+                    if tw_b and len(tw_b) <= max_bytes:
                         video_bytes = tw_b
                         break
                 except Exception as e:

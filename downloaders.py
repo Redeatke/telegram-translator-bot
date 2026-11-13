@@ -590,21 +590,32 @@ async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> di
             q_val = 1080
 
         logger.info(f"Downloading YouTube video ({q_val}p): {url}...")
-        # Prioritize H.264 video + AAC audio; format_sort 'res:{q_val}' handles both landscape and portrait (Shorts) up to q_val
-        fast_format = (
-            'bestvideo[vcodec^=avc]+bestaudio[format_note*=original][acodec^=mp4a]/'
-            'bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/'
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
-            'bestvideo+bestaudio/'
-            'best[ext=mp4]/'
-            'best'
-        )
+        # For 4K/2K, allow any video codec (VP9/AV1) since YouTube does not encode 4K in AVC/H.264
+        if q_val > 1080:
+            fast_format = (
+                'bestvideo+bestaudio[format_note*=original][acodec^=mp4a]/'
+                'bestvideo+bestaudio/'
+                'best'
+            )
+            sort_list = [f'res:{q_val}', 'lang:original', 'fps', 'quality']
+        else:
+            # Prioritize H.264 video + AAC audio; format_sort 'res:{q_val}' handles both landscape and portrait (Shorts) up to q_val
+            fast_format = (
+                'bestvideo[vcodec^=avc]+bestaudio[format_note*=original][acodec^=mp4a]/'
+                'bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/'
+                'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+                'bestvideo+bestaudio/'
+                'best[ext=mp4]/'
+                'best'
+            )
+            sort_list = [f'res:{q_val}', 'lang:original', 'vcodec:avc', 'acodec:mp4a', 'fps']
+
         def _make_video_opts(use_fallback_clients: bool = False) -> dict:
             opts = {
                 'outtmpl': output_template,
                 'merge_output_format': 'mp4',
                 'format': fast_format,
-                'format_sort': [f'res:{q_val}', 'lang:original', 'vcodec:avc', 'acodec:mp4a', 'fps'],
+                'format_sort': sort_list,
                 'http_headers': {'Accept-Language': 'en-US,en;q=0.9'},
                 'source_address': '0.0.0.0',
                 'noplaylist': True,
@@ -619,7 +630,10 @@ async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> di
                 'nocheckcertificate': True,
             }
             if not use_fallback_clients:
-                opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+                if q_val > 1080:
+                    opts['extractor_args'] = {'youtube': {'player_client': ['web', 'tv', 'android']}}
+                else:
+                    opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
             else:
                 opts['js_runtimes'] = {'deno': {}, 'node': {}}
                 if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
@@ -700,7 +714,12 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
     """Execute download and upload for YouTube video or audio with queue management and memory streaming."""
     global _queued_downloads_count
     is_audio = str(quality).lower() in ("audio", "mp3")
-    label = "audio (MP3)" if is_audio else f"{quality}p"
+    if is_audio:
+        label = "audio (MP3)"
+    elif str(quality) in ("2160", "4k", "4K"):
+        label = "4K video"
+    else:
+        label = f"{quality}p"
     key = (target_message.chat_id, yt_url, str(quality))
 
     if key in _active_yt_downloads:
@@ -748,11 +767,27 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                     )
                     return
 
-                # Check file size limit (Standard Telegram limit: 50 MB, Local Bot API: up to 2000 MB)
+                # Check file size limit (Standard Telegram limit: 50 MB, Local Bot API / Telethon: up to 2000 MB)
                 file_size = os.path.getsize(filepath)
                 mb_size = file_size / (1024 * 1024)
                 max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-                if file_size > max_bytes and not is_audio and str(quality) == "1080":
+
+                # Fallback Step 1: If 4K exceeds size limit, fall back to 1080p
+                if file_size > max_bytes and not is_audio and str(quality) in ("2160", "4k", "4K"):
+                    logger.info(f"4K YouTube file ({mb_size:.1f} MB) exceeded {MAX_UPLOAD_SIZE_MB} MB limit; falling back to 1080p for {yt_url}")
+                    try:
+                        await status_msg.edit_text(f"⚠️ 4K exceeded {MAX_UPLOAD_SIZE_MB} MB — retrying at 1080p...")
+                    except Exception:
+                        pass
+                    result = await download_youtube_video(yt_url, tmp_dir, quality=1080)
+                    filepath = result['filepath']
+                    title = result['title']
+                    duration = result.get('duration', 0)
+                    file_size = os.path.getsize(filepath)
+                    mb_size = file_size / (1024 * 1024)
+
+                # Fallback Step 2: If 1080p exceeds size limit, fall back to 720p
+                if file_size > max_bytes and not is_audio and str(quality) in ("1080", "2160", "4k", "4K"):
                     logger.info(f"1080p YouTube file ({mb_size:.1f} MB) exceeded {MAX_UPLOAD_SIZE_MB} MB limit; falling back to 720p for {yt_url}")
                     try:
                         await status_msg.edit_text(f"⚠️ 1080p exceeded {MAX_UPLOAD_SIZE_MB} MB — retrying at 720p...")
@@ -909,9 +944,10 @@ async def handle_youtube_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Ignoring live YouTube stream: {yt_url}")
         return
 
-    # For standard videos, offer quality choices + MP3 (1080p default)
+    # For standard videos, offer quality choices + MP3 (4K, 1080p, 720p)
     keyboard = InlineKeyboardMarkup([
         [
+            InlineKeyboardButton("⬇️ 4K", callback_data=f"ytdl:2160:{yt_url}"),
             InlineKeyboardButton("⬇️ 1080p", callback_data=f"ytdl:1080:{yt_url}"),
             InlineKeyboardButton("⬇️ 720p", callback_data=f"ytdl:720:{yt_url}"),
             InlineKeyboardButton("🎵 MP3", callback_data=f"ytdl:audio:{yt_url}"),
@@ -979,6 +1015,9 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
     if quality_str in ("audio", "mp3"):
         quality = "audio"
         logger.info(f"User clicked YouTube download button (MP3 audio) for: {yt_url}")
+    elif quality_str in ("2160", "4k", "4K"):
+        quality = 2160
+        logger.info(f"User clicked YouTube download button (4K 2160p) for: {yt_url}")
     elif quality_str == "1080":
         quality = 1080
         logger.info(f"User clicked YouTube download button (1080p) for: {yt_url}")

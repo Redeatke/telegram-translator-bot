@@ -386,6 +386,11 @@ async def load_chat_configs_from_channel() -> None:
             data = json.loads(chat.pinned_message.text)
             chat_configs = {int(k): v for k, v in data.items()}
             logger.info(f"Loaded media configs for {len(chat_configs)} chats from Telegram storage channel.")
+            try:
+                with open(CHAT_CONFIGS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(chat_configs, f, indent=2)
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Failed to load chat_configs from Telegram storage channel: {e}")
 
@@ -393,16 +398,21 @@ async def _push_chat_configs_to_channel() -> None:
     """Push the in-memory chat_configs to the pinned message in the storage channel."""
     if not CONFIG_CHANNEL_ID or not _config_bot:
         return
-    payload = json.dumps(chat_configs)
+    # Use compact JSON representation to fit as many chats as possible under 4096 chars
+    payload = json.dumps(chat_configs, separators=(',', ':'))
     if len(payload) > 4096:
         logger.error("chat_configs payload exceeds Telegram's 4096-char message limit; skipping channel sync.")
         return
     try:
         chat = await _config_bot.get_chat(CONFIG_CHANNEL_ID)
         if chat.pinned_message:
-            await _config_bot.edit_message_text(
-                chat_id=CONFIG_CHANNEL_ID, message_id=chat.pinned_message.message_id, text=payload
-            )
+            try:
+                await _config_bot.edit_message_text(
+                    chat_id=CONFIG_CHANNEL_ID, message_id=chat.pinned_message.message_id, text=payload
+                )
+            except Exception as e:
+                if "Message is not modified" not in str(e):
+                    raise
         else:
             msg = await _config_bot.send_message(chat_id=CONFIG_CHANNEL_ID, text=payload)
             await _config_bot.pin_chat_message(chat_id=CONFIG_CHANNEL_ID, message_id=msg.message_id, disable_notification=True)

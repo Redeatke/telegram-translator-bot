@@ -84,7 +84,18 @@ async def safe_answer_query(query, *args, **kwargs) -> bool:
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 
 _config_channel_id_raw = os.getenv("CONFIG_CHANNEL_ID", "").strip()
-CONFIG_CHANNEL_ID = int(_config_channel_id_raw) if _config_channel_id_raw else None
+CONFIG_CHANNEL_ID: Optional[int] = None
+if _config_channel_id_raw:
+    # If the user pasted a t.me link: e.g. https://t.me/c/3907408082/5 -> 3907408082
+    if "/c/" in _config_channel_id_raw:
+        _config_channel_id_raw = _config_channel_id_raw.split("/c/")[1].split("/")[0]
+    cid_str = _config_channel_id_raw.strip()
+    if cid_str.lstrip("-").isdigit():
+        cid_int = int(cid_str)
+        # Telegram channel IDs require the -100 prefix (e.g. -1003907408082)
+        if cid_int > 0:
+            cid_int = int(f"-100{cid_int}")
+        CONFIG_CHANNEL_ID = cid_int
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")

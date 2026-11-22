@@ -380,12 +380,34 @@ def generate_quote_card(
       - If reply context: indented reply container with vertical accent bar
       - Quoted message body text below
       - Snug card bounding box scaled to 512px without excess empty canvas
+    The card reserves a timestamp-safe zone (extra right/bottom space
+    plus transparent canvas below) so Telegram's bottom-right
+    timestamp pill does not cover the last words.
     """
     text = _clean_text(text) or "(no text)"
     username = _clean_text(username) or "User"
 
     PADDING = 18
     AVATAR_SIZE = 48
+    # ── Timestamp-safe zone ──────────────────────────────────────────
+    # Telegram overlays its "9:31 AM ✓✓" pill at the bottom-right of a
+    # sticker. The old snug card put body text ~18px (pre-scale, ~25px
+    # final) from the right edge and ~28px from the bottom, so the pill
+    # covered the last words. Reserve space for it instead:
+    #   * TIMESTAMP_RIGHT_RESERVE: empty card space to the right of text
+    #   * TIMESTAMP_BOTTOM_RESERVE: extra empty card height below text
+    #   * TIMESTAMP_CANVAS_PAD: transparent canvas added below the
+    #     scaled card, so the pill lands on transparency, below the
+    #     visible bubble (as in the reference sticker from another bot).
+    # MAX_CARD_W caps the pre-scale width so the card is narrower than
+    # the old 512px snug width. With content_x=80, PADDING=18 and the
+    # 72px right reserve, max_content_w is 432-80-18-72 = 262, which
+    # guarantees >=90px (final, 512-scaled) from the last line's end
+    # to the right edge even for a full-width wrapped line.
+    TIMESTAMP_RIGHT_RESERVE = 72
+    TIMESTAMP_BOTTOM_RESERVE = 36
+    TIMESTAMP_CANVAS_PAD = 40
+    MAX_CARD_W = 432
 
     font_user = FONT_USERNAME(22)
     font_body = FONT_BODY(21)
@@ -399,7 +421,8 @@ def generate_quote_card(
     dd = ImageDraw.Draw(dummy_img)
 
     content_x = PADDING + AVATAR_SIZE + 14
-    max_content_w = 480 - content_x - PADDING
+    # Narrower than the old 480-based width: see timestamp-safe zone above.
+    max_content_w = MAX_CARD_W - content_x - PADDING - TIMESTAMP_RIGHT_RESERVE
 
     # 1. Author username width
     user_w = _measure_text_width(username, font_user, emoji_font, dd)
@@ -432,13 +455,15 @@ def generate_quote_card(
     body_max_w = max([_measure_text_width(l, font_body, emoji_font, dd) for l in body_lines] or [0])
     body_h = len(body_lines) * line_h
 
-    # Calculate snug card dimensions
+    # Calculate snug card dimensions, with the timestamp-safe zone.
+    # card_w includes TIMESTAMP_RIGHT_RESERVE so text never runs to
+    # the right edge, even though the card is otherwise snug.
     needed_content_w = max(header_w, reply_w, body_max_w, 140)
-    card_w = min(content_x + needed_content_w + PADDING, 512)
+    card_w = min(content_x + needed_content_w + PADDING + TIMESTAMP_RIGHT_RESERVE, MAX_CARD_W)
     card_w = max(card_w, 230)
 
     total_content_h = 30 + (reply_h + 8 if has_reply else 0) + body_h
-    card_h = max(total_content_h + (PADDING * 2), AVATAR_SIZE + (PADDING * 2), 105)
+    card_h = max(total_content_h + (PADDING * 2) + TIMESTAMP_BOTTOM_RESERVE, AVATAR_SIZE + (PADDING * 2), 105)
     card_h = min(card_h, 512)
 
     img = Image.new("RGBA", (int(card_w), int(card_h)), (0, 0, 0, 0))
@@ -494,15 +519,26 @@ def generate_quote_card(
         _draw_text_with_emoji(draw, (content_x, cur_y), bline, font_body, emoji_font, fill=TEXT_COLOR)
         cur_y += line_h
 
-    # Ensure one side is exactly 512px with no stretched empty padding
+    # Ensure one side is exactly 512px, then add transparent space
+    # below the card for Telegram's timestamp pill.
+    # Wide card (w >= h): scale width to 512, height follows, then
+    # append TIMESTAMP_CANVAS_PAD transparent pixels at the bottom.
+    # Tall card (h > w): scale so scaled height + pad = 512, so the
+    # final height is exactly 512 and the width stays under it.
     w, h = img.size
     if w >= h:
         new_w = STICKER_SIZE
         new_h = max(int(h * (STICKER_SIZE / w)), 1)
+        final_w, final_h = new_w, new_h + TIMESTAMP_CANVAS_PAD
     else:
-        new_h = STICKER_SIZE
-        new_w = max(int(w * (STICKER_SIZE / h)), 1)
+        new_h = STICKER_SIZE - TIMESTAMP_CANVAS_PAD
+        new_w = max(int(w * (new_h / h)), 1)
+        final_w, final_h = new_w, STICKER_SIZE
     img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    if final_h != new_h or final_w != new_w:
+        canvas = Image.new("RGBA", (final_w, final_h), (0, 0, 0, 0))
+        canvas.paste(img, (0, 0), mask=img)
+        img = canvas
 
     for q in (95, 85, 75, 60, 45):
         buffer = io.BytesIO()

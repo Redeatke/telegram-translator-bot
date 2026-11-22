@@ -56,6 +56,7 @@ from config import (
     CONFIG_CHANNEL_ID,
     load_chat_configs_from_channel,
     save_chat_configs,
+    save_user_configs,
     get_chat_config,
     is_downloader_enabled,
     get_download_mode,
@@ -69,6 +70,8 @@ from config import (
     OPENROUTER_MODEL,
     has_ai,
     should_skip_message,
+    check_rate_limit,
+    MAX_TRANSLATION_CHARS,
     safe_answer_query,
     logger,
     media_cache,
@@ -147,7 +150,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     target_flag = get_flag(config["target"])
 
     body = (
-        f"👋 Welcome, <b>{first_name}</b>!\n"
+        f"👋 Welcome, <b>{html.escape(first_name)}</b>!\n"
         f"\n"
         f"I'm your personal translator and media assistant. Send me any\n"
         f"text and I'll translate it instantly.\n"
@@ -277,6 +280,7 @@ async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if new_target:
         config["target"] = new_target
+        save_user_configs()
         target_name = COMMON_LANGUAGES.get(new_target, new_target.upper())
         new_flag = get_flag(new_target)
         await update.message.reply_text(
@@ -383,6 +387,21 @@ async def tr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"\n"
                 f"  See languages: /languages"
             ),
+            parse_mode="HTML"
+        )
+        return
+
+    if len(text_to_translate) > MAX_TRANSLATION_CHARS:
+        await update.message.reply_text(
+            fmt_error(f"That text is too long ({len(text_to_translate)} chars, max {MAX_TRANSLATION_CHARS}). Please send a shorter message."),
+            parse_mode="HTML"
+        )
+        return
+
+    _kind = "ai" if has_ai else "free"
+    if not check_rate_limit(user.id, _kind):
+        await update.message.reply_text(
+            fmt_warning("You've hit the hourly translation limit. Please try again in a little while."),
             parse_mode="HTML"
         )
         return
@@ -773,6 +792,18 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
                         target_msg.chat_id, target_msg.message_id, tmp_tt_path
                     )
                     if ok and os.path.exists(tmp_tt_path) and os.path.getsize(tmp_tt_path) > 0:
+                        _tt_size = os.path.getsize(tmp_tt_path)
+                        if _tt_size > 50 * 1024 * 1024:
+                            logger.warning(f"Telethon sticker video too large ({_tt_size} bytes); refusing to load into RAM.")
+                            await msg.reply_text(
+                                fmt_error(f"Video is too large ({_tt_size / (1024 * 1024):.1f} MB, max 50 MB for stickers). Please send a shorter or compressed clip."),
+                                parse_mode="HTML"
+                            )
+                            try:
+                                os.unlink(tmp_tt_path)
+                            except OSError:
+                                pass
+                            return
                         with open(tmp_tt_path, "rb") as f:
                             video_bytes = f.read()
                     try:
@@ -1013,6 +1044,21 @@ async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # Cache of last link or video sent in DM per chat (chat_id -> (url, video_obj, timestamp))
 _last_dm_media: Dict[int, tuple] = {}
+_MAX_DM_MEDIA_ENTRIES = 200
+_DM_MEDIA_TTL_SECONDS = 300  # 5 minutes, matching the freshness check in gif_command
+
+
+def _track_dm_media(chat_id: int, url, vid) -> None:
+    """Record the last DM media for a chat, evicting stale entries and
+    capping the cache at 200 chats. Previously this dict grew forever —
+    one entry per DM chat, never evicted."""
+    now = time.time()
+    for cid in [c for c, (_, _, ts) in _last_dm_media.items() if now - ts > _DM_MEDIA_TTL_SECONDS]:
+        _last_dm_media.pop(cid, None)
+    if len(_last_dm_media) >= _MAX_DM_MEDIA_ENTRIES:
+        oldest = min(_last_dm_media, key=lambda c: _last_dm_media[c][2])
+        _last_dm_media.pop(oldest, None)
+    _last_dm_media[chat_id] = (url, vid, now)
 
 
 def _extract_video_media(message):
@@ -1353,7 +1399,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if update.effective_chat.type == "private":
             extracted_url = _extract_url_from_message(update.message)
             if extracted_url:
-                _last_dm_media[update.effective_chat.id] = (extracted_url, None, time.time())
+                _track_dm_media(update.effective_chat.id, extracted_url, None)
         return
 
     # Only auto-translate in private chats
@@ -1363,6 +1409,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     config = get_user_config(user.id)
     target_lang = config["target"]
     text = update.message.text
+
+    if len(text) > MAX_TRANSLATION_CHARS:
+        await update.message.reply_text(
+            fmt_error(f"That text is too long ({len(text)} chars, max {MAX_TRANSLATION_CHARS}). Please send a shorter message."),
+            parse_mode="HTML"
+        )
+        return
+
+    _kind = "ai" if has_ai else "free"
+    if not check_rate_limit(user.id, _kind):
+        await update.message.reply_text(
+            fmt_warning("You've hit the hourly translation limit. Please try again in a little while."),
+            parse_mode="HTML"
+        )
+        return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
@@ -1402,7 +1463,7 @@ async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_
     vid = _extract_video_media(msg)
     url = _extract_url_from_message(msg)
     if vid or url:
-        _last_dm_media[update.effective_chat.id] = (url, vid, time.time())
+        _track_dm_media(update.effective_chat.id, url, vid)
 
 
 def build_downloads_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -1503,6 +1564,11 @@ async def downloads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 return
         except Exception as e:
             logger.error(f"Admin check error in /downloads: {e}")
+            await update.message.reply_text(
+                fmt_error("Failed to verify your admin privileges. Please try again later."),
+                parse_mode="HTML"
+            )
+            return
 
     text = build_downloads_text(chat.id, chat.title or "")
     kb = build_downloads_keyboard(chat.id)
@@ -1535,6 +1601,16 @@ async def handle_downloads_callback(update: Update, context: ContextTypes.DEFAUL
             return
 
     action = query.data[6:]
+
+    # Allowlist: a crafted dltog:<anything> callback must not create
+    # arbitrary keys in the persisted chat config.
+    _ALLOWED_DL_ACTIONS = {
+        "youtube", "twitter", "twitch", "tiktok", "instagram", "threads",
+        "reddit", "mode", "reset", "close", "menu",
+    }
+    if action not in _ALLOWED_DL_ACTIONS:
+        await query.answer("❌ Unknown setting.", show_alert=True)
+        return
 
     if action == "close":
         await query.answer("Closed settings.")

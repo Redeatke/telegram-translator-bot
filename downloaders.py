@@ -19,9 +19,11 @@ import html
 import time
 import asyncio
 import tempfile
+import threading
 import uuid
 from typing import Optional
-from urllib.parse import urljoin
+import ipaddress
+from urllib.parse import urljoin, urlparse
 import card
 
 import httpx
@@ -104,6 +106,116 @@ def sanitize_instagram_url(url: str) -> str:
         post_type = "reel" if "/reel/" in url.lower() or "/reels/" in url.lower() else "p"
         return f"https://www.instagram.com/{post_type}/{shortcode}/"
     return url.split("?")[0].split("#")[0]
+
+
+# ─── Download Safety: SSRF / Path-Traversal / Size Guards ────────────────────
+# Direct user-supplied URLs used to be fetched with httpx follow_redirects=True
+# and resp.content fully into RAM, with no host, size, or content-type check
+# (SSRF to 169.254.169.254/localhost + OOM). Relay filenames were also used
+# unsanitized. These helpers are the single place those checks live.
+
+# Cap for direct (non-yt-dlp) downloads, e.g. /gif <url> and relay streams.
+MAX_DIRECT_DOWNLOAD_BYTES = max(
+    1, int(os.getenv("MAX_DIRECT_DOWNLOAD_MB", "50"))
+) * 1024 * 1024
+
+_DIRECT_VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".gif", ".webp", ".m4v")
+_BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain"}
+
+
+def is_public_url(url: str) -> bool:
+    """True only for http/https URLs to a non-private host.
+
+    Blocks IP-literal private/loopback/link-local/reserved hosts and
+    localhost names, and URLs with embedded credentials. Domain names are
+    allowed (they are resolved by httpx at connect time); this does not
+    fully mitigate DNS rebinding, but it blocks the direct IP-literal SSRF
+    cases, which are the ones a chat user can reliably exploit.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower().strip().rstrip(".")
+    if not host or host in _BLOCKED_HOSTNAMES:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # a domain name — allowed; see docstring
+    return bool(ip.is_global)
+
+
+def safe_relay_filename(filename: str) -> str:
+    """Sanitize a filename supplied by the relay (or any remote) for use
+    under output_dir. Rejects traversal (../, absolute paths) and strips
+    unsafe characters; falls back to a random name if nothing is left."""
+    if not filename:
+        return f"{uuid.uuid4().hex}.mp4"
+    name = os.path.basename(str(filename).replace("\\", "/"))
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    if not name or name in (".", ".."):
+        return f"{uuid.uuid4().hex}.mp4"
+    if "." not in name:
+        name += ".mp4"
+    return name
+
+
+def safe_join(output_dir: str, filename: str) -> str:
+    """Join filename under output_dir, raising if it would escape that dir."""
+    base = os.path.abspath(output_dir)
+    target = os.path.abspath(os.path.join(base, filename))
+    if os.path.commonpath([base, target]) != base:
+        raise ValueError(f"Unsafe filename escapes output directory: {filename!r}")
+    return target
+
+
+async def _fetch_to_file_streaming(
+    client, url: str, out_path: str, max_bytes: int,
+    allowed_content_types: Optional[tuple] = None,
+) -> bool:
+    """Stream a URL to disk, aborting (and deleting the partial file) if it
+    exceeds max_bytes. Returns False on non-200, wrong content-type, or error.
+    """
+    try:
+        async with client.stream("GET", url) as resp:
+            if resp.status_code != 200:
+                return False
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if allowed_content_types and ctype and not ctype.startswith(allowed_content_types):
+                logger.warning(f"Rejected download with unexpected content-type {ctype!r} for {url}")
+                return False
+            total = 0
+            with open(out_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=128 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"Download exceeds {max_bytes} bytes")
+                    f.write(chunk)
+            return total > 0
+    except Exception as e:
+        logger.warning(f"Streaming download failed for {url}: {e}")
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except OSError:
+            pass
+        return False
+
+
+def _generic_match_filter(info) -> Optional[str]:
+    """yt-dlp match_filter: reject videos longer than MAX_VIDEO_DURATION
+    before they are downloaded."""
+    duration = (info or {}).get("duration")
+    if duration and duration > MAX_VIDEO_DURATION:
+        return f"Video duration {duration}s exceeds {MAX_VIDEO_DURATION}s limit"
+    return None
 
 
 # ─── Instagram Throttling & Rate-Limit Concurrency Guards ─────────────────────
@@ -427,14 +539,33 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality=1080) ->
         title = data.get("title", "Video")
         duration = data.get("duration", 0)
 
+        # Validate the relay's download path: it must be a plain path on the
+        # relay itself, not a full URL to somewhere else, and not traversal.
+        if not isinstance(download_path, str) or not download_path.startswith("/"):
+            raise Exception("Relay returned an invalid download path")
+        if "://" in download_path or ".." in download_path.split("/"):
+            raise Exception("Relay returned an unsafe download path")
+        declared_size = data.get("file_size") or 0
+        try:
+            declared_size = int(declared_size)
+        except (TypeError, ValueError):
+            declared_size = 0
+        _relay_cap = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        if declared_size and declared_size > _relay_cap:
+            raise Exception(f"Relay file too large ({declared_size} bytes)")
+
         # Step 2: Stream the file from the relay to local disk in 128KB chunks (zero RAM overhead)
         logger.info(f"Streaming file from relay: {download_path} ({data.get('file_size', 0)} bytes)")
-        local_path = os.path.join(output_dir, data["filename"])
+        local_path = safe_join(output_dir, safe_relay_filename(data.get("filename") or "video.mp4"))
 
         async with client.stream("GET", f"{YOUTUBE_RELAY_URL}{download_path}", headers=headers) as file_resp:
             file_resp.raise_for_status()
+            total = 0
             with open(local_path, "wb") as f:
                 async for chunk in file_resp.aiter_bytes(chunk_size=128 * 1024):
+                    total += len(chunk)
+                    if total > _relay_cap:
+                        raise Exception(f"Relay file exceeds {_relay_cap} bytes")
                     f.write(chunk)
 
         if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
@@ -559,7 +690,6 @@ async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> di
                     'retries': 1,
                     'extractor_retries': 0,
                     'quiet': not os.getenv('YT_DEBUG'),
-                    'nocheckcertificate': True,
                 }
                 if not use_fallback_clients:
                     opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
@@ -627,7 +757,6 @@ async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> di
                 'extractor_retries': 0,
                 'quiet': not os.getenv('YT_DEBUG'),
                 'verbose': bool(os.getenv('YT_DEBUG')),
-                'nocheckcertificate': True,
             }
             if not use_fallback_clients:
                 if q_val > 1080:
@@ -708,6 +837,7 @@ MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _queued_downloads_count = 0
 _active_yt_downloads = set()
+_active_yt_downloads_lock = threading.Lock()
 
 
 async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=1080) -> None:
@@ -722,9 +852,12 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
         label = f"{quality}p"
     key = (target_message.chat_id, yt_url, str(quality))
 
-    if key in _active_yt_downloads:
-        return
-    _active_yt_downloads.add(key)
+    # Check-then-add must be atomic: with concurrent_updates=True two
+    # handlers could both see the key as absent and start duplicate downloads.
+    with _active_yt_downloads_lock:
+        if key in _active_yt_downloads:
+            return
+        _active_yt_downloads.add(key)
 
     try:
         # If all download slots are currently occupied, notify user of queue position
@@ -886,7 +1019,8 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                 pass
         await send_media_error_dm(context, target_message, yt_url, "YouTube", error_str)
     finally:
-        _active_yt_downloads.discard(key)
+        with _active_yt_downloads_lock:
+            _active_yt_downloads.discard(key)
 
 
 async def is_youtube_live(url: str) -> bool:
@@ -1025,8 +1159,21 @@ async def handle_youtube_download_button(update: Update, context: ContextTypes.D
         quality = 720
         logger.info(f"User clicked YouTube download button (720p) for: {yt_url}")
 
+    # Re-check the downloader is still enabled for this chat and the URL is
+    # really a YouTube link — a button press is not proof of either, and any
+    # group member can press it.
+    if not yt_url or not YOUTUBE_URL_PATTERN.search(yt_url):
+        await safe_answer_query(query, "❌ Invalid YouTube link.", show_alert=True)
+        return
+    _chat_id = query.message.chat_id if query.message else None
+    if _chat_id is not None and not is_downloader_enabled(_chat_id, "youtube"):
+        await safe_answer_query(query, "❌ YouTube downloads are disabled in this chat.", show_alert=True)
+        return
+
     key = (query.message.chat_id, yt_url, str(quality))
-    if key in _active_yt_downloads:
+    with _active_yt_downloads_lock:
+        _already_active = key in _active_yt_downloads
+    if _already_active:
         try:
             await query.answer("⏳ This download is already in progress! Please wait a moment...", show_alert=True)
         except Exception:
@@ -1054,7 +1201,6 @@ async def download_twitch_clip(url: str, output_dir: str) -> dict:
             'socket_timeout': 20,
             'retries': 3,
             'quiet': True,
-            'nocheckcertificate': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -1208,7 +1354,9 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
             'socket_timeout': 20,
             'retries': 3,
             'quiet': True,
-            'nocheckcertificate': True,
+            'noplaylist': True,
+            'max_filesize': MAX_UPLOAD_SIZE_MB * 1024 * 1024,
+            'match_filter': _generic_match_filter,
         }
         if cookiefile and os.path.exists(cookiefile):
             ydl_opts['cookiefile'] = cookiefile
@@ -1248,17 +1396,21 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
     if not url:
         return None
 
-    # 1. Direct video file URL
+    # 1. Direct video file URL — validated + streamed with a size cap.
+    # Previously any URL was fetched with resp.content fully into RAM.
     clean_url = url.split("?")[0].lower()
-    if clean_url.endswith((".mp4", ".mov", ".mkv", ".webm", ".gif", ".webp", ".m4v")):
+    if clean_url.endswith(_DIRECT_VIDEO_EXTS):
+        if not is_public_url(url):
+            logger.warning(f"Rejected direct video URL with non-public host: {url}")
+            return None
         try:
             ext = os.path.splitext(clean_url)[1] or ".mp4"
             out_path = os.path.join(output_dir, f"video_{uuid.uuid4().hex[:8]}{ext}")
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200 and len(resp.content) > 0:
-                    with open(out_path, "wb") as f:
-                        f.write(resp.content)
+                if await _fetch_to_file_streaming(
+                    client, url, out_path, MAX_DIRECT_DOWNLOAD_BYTES,
+                    allowed_content_types=("video/", "image/", "application/octet-stream"),
+                ):
                     return out_path
         except Exception as e:
             logger.warning(f"Direct video download failed ({e}), continuing fallback...")
@@ -1284,12 +1436,12 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                         if mp4_variants:
                             mp4_variants.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
                             v_url = mp4_variants[0].get("url") or v_url
-                        if v_url:
-                            v_resp = await client.get(v_url, timeout=25.0)
-                            if v_resp.status_code == 200 and len(v_resp.content) > 0:
-                                out_path = os.path.join(output_dir, f"tw_{uuid.uuid4().hex[:8]}.mp4")
-                                with open(out_path, "wb") as f:
-                                    f.write(v_resp.content)
+                        if v_url and is_public_url(v_url):
+                            out_path = os.path.join(output_dir, f"tw_{uuid.uuid4().hex[:8]}.mp4")
+                            if await _fetch_to_file_streaming(
+                                client, v_url, out_path, MAX_DIRECT_DOWNLOAD_BYTES,
+                                allowed_content_types=("video/", "application/octet-stream"),
+                            ):
                                 return out_path
         except Exception as tw_err:
             logger.warning(f"Fast Twitter extraction failed for GIF ({tw_err}), falling back...")
@@ -1338,10 +1490,10 @@ async def download_video_source(url: str, output_dir: str) -> Optional[str]:
                 if ig_proxy:
                     client_kwargs["proxy"] = ig_proxy
                 async with httpx.AsyncClient(**client_kwargs) as client:
-                    resp = await client.get(video_cdn_url, headers=headers)
-                    if resp.status_code == 200 and len(resp.content) > 0:
-                        with open(out_path, "wb") as f:
-                            f.write(resp.content)
+                    if is_public_url(video_cdn_url) and await _fetch_to_file_streaming(
+                        client, video_cdn_url, out_path, MAX_DIRECT_DOWNLOAD_BYTES,
+                        allowed_content_types=("video/", "application/octet-stream"),
+                    ):
                         return out_path
         except Exception as ig_err:
             logger.warning(f"Fast Instagram extraction failed for GIF ({ig_err}), falling back to yt-dlp...")
@@ -2350,6 +2502,17 @@ async def handle_pending_download_button(update: Update, context: ContextTypes.D
         return
     url = item["url"]
     platform = item["platform"]
+    # Re-check the platform is still enabled for this chat — settings may
+    # have changed since the button was shown.
+    _platform_key = platform.lower().split("/")[0].strip()
+    if _platform_key in ("x",):
+        _platform_key = "twitter"
+    _chat_id = query.message.chat_id if query.message else None
+    if _chat_id is not None and _platform_key in (
+        "youtube", "twitter", "twitch", "tiktok", "instagram", "threads", "reddit",
+    ) and not is_downloader_enabled(_chat_id, _platform_key):
+        await query.message.reply_text(fmt_error(f"{platform} downloads are disabled in this chat."))
+        return
     status_msg = await query.message.reply_text(f"⏳ Starting {platform} download...")
     if platform == "Instagram":
         await execute_instagram_download(query.message, url, context, status_msg=status_msg)

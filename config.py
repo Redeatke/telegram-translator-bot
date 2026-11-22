@@ -35,6 +35,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Anti-flood guards: ignore stale backlogs and deduplicate messages
 BOT_STARTUP_TIME = time.time()
 _PROCESSED_MESSAGES = set()
+_PROCESSED_MESSAGES_LOCK = threading.Lock()
 _MAX_PROCESSED_MESSAGES = 10000
 
 def should_skip_message(message, max_age_seconds: int = 120) -> bool:
@@ -48,8 +49,13 @@ def should_skip_message(message, max_age_seconds: int = 120) -> bool:
         return True
 
     key = (message.chat_id, message.message_id)
-    if key in _PROCESSED_MESSAGES:
-        return True
+    with _PROCESSED_MESSAGES_LOCK:
+        if key in _PROCESSED_MESSAGES:
+            return True
+
+        if len(_PROCESSED_MESSAGES) > _MAX_PROCESSED_MESSAGES:
+            _PROCESSED_MESSAGES.clear()
+        _PROCESSED_MESSAGES.add(key)
 
     if getattr(message, "date", None):
         now_utc = datetime.now(timezone.utc)
@@ -61,10 +67,65 @@ def should_skip_message(message, max_age_seconds: int = 120) -> bool:
             logger.info(f"Skipping pre-startup message {message.message_id} in {message.chat_id}")
             return True
 
-    if len(_PROCESSED_MESSAGES) > _MAX_PROCESSED_MESSAGES:
-        _PROCESSED_MESSAGES.clear()
-    _PROCESSED_MESSAGES.add(key)
     return False
+
+
+# ─── Rate Limiting ──────────────────────────────────────────────────────────
+# Per-user sliding-window limits for the paid / heavy paths (AI translation,
+# free translation, voice). Previously there was no limit at all, so one user
+# could burn the whole OpenRouter quota. Admins get 5x the normal limit.
+# Limits are configurable via env, e.g. RATE_LIMIT_AI_PER_HOUR=20.
+import collections
+
+RATE_LIMIT_AI_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_AI_PER_HOUR", "20")))
+RATE_LIMIT_FREE_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_FREE_PER_HOUR", "60")))
+RATE_LIMIT_VOICE_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_VOICE_PER_HOUR", "10")))
+MAX_TRANSLATION_CHARS = max(100, int(os.getenv("MAX_TRANSLATION_CHARS", "4000")))
+MAX_VOICE_DURATION_SECONDS = max(30, int(os.getenv("MAX_VOICE_DURATION_SECONDS", "300")))
+MAX_VOICE_FILE_MB = max(1, int(os.getenv("MAX_VOICE_FILE_MB", "5")))
+
+_RATE_LIMITS = {
+    "ai": RATE_LIMIT_AI_PER_HOUR,
+    "free": RATE_LIMIT_FREE_PER_HOUR,
+    "voice": RATE_LIMIT_VOICE_PER_HOUR,
+}
+_rate_limit_lock = threading.Lock()
+_rate_limit_hits: Dict[Tuple[int, str], "collections.deque"] = {}
+
+
+def _rate_limit_for(user_id: int, kind: str) -> int:
+    base = _RATE_LIMITS.get(kind, RATE_LIMIT_FREE_PER_HOUR)
+    return base * 5 if user_id in ADMIN_USER_IDS else base
+
+
+def check_rate_limit(user_id: int, kind: str) -> bool:
+    """Return True and record a hit if the user is within their hourly limit.
+
+    Sliding window over the last 3600 seconds, thread-safe. Returns False
+    (without recording) when the limit is exceeded — callers should reply
+    politely and NOT call the AI / translation service.
+    """
+    limit = _rate_limit_for(user_id, kind)
+    now = time.time()
+    key = (user_id, kind)
+    with _rate_limit_lock:
+        hits = _rate_limit_hits.setdefault(key, collections.deque())
+        while hits and hits[0] <= now - 3600:
+            hits.popleft()
+        if len(hits) >= limit:
+            return False
+        hits.append(now)
+        return True
+
+
+def rate_limit_remaining(user_id: int, kind: str) -> int:
+    """How many uses of `kind` this user has left in the current hour."""
+    limit = _rate_limit_for(user_id, kind)
+    now = time.time()
+    with _rate_limit_lock:
+        hits = _rate_limit_hits.get((user_id, kind), collections.deque())
+        recent = sum(1 for t in hits if t > now - 3600)
+    return max(0, limit - recent)
 
 
 async def safe_answer_query(query, *args, **kwargs) -> bool:
@@ -106,13 +167,20 @@ PING_URL = os.getenv("PING_URL", "")
 
 ALLOW_ALL_TO_USE_AI = os.getenv("ALLOW_ALL_TO_USE_AI", "True").lower() == "true"
 
+# Admin user IDs come only from the ADMIN_USER_IDS env var.
+# Previously a hardcoded ID was the default and was re-appended even when
+# the env var was set — that was a permanent backdoor admin. Now: no env
+# var means no bot admins (group admins can still use group features).
 ADMIN_USER_IDS = [
     int(uid.strip())
-    for uid in (os.getenv("ADMIN_USER_IDS") or "360290136").split(",")
+    for uid in (os.getenv("ADMIN_USER_IDS") or "").split(",")
     if uid.strip().isdigit()
 ]
-if 360290136 not in ADMIN_USER_IDS:
-    ADMIN_USER_IDS.append(360290136)
+if not ADMIN_USER_IDS:
+    logger.warning(
+        "ADMIN_USER_IDS is not set — no bot admins are configured. "
+        "Set ADMIN_USER_IDS in the environment to enable admin-only commands."
+    )
 
 MAINTENANCE_MODE = os.getenv("MAINTENANCE_MODE", "False").lower() == "true"
 
@@ -354,6 +422,66 @@ if HAS_TELETHON_UPLOAD and not LOCAL_BOT_API_URL:
 
 user_configs: Dict[int, Dict[str, str]] = {}
 
+# Per-user language/engine settings persist across restarts in
+# user_configs.json (same DATA_DIR pattern as chat_configs.json).
+# Previously these lived only in memory and reset to en/free on every deploy.
+USER_CONFIGS_FILE = os.path.join(
+    os.environ.get("DATA_DIR", os.path.dirname(__file__)), "user_configs.json"
+)
+_user_configs_lock = threading.Lock()
+
+
+def load_user_configs() -> None:
+    """Load per-user configs from user_configs.json, if present."""
+    global user_configs
+    if not os.path.exists(USER_CONFIGS_FILE):
+        return
+    try:
+        with open(USER_CONFIGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        loaded: Dict[int, Dict[str, str]] = {}
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            # Literals match DEFAULT_ENGINE/DEFAULT_TARGET_LANG ("free"/"en"),
+            # which are defined later in this module.
+            loaded[int(k)] = {
+                "engine": str(v.get("engine", "free")),
+                "target": str(v.get("target", "en")),
+            }
+        user_configs = loaded
+        logger.info(f"Loaded user configs for {len(user_configs)} users from local cache.")
+    except Exception as e:
+        logger.error(f"Failed to load user_configs.json: {e}")
+        user_configs = {}
+
+
+def save_user_configs() -> None:
+    """Atomically save per-user configs (temp file in same dir + os.replace)."""
+    with _user_configs_lock:
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(USER_CONFIGS_FILE) or ".",
+                prefix=".user_configs.",
+                suffix=".tmp",
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in user_configs.items()}, f, indent=2)
+            os.replace(tmp_path, USER_CONFIGS_FILE)
+            tmp_path = None
+        except Exception as e:
+            logger.error(f"Failed to save user_configs.json: {e}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+
+load_user_configs()
+
 
 # ─── Chat Media Config Persistence ──────────────────────────────────────────
 
@@ -372,6 +500,30 @@ DEFAULT_CHAT_CONFIG = {
 }
 
 _config_bot = None
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    """Write JSON atomically: temp file in the same directory + os.replace,
+    so a crash or concurrent write cannot leave a truncated file."""
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".tmp.", suffix=".json"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+_chat_configs_lock = threading.Lock()
+
 
 def load_chat_configs() -> None:
     """Load chat media configurations from the local chat_configs.json cache."""
@@ -395,11 +547,20 @@ async def load_chat_configs_from_channel() -> None:
         chat = await _config_bot.get_chat(CONFIG_CHANNEL_ID)
         if chat.pinned_message and chat.pinned_message.text:
             data = json.loads(chat.pinned_message.text)
+            # Only overwrite the local cache with a payload that actually
+            # parses and is non-empty. A stale/empty pinned message must
+            # never wipe the local settings (previously it overwrote
+            # unconditionally).
+            if not isinstance(data, dict) or not data:
+                logger.warning(
+                    "Pinned chat-configs payload is empty or invalid; "
+                    "keeping the local chat_configs.json instead."
+                )
+                return
             chat_configs = {int(k): v for k, v in data.items()}
             logger.info(f"Loaded media configs for {len(chat_configs)} chats from Telegram storage channel.")
             try:
-                with open(CHAT_CONFIGS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(chat_configs, f, indent=2)
+                _atomic_write_json(CHAT_CONFIGS_FILE, chat_configs)
             except Exception:
                 pass
     except Exception as e:
@@ -412,7 +573,12 @@ async def _push_chat_configs_to_channel() -> None:
     # Use compact JSON representation to fit as many chats as possible under 4096 chars
     payload = json.dumps(chat_configs, separators=(',', ':'))
     if len(payload) > 4096:
-        logger.error("chat_configs payload exceeds Telegram's 4096-char message limit; skipping channel sync.")
+        logger.error(
+            "chat_configs payload exceeds Telegram's 4096-char message limit "
+            f"({len(payload)} chars for {len(chat_configs)} chats); skipping channel sync. "
+            "Local chat_configs.json is still saved, but settings will NOT survive "
+            "the next redeploy until the payload shrinks (fewer chats / shorter config)."
+        )
         return
     try:
         chat = await _config_bot.get_chat(CONFIG_CHANNEL_ID)
@@ -432,11 +598,11 @@ async def _push_chat_configs_to_channel() -> None:
 
 def save_chat_configs() -> None:
     """Save chat media configurations locally and sync them to the Telegram storage channel."""
-    try:
-        with open(CHAT_CONFIGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(chat_configs, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save chat_configs.json: {e}")
+    with _chat_configs_lock:
+        try:
+            _atomic_write_json(CHAT_CONFIGS_FILE, chat_configs)
+        except Exception as e:
+            logger.error(f"Failed to save chat_configs.json: {e}")
 
     try:
         asyncio.get_running_loop().create_task(_push_chat_configs_to_channel())
@@ -495,6 +661,10 @@ load_chat_configs()
 
 # ─── High Performance In-Memory LRU Media / Card Cache ─────────────────────────
 
+# Cap for raw bytes stored in the in-memory media cache (see MediaMemoryCache.set).
+MAX_MEDIA_CACHE_BYTES = max(1, int(os.getenv("MAX_MEDIA_CACHE_MB", "20"))) * 1024 * 1024
+
+
 class MediaMemoryCache:
     """Thread-safe bounded in-memory LRU cache with TTL expiration."""
     def __init__(self, max_items: int = 150, ttl_seconds: int = 86400):
@@ -513,6 +683,16 @@ class MediaMemoryCache:
             return None
 
     def set(self, key: str, val):
+        # Never cache large raw bytes (e.g. a full video) — 150 items of
+        # 20-50 MB would be gigabytes of RAM. Small values (file_ids,
+        # card PNGs, avatars) are fine. Callers that need the video again
+        # re-download it instead of OOMing the host.
+        if isinstance(val, (bytes, bytearray)) and len(val) > MAX_MEDIA_CACHE_BYTES:
+            logger.warning(
+                f"Skipping media cache for {key}: {len(val)} bytes exceeds "
+                f"{MAX_MEDIA_CACHE_BYTES} byte cap."
+            )
+            return
         with self._lock:
             if len(self._cache) >= self.max_items:
                 oldest_keys = sorted(self._cache.keys(), key=lambda k: self._cache[k][0])[:max(1, len(self._cache) // 5)]
@@ -525,15 +705,17 @@ url_media_cache = MediaMemoryCache(max_items=1000, ttl_seconds=7 * 86400)
 
 # Pending download buttons cache
 pending_downloads: Dict[str, Dict[str, Any]] = {}
+_pending_downloads_lock = threading.Lock()
 
 def store_pending_download(url: str, platform: str) -> str:
     """Store URL in pending downloads cache and return a short ID."""
     short_id = uuid.uuid4().hex[:10]
-    pending_downloads[short_id] = {"url": url, "platform": platform, "time": time.time()}
-    now = time.time()
-    for k in list(pending_downloads.keys()):
-        if now - pending_downloads[k]["time"] > 7200:
-            pending_downloads.pop(k, None)
+    with _pending_downloads_lock:
+        pending_downloads[short_id] = {"url": url, "platform": platform, "time": time.time()}
+        now = time.time()
+        for k in list(pending_downloads.keys()):
+            if now - pending_downloads[k]["time"] > 7200:
+                pending_downloads.pop(k, None)
     return short_id
 
 
@@ -616,8 +798,13 @@ REDDIT_URL_PATTERN = re.compile(
 # ─── Formatting Helpers ───────────────────────────────────────────────────────
 
 def fmt_card(title: str, body: str, footer: str = "") -> str:
-    """Clean message formatting without box drawing lines."""
-    lines = [f"<b>{title}</b>\n", body.strip()]
+    """Clean message formatting without box drawing lines.
+
+    The title is escaped — it can contain user-controlled text in some
+    callers. The body is intentionally NOT escaped here: callers build it
+    with their own <b>/<code> formatting and escape user data themselves.
+    """
+    lines = [f"<b>{html.escape(title)}</b>\n", body.strip()]
     if footer:
         lines.append(f"\n<i>{footer}</i>")
     return "\n".join(lines)
@@ -627,14 +814,16 @@ def fmt_translation(src_lang: str, target_lang: str, translated_text: str, fallb
     if src_lang and src_lang != "auto":
         src_name = COMMON_LANGUAGES.get(src_lang.lower(), src_lang.lower())
         src_flag = get_flag(src_lang.lower())
-        src_label = f"{src_flag} {src_name}"
+        src_label = f"{src_flag} {html.escape(src_name)}"
     else:
         src_label = "auto-detected"
     target_name = COMMON_LANGUAGES.get(target_lang.lower(), target_lang.lower())
     target_flag = get_flag(target_lang.lower())
-    target_label = f"{target_flag} {target_name}"
+    target_label = f"{target_flag} {html.escape(target_name)}"
 
-    msg = f"Translated from {src_label} to {target_label}:\n{translated_text}"
+    # translated_text is user/model-controlled — escape it so a translation
+    # containing <b>, <a href=...>, or malformed tags cannot inject HTML.
+    msg = f"Translated from {src_label} to {target_label}:\n{html.escape(translated_text)}"
     if fallback:
         msg += "\n\n⚠️ (Fell back to free engine)"
     return msg

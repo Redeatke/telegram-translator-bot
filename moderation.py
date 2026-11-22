@@ -13,6 +13,7 @@ import re
 import json
 import html
 import tempfile
+import threading
 import logging
 from typing import Optional, Dict, Any, Tuple
 
@@ -113,7 +114,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 6. Perform ban
     try:
         await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user_id)
-        name_str = f"<b>{target_user_name}</b> (<code>{target_user_id}</code>)" if target_user_name else f"<code>{target_user_id}</code>"
+        name_str = f"<b>{html.escape(target_user_name)}</b> (<code>{target_user_id}</code>)" if target_user_name else f"<code>{target_user_id}</code>"
         await update.message.reply_text(
             fmt_success(f"{name_str} has been banned from the group."),
             parse_mode="HTML"
@@ -212,7 +213,7 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             can_manage_chat=True,
             can_manage_video_chats=True,
         )
-        name_str = f"<b>{target_user_name}</b> (<code>{target_user_id}</code>)" if target_user_name else f"<code>{target_user_id}</code>"
+        name_str = f"<b>{html.escape(target_user_name)}</b> (<code>{target_user_id}</code>)" if target_user_name else f"<code>{target_user_id}</code>"
         await update.message.reply_text(
             fmt_success(f"{name_str} has been promoted to administrator!"),
             parse_mode="HTML"
@@ -320,7 +321,7 @@ async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             can_pin_messages=False,
             can_promote_members=False
         )
-        name_str = f"<b>{target_user_name}</b> (<code>{target_user_id}</code>)" if target_user_name else f"<code>{target_user_id}</code>"
+        name_str = f"<b>{html.escape(target_user_name)}</b> (<code>{target_user_id}</code>)" if target_user_name else f"<code>{target_user_id}</code>"
         await update.message.reply_text(
             fmt_success(f"{name_str} has been demoted to regular member."),
             parse_mode="HTML"
@@ -350,7 +351,15 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    report_text = html.escape(" ".join(context.args))
+    _raw_report = " ".join(context.args)
+    if len(_raw_report) > 1000:
+        await update.message.reply_text(
+            fmt_error("Your report is too long (max 1000 characters). Please shorten it."),
+            parse_mode="HTML"
+        )
+        return
+
+    report_text = html.escape(_raw_report)
 
     if not ADMIN_USER_IDS:
         await update.message.reply_text(
@@ -360,7 +369,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     admin_msg = fmt_card("⚠️ Bug Report",
-        f"  <b>From:</b> {user.first_name} (@{user.username if user.username else 'N/A'})\n"
+        f"  <b>From:</b> {html.escape(user.first_name or '')} (@{html.escape(user.username) if user.username else 'N/A'})\n"
         f"  <b>User ID:</b> <code>{user.id}</code>\n\n"
         f"  <b>Message:</b>\n"
         f"  <i>{report_text}</i>"
@@ -483,13 +492,31 @@ def load_chat_warns() -> None:
             chat_warns = {}
 
 
+_warns_lock = threading.Lock()
+
+
 def save_chat_warns() -> None:
-    """Save warnings data to local JSON file."""
-    try:
-        with open(WARNS_FILE, "w", encoding="utf-8") as f:
-            json.dump(chat_warns, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save chat_warns.json: {e}")
+    """Save warnings data to local JSON file (atomic temp+replace, locked)."""
+    with _warns_lock:
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(WARNS_FILE) or ".",
+                prefix=".chat_warns.",
+                suffix=".tmp",
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(chat_warns, f, indent=2)
+            os.replace(tmp_path, WARNS_FILE)
+            tmp_path = None
+        except Exception as e:
+            logger.error(f"Failed to save chat_warns.json: {e}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 # Initialize on import
@@ -653,27 +680,39 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.error(f"Error checking target member status: {e}")
 
-    # 5. Add warning
+    # 5. Work out whether this warn would hit the limit — BEFORE persisting it.
+    # Previously add_user_warn() ran first, so if the bot then could not ban
+    # (no Restrict Members permission) the count stayed at max and every
+    # later /warn re-attempted a ban. Now the permission check happens first
+    # and a failed check returns without recording the warn.
+    max_warns = get_chat_warn_limit(chat.id)
+    _existing_warns = get_user_warn_data(chat.id, target_user_id).get("count", 0)
+    if (_existing_warns + 1) >= max_warns:
+        try:
+            bot_member = await context.bot.get_chat_member(chat_id=chat.id, user_id=context.bot.id)
+            if bot_member.status not in ["administrator", "creator"] or not bot_member.can_restrict_members:
+                await update.message.reply_text(
+                    fmt_error("Warning limit would be reached, but I need <b>Restrict Members</b> permission to ban. Warning not recorded."),
+                    parse_mode="HTML"
+                )
+                return
+        except Exception as e:
+            logger.error(f"Error checking bot permissions: {e}")
+            await update.message.reply_text(
+                fmt_error("Failed to verify my permissions to ban. Warning not recorded."),
+                parse_mode="HTML"
+            )
+            return
+
+    # 6. Add warning (now that the ban, if needed, is known to be possible)
     current_warns, max_warns = add_user_warn(chat.id, target_user_id, reason)
     lives_remaining = max(0, max_warns - current_warns)
     lives_bar = format_lives_bar(current_warns, max_warns)
     name_str = f"<b>{html.escape(target_user_name)}</b>" if target_user_name else f"<code>{target_user_id}</code>"
     reason_str = html.escape(reason) if reason else "No reason specified"
 
-    # 6. Check if warn limit reached -> Ban user
+    # 7. Check if warn limit reached -> Ban user
     if current_warns >= max_warns:
-        # Check bot ban permissions
-        try:
-            bot_member = await context.bot.get_chat_member(chat_id=chat.id, user_id=context.bot.id)
-            if bot_member.status not in ["administrator", "creator"] or not bot_member.can_restrict_members:
-                await update.message.reply_text(
-                    fmt_error("Warning limit reached, but I need <b>Restrict Members</b> permission to ban."),
-                    parse_mode="HTML"
-                )
-                return
-        except Exception as e:
-            logger.error(f"Error checking bot permissions: {e}")
-
         try:
             await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user_id)
             reset_user_warns(chat.id, target_user_id)

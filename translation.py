@@ -27,6 +27,7 @@ from config import (
     DEFAULT_ENGINE,
     DEFAULT_TARGET_LANG,
     user_configs,
+    save_user_configs,
     ADMIN_USER_IDS,
     has_ai,
     ai_client,
@@ -55,11 +56,14 @@ def resolve_language_code(query: str) -> Optional[str]:
         for code, name in COMMON_LANGUAGES.items():
             if name.lower().startswith(q):
                 return code
-    try:
-        GoogleTranslator(source="auto", target=q)
+    # Explicit allowlist of language codes the bot actually supports
+    # (codes in COMMON_LANGUAGES plus the extra flag codes in LANG_FLAGS).
+    # Previously this "validated" a code by constructing a GoogleTranslator,
+    # but that constructor never validates the target — any string like "xx"
+    # passed and failed later during translation.
+    _ALLOWED_CODES = set(COMMON_LANGUAGES) | set(LANG_FLAGS)
+    if 2 <= len(q) <= 3 and q in _ALLOWED_CODES:
         return q
-    except Exception:
-        pass
     return None
 
 
@@ -161,7 +165,13 @@ def get_user_config(user_id: int) -> dict:
             "engine": DEFAULT_ENGINE,
             "target": DEFAULT_TARGET_LANG,
         }
+        save_user_configs()
     return user_configs[user_id]
+
+
+def save_user_config() -> None:
+    """Persist the current per-user configs (call after mutating one)."""
+    save_user_configs()
 
 
 def is_user_premium_or_admin(update: Update) -> bool:
@@ -226,6 +236,7 @@ async def handle_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         new_lang = parts[2] if len(parts) > 2 else "en"
         page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
         config["target"] = new_lang
+        save_user_configs()
         lang_name = COMMON_LANGUAGES.get(new_lang, new_lang.upper())
         flag = get_flag(new_lang)
         reply_markup = build_language_keyboard(new_lang, page)
@@ -368,7 +379,8 @@ async def _translate_mymemory(text: str, target_lang: str, src_lang: str = "auto
             or not translated
             or "INVALID SOURCE LANGUAGE" in translated.upper()
             or "MYMEMORY WARNING" in translated.upper()
-            or translated.upper() == text.upper()
+            # NOTE: an identical translation is NOT a failure — proper nouns,
+            # "OK", numbers, etc. legitimately translate to themselves.
         ):
             raise ValueError(f"MyMemory returned invalid response: {translated}")
         return translated

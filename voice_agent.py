@@ -26,6 +26,9 @@ from config import (
     ADMIN_USER_IDS,
     is_maintenance_active_for_user,
     MAINTENANCE_NOTICE,
+    check_rate_limit,
+    MAX_VOICE_DURATION_SECONDS,
+    MAX_VOICE_FILE_MB,
     logger,
     fmt_card,
     fmt_success,
@@ -319,6 +322,30 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if is_maintenance_active_for_user(user.id):
         await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    # Size/duration guard BEFORE downloading — voice notes can be long.
+    _vsize = getattr(msg.voice, "file_size", None)
+    if _vsize and _vsize > MAX_VOICE_FILE_MB * 1024 * 1024:
+        await msg.reply_text(
+            fmt_error(f"That voice note is too large ({_vsize / (1024 * 1024):.1f} MB, max {MAX_VOICE_FILE_MB} MB). Please send a shorter one."),
+            parse_mode="HTML"
+        )
+        return
+    _vdur = getattr(msg.voice, "duration", None)
+    if _vdur and _vdur > MAX_VOICE_DURATION_SECONDS:
+        await msg.reply_text(
+            fmt_error(f"That voice note is too long ({_vdur}s, max {MAX_VOICE_DURATION_SECONDS}s). Please send a shorter one."),
+            parse_mode="HTML"
+        )
+        return
+
+    # Rate limit BEFORE any STT/LLM/TTS call (3 paid calls per note).
+    if not check_rate_limit(user.id, "voice"):
+        await msg.reply_text(
+            fmt_warning("You've hit the hourly voice limit. Please try again in a little while."),
+            parse_mode="HTML"
+        )
         return
 
     # Send recording audio action

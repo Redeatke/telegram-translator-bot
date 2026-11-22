@@ -11,3 +11,16 @@ sample_*.png
 !splash_icon.png
 !webapp/splash_icon.png
 *.exe
+
+# Bot runtime state — contains real chat/user IDs and must not be committed.
+# NOTE: chat_configs.json is already tracked in git history; adding it here
+# only stops future commits. To remove the IDs from GitHub, Red must also
+# remove the file from git history (e.g. git rm --cached + a history rewrite,
+# or delete it from the repo on GitHub).
+chat_configs.json
+chat_warns.json
+user_configs.json
+*.session
+*.session-journal
+cookies.txt
+instagram_cookies.txt

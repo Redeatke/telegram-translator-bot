@@ -648,7 +648,15 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
     """
     user = update.effective_user
     msg = update.effective_message
-    if not user or not msg or should_skip_message(msg):
+    if not user or not msg:
+        return
+
+    # Track the /q (or /sticker) command message itself, before the
+    # should_skip dedup check — its reply_to_message is the quote
+    # target, so this records the command in the reply chain for any
+    # later /q r on it.
+    _track_message_for_quote(update.effective_chat.id, msg)
+    if should_skip_message(msg):
         return
 
     if is_maintenance_active_for_user(user.id):
@@ -1016,6 +1024,15 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
         # ── Quote Card Sticker (from text / caption) ──
         if msg_text:
             username, avatar_bytes = await _extract_author_and_avatar(context.bot, target_msg)
+            if username == "User":
+                # No username bug was reproduced locally — the generator
+                # renders "Red" correctly — but log it so a live
+                # recurrence is diagnosable from Northflank logs.
+                logger.warning(
+                    "Could not determine author name for /q target "
+                    f"message {getattr(target_msg, 'message_id', None)} "
+                    f"in chat {update.effective_chat.id}; using 'User'"
+                )
 
             # Check for reply context (who target_msg replied to).
             # _resolve_reply_context() first uses the reply in the
@@ -1204,6 +1221,12 @@ async def _resolve_reply_context(bot, target_msg, chat_id: int):
        as recorded when that message arrived (covers DM updates where
        Telegram omits the nested reply).
     Returns (None, None, None) when neither source has a reply.
+
+    Fall-through is deliberate: if the update's reply message exists
+    but has no usable text (empty text/caption and no media label),
+    we must still try the tracker instead of returning None at once —
+    the previous code returned None here and /q r silently lost the
+    reply even when the tracker knew it.
     """
     r_msg = getattr(target_msg, "reply_to_message", None)
     if r_msg:
@@ -1217,16 +1240,30 @@ async def _resolve_reply_context(bot, target_msg, chat_id: int):
                 reply_text = f"{getattr(r_msg.sticker, 'emoji', None) or '💬'} Sticker"
             elif getattr(r_msg, "document", None):
                 reply_text = "📄 File"
-        reply_username, reply_avatar_bytes = await _extract_author_and_avatar(bot, r_msg)
         if reply_text:
+            reply_username, reply_avatar_bytes = await _extract_author_and_avatar(bot, r_msg)
             return reply_username, reply_text, reply_avatar_bytes
-        return None, None, None
+        logger.debug(
+            "/q r: update reply message %s has no usable text; "
+            "falling through to reply-chain tracker",
+            getattr(r_msg, "message_id", None),
+        )
     # Fallback: tracker lookup by (chat_id, target message_id).
     entry = _reply_chain.get((chat_id, getattr(target_msg, "message_id", None)))
     if entry and entry.get("reply_to_id") is not None:
         replied = _reply_chain.get((chat_id, entry["reply_to_id"]))
         if replied and replied.get("text"):
             return replied["author"], replied["text"], None
+    logger.warning(
+        "/q r: no reply context for message %s in chat %s "
+        "(tracker entries=%d, tracker reply_to_id=%s, "
+        "update reply_to_message present=%s)",
+        getattr(target_msg, "message_id", None),
+        chat_id,
+        len(_reply_chain),
+        entry.get("reply_to_id") if entry else None,
+        r_msg is not None,
+    )
     return None, None, None
 
 
@@ -1559,6 +1596,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user or not update.message or not update.message.text:
         return
 
+    # Track the reply chain HERE, in group 0 — not only in the group-1
+    # _track_reply_chain_handler. PTB runs only ONE handler per group,
+    # and in DMs the group-1 DM-media tracker matches plain text first,
+    # so the group-1 reply tracker never runs there (verified against
+    # PTB 21.11: DM text -> group 1 runs handle_dm_media_tracker only).
+    # handle_message is the group-0 TEXT handler, so it runs for every
+    # plain text message in every chat. Track before the maintenance /
+    # should_skip early returns, so those never stop tracking.
+    _track_message_for_quote(update.effective_chat.id, update.message)
+
     if is_maintenance_active_for_user(user.id):
         await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
         return
@@ -1587,6 +1634,12 @@ async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_
     if not update.effective_message or update.effective_chat.type != "private":
         return
     msg = update.effective_message
+    # Also track the reply chain here: this handler WINS group 1 in DMs
+    # (PTB runs only one handler per group, and this one is registered
+    # before _track_reply_chain_handler), so it is the only group-1
+    # handler that runs for DM text/captions. Without this call, /q r
+    # in DMs never saw any tracked messages.
+    _track_message_for_quote(update.effective_chat.id, msg)
     vid = _extract_video_media(msg)
     url = _extract_url_from_message(msg)
     if vid or url:
@@ -2016,6 +2069,12 @@ def main() -> None:
     # text/caption message's author + reply target in all chats, so
     # /q r can resolve reply context even when Telegram's update omits
     # the nested reply_to_message — see _resolve_reply_context).
+    # NOTE: do NOT rely on this handler alone. PTB runs only ONE
+    # handler per group, and in DMs handle_dm_media_tracker (above)
+    # matches plain text first, so this handler never runs there.
+    # Reply-chain tracking therefore also happens inside
+    # handle_message (group 0) and handle_dm_media_tracker, which
+    # are the handlers that actually win for DM text.
     application.add_handler(
         MessageHandler(
             (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,

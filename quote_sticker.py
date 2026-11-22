@@ -500,9 +500,14 @@ def generate_quote_card(
       - If reply context: indented reply container with vertical accent bar
       - Quoted message body text below
       - Snug card bounding box scaled to 512px without excess empty canvas
-    The card reserves a timestamp-safe zone (extra right/bottom space
-    plus transparent canvas below) so Telegram's bottom-right
-    timestamp pill does not cover the last words.
+    The card is SNUG to its content (no empty space inside it) and the
+    timestamp protection comes ONLY from transparent canvas BELOW the
+    card, so Telegram's bottom-right timestamp pill lands on
+    transparency, below the visible bubble — as in the reference
+    sticker from another bot, where the time is outside/separated
+    from the card. Text may therefore run close to the card's right
+    edge, like the reference; that is intended, because the pill is
+    below the card, not to its right.
     bg_color: optional card background — an (R, G, B) tuple, or a color
     name / hex string accepted by parse_quote_color() (e.g. "yellow",
     "#FFD700"). Defaults to the original dark (26, 24, 34) when None
@@ -534,23 +539,24 @@ def generate_quote_card(
     AVATAR_SIZE = 48
     # ── Timestamp-safe zone ──────────────────────────────────────────
     # Telegram overlays its "9:31 AM ✓✓" pill at the bottom-right of a
-    # sticker. The old snug card put body text ~18px (pre-scale, ~25px
-    # final) from the right edge and ~28px from the bottom, so the pill
-    # covered the last words. Reserve space for it instead:
-    #   * TIMESTAMP_RIGHT_RESERVE: empty card space to the right of text
-    #   * TIMESTAMP_BOTTOM_RESERVE: extra empty card height below text
-    #   * TIMESTAMP_CANVAS_PAD: transparent canvas added below the
-    #     scaled card, so the pill lands on transparency, below the
-    #     visible bubble (as in the reference sticker from another bot).
-    # MAX_CARD_W caps the pre-scale width so the card is narrower than
-    # the old 512px snug width. With content_x=80, PADDING=18 and the
-    # 72px right reserve, max_content_w is 432-80-18-72 = 262, which
-    # guarantees >=90px (final, 512-scaled) from the last line's end
-    # to the right edge even for a full-width wrapped line.
-    TIMESTAMP_RIGHT_RESERVE = 72
-    TIMESTAMP_BOTTOM_RESERVE = 36
-    TIMESTAMP_CANVAS_PAD = 40
-    MAX_CARD_W = 432
+    # sticker. The old layout reserved empty space INSIDE the card
+    # (72px right + 36px bottom), which made the card wide/tall with
+    # a lot of empty space and wrapped short sentences onto 2 lines.
+    # The reference sticker instead keeps the card snug to its text
+    # and puts the pill on transparent canvas BELOW the card, so:
+    #   * TIMESTAMP_RIGHT_RESERVE / TIMESTAMP_BOTTOM_RESERVE are 0 —
+    #     no empty space inside the card.
+    #   * TIMESTAMP_CANVAS_PAD is the only protection: 48px of
+    #     transparent canvas appended below the scaled card.
+    # MAX_CARD_W is 512 (was 432) so normal sentences fit on one line:
+    # "Ur mum is ai generated stfu" is 295px and "Gonna test the colors
+    # now with reply" is 387px at 21px font; with content_x=80 and
+    # PADDING=18, max_content_w is 512-80-18 = 414, so both fit on one
+    # line. Longer sentences still wrap, but at 414px instead of 262px.
+    TIMESTAMP_RIGHT_RESERVE = 0
+    TIMESTAMP_BOTTOM_RESERVE = 0
+    TIMESTAMP_CANVAS_PAD = 48
+    MAX_CARD_W = 512
 
     font_user = FONT_USERNAME(22)
     font_body = FONT_BODY(21)
@@ -564,7 +570,7 @@ def generate_quote_card(
     dd = ImageDraw.Draw(dummy_img)
 
     content_x = PADDING + AVATAR_SIZE + 14
-    # Narrower than the old 480-based width: see timestamp-safe zone above.
+    # Full width for text — no right reserve deducted (see above).
     max_content_w = MAX_CARD_W - content_x - PADDING - TIMESTAMP_RIGHT_RESERVE
 
     # 1. Author username width
@@ -598,15 +604,16 @@ def generate_quote_card(
     body_max_w = max([_measure_text_width(l, font_body, emoji_font, dd) for l in body_lines] or [0])
     body_h = len(body_lines) * line_h
 
-    # Calculate snug card dimensions, with the timestamp-safe zone.
-    # card_w includes TIMESTAMP_RIGHT_RESERVE so text never runs to
-    # the right edge, even though the card is otherwise snug.
+    # Calculate snug card dimensions — no internal timestamp reserve:
+    # card_w is exactly content + padding, card_h is exactly content
+    # + padding. The time pill is kept off the card by the transparent
+    # canvas below it, not by empty space inside it.
     needed_content_w = max(header_w, reply_w, body_max_w, 140)
     card_w = min(content_x + needed_content_w + PADDING + TIMESTAMP_RIGHT_RESERVE, MAX_CARD_W)
     card_w = max(card_w, 230)
 
     total_content_h = 30 + (reply_h + 8 if has_reply else 0) + body_h
-    card_h = max(total_content_h + (PADDING * 2) + TIMESTAMP_BOTTOM_RESERVE, AVATAR_SIZE + (PADDING * 2), 105)
+    card_h = max(total_content_h + (PADDING * 2) + TIMESTAMP_BOTTOM_RESERVE, AVATAR_SIZE + (PADDING * 2), 90)
     card_h = min(card_h, 512)
 
     img = Image.new("RGBA", (int(card_w), int(card_h)), (0, 0, 0, 0))

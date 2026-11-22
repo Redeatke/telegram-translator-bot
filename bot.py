@@ -540,14 +540,16 @@ async def _extract_author_and_avatar(bot, msg) -> tuple[str, Optional[bytes]]:
     if not author_name:
         if getattr(msg, "from_user", None):
             author_user = msg.from_user
-            author_name = author_user.first_name
-            if getattr(author_user, "last_name", None):
-                author_name = f"{author_user.first_name} {author_user.last_name}"
+            author_name = author_user.first_name or getattr(author_user, "username", None)
+            if getattr(author_user, "last_name", None) and author_name:
+                author_name = f"{author_name} {author_user.last_name}"
         elif getattr(msg, "sender_chat", None):
             author_chat = msg.sender_chat
             author_name = getattr(author_chat, "title", None) or "Chat"
 
     author_name = (author_name or "User").strip()
+    if author_name == "User":
+        logger.debug(f"Could not determine author name for message {getattr(msg, 'message_id', None)}; using 'User'")
 
     # 4. Fetch avatar bytes
     avatar_bytes = None
@@ -1015,23 +1017,27 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
         if msg_text:
             username, avatar_bytes = await _extract_author_and_avatar(context.bot, target_msg)
 
-            # Check for reply context (who target_msg replied to)
+            # Check for reply context (who target_msg replied to).
+            # _resolve_reply_context() first uses the reply in the
+            # Telegram update, then falls back to the reply-chain
+            # tracker — the update alone omits the nested reply in
+            # DMs, which is why "/q r white" used to come out with
+            # no reply context at all.
             reply_username = None
             reply_text = None
             reply_avatar_bytes = None
-            if include_reply_context and target_msg.reply_to_message:
-                r_msg = target_msg.reply_to_message
-                reply_text = r_msg.text or r_msg.caption or ""
+            reply_context_missing = False
+            if include_reply_context:
+                reply_username, reply_text, reply_avatar_bytes = await _resolve_reply_context(
+                    context.bot, target_msg, update.effective_chat.id
+                )
                 if not reply_text:
-                    if r_msg.photo:
-                        reply_text = "📷 Photo"
-                    elif r_msg.video or r_msg.animation or r_msg.video_note:
-                        reply_text = "🎥 Video"
-                    elif r_msg.sticker:
-                        reply_text = f"{r_msg.sticker.emoji or '💬'} Sticker"
-                    elif r_msg.document:
-                        reply_text = "📄 File"
-                reply_username, reply_avatar_bytes = await _extract_author_and_avatar(context.bot, r_msg)
+                    reply_context_missing = True
+                    logger.warning(
+                        "/q r requested but no reply context found for "
+                        f"message {getattr(target_msg, 'message_id', None)} "
+                        f"in chat {update.effective_chat.id}"
+                    )
 
             sticker_bytes = quote_sticker.generate_quote_card(
                 username=username,
@@ -1049,6 +1055,16 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
             sticker_set = await context.bot.get_sticker_set(pack_name)
             last_sticker = sticker_set.stickers[-1]
             await msg.reply_sticker(sticker=last_sticker.file_id)
+            if reply_context_missing:
+                await msg.reply_text(
+                    fmt_warning(
+                        "Made the quote, but I couldn't see what that message was "
+                        "replying to — Telegram doesn't always include the reply chain "
+                        "in DMs, and it wasn't in my recent-message memory. "
+                        "Try /q r again on a message sent after the bot restarted."
+                    ),
+                    parse_mode="HTML",
+                )
             return
 
         await msg.reply_text(
@@ -1118,6 +1134,100 @@ def _track_dm_media(chat_id: int, url, vid) -> None:
         oldest = min(_last_dm_media, key=lambda c: _last_dm_media[c][2])
         _last_dm_media.pop(oldest, None)
     _last_dm_media[chat_id] = (url, vid, now)
+
+
+# ─── Reply-chain tracker (for /q r) ─────────────────────────────────────────
+# Why this exists: /q r shows what the quoted message was replying to.
+# The live failure (2026-11-22) was: "/q r white" produced a white card
+# but NO reply context and NO username, even though the colour parsing
+# in the very same arg loop worked — so include_reply_context WAS set.
+# The only remaining cause in handle_sticker_or_quote() is that
+# target_msg.reply_to_message was empty in the update Telegram sent:
+# Telegram does not reliably include the *nested* reply (the message
+# the target was replying to) in a DM update, so the old code silently
+# dropped the reply context. This tracker records recent messages
+# (author + text + what they replied to) as they arrive, so /q r can
+# resolve the chain from memory even when the update omits it.
+# In-memory only, capped and TTL'd like _last_dm_media; lost on restart.
+_reply_chain: Dict[tuple, dict] = {}
+_MAX_REPLY_CHAIN_ENTRIES = 500
+_REPLY_CHAIN_TTL_SECONDS = 3600  # 1 hour
+
+
+def _track_message_for_quote(chat_id: int, msg) -> None:
+    """Record one message's author/text/reply-target for later /q r lookup."""
+    if not msg or getattr(msg, "message_id", None) is None:
+        return
+    text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+    author = None
+    author_user = getattr(msg, "from_user", None)
+    if author_user:
+        author = getattr(author_user, "first_name", None) or getattr(author_user, "username", None)
+        if getattr(author_user, "last_name", None):
+            author = f"{author} {author_user.last_name}"
+    if not author:
+        sender_chat = getattr(msg, "sender_chat", None)
+        author = getattr(sender_chat, "title", None) if sender_chat else None
+    author = (author or "User").strip()
+    reply_to = getattr(msg, "reply_to_message", None)
+    reply_to_id = getattr(reply_to, "message_id", None) if reply_to else None
+    now = time.time()
+    for key in [k for k, v in _reply_chain.items() if now - v.get("ts", 0) > _REPLY_CHAIN_TTL_SECONDS]:
+        _reply_chain.pop(key, None)
+    if len(_reply_chain) >= _MAX_REPLY_CHAIN_ENTRIES:
+        oldest = min(_reply_chain, key=lambda k: _reply_chain[k].get("ts", 0))
+        _reply_chain.pop(oldest, None)
+    _reply_chain[(chat_id, msg.message_id)] = {
+        "author": author,
+        "text": text,
+        "reply_to_id": reply_to_id,
+        "ts": now,
+    }
+
+
+async def _track_reply_chain_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group-1 passive handler: record every text/caption message's
+    reply chain so /q r can find it later. Runs after group-0 handlers
+    and never replies or interrupts anything."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    _track_message_for_quote(chat.id, msg)
+
+
+async def _resolve_reply_context(bot, target_msg, chat_id: int):
+    """Resolve (reply_username, reply_text, reply_avatar_bytes) for /q r.
+
+    1. Preferred: target_msg.reply_to_message from the Telegram update.
+    2. Fallback: the reply-chain tracker — what the target replied to,
+       as recorded when that message arrived (covers DM updates where
+       Telegram omits the nested reply).
+    Returns (None, None, None) when neither source has a reply.
+    """
+    r_msg = getattr(target_msg, "reply_to_message", None)
+    if r_msg:
+        reply_text = getattr(r_msg, "text", None) or getattr(r_msg, "caption", None) or ""
+        if not reply_text:
+            if getattr(r_msg, "photo", None):
+                reply_text = "📷 Photo"
+            elif getattr(r_msg, "video", None) or getattr(r_msg, "animation", None) or getattr(r_msg, "video_note", None):
+                reply_text = "🎥 Video"
+            elif getattr(r_msg, "sticker", None):
+                reply_text = f"{getattr(r_msg.sticker, 'emoji', None) or '💬'} Sticker"
+            elif getattr(r_msg, "document", None):
+                reply_text = "📄 File"
+        reply_username, reply_avatar_bytes = await _extract_author_and_avatar(bot, r_msg)
+        if reply_text:
+            return reply_username, reply_text, reply_avatar_bytes
+        return None, None, None
+    # Fallback: tracker lookup by (chat_id, target message_id).
+    entry = _reply_chain.get((chat_id, getattr(target_msg, "message_id", None)))
+    if entry and entry.get("reply_to_id") is not None:
+        replied = _reply_chain.get((chat_id, entry["reply_to_id"]))
+        if replied and replied.get("text"):
+            return replied["author"], replied["text"], None
+    return None, None, None
 
 
 def _extract_video_media(message):
@@ -1897,6 +2007,19 @@ def main() -> None:
         MessageHandler(
             (filters.VIDEO | filters.ANIMATION | filters.ATTACHMENT | filters.TEXT) & filters.ChatType.PRIVATE,
             handle_dm_media_tracker,
+            block=False
+        ),
+        group=1
+    )
+
+    # Register reply-chain tracker in group 1 (passively records every
+    # text/caption message's author + reply target in all chats, so
+    # /q r can resolve reply context even when Telegram's update omits
+    # the nested reply_to_message — see _resolve_reply_context).
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+            _track_reply_chain_handler,
             block=False
         ),
         group=1

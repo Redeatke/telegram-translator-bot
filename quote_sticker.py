@@ -7,6 +7,8 @@ Also handles /gif command for converting videos to GIFs.
 Commands handled:
   /q          – Quote a replied message as a static sticker (card for text, raw for image)
   /q r        – Quote with reply context (shows both users)
+  /q yellow   – Quote with a yellow card background (named color or hex, e.g. /q #FFD700)
+  /q #FFD700  – Quote with a custom hex-color card background
   /q N        – Quote last N messages as individual stickers
   /q 2 5      – For video replies: clip from 2s to 5s as a video sticker
   /gif        – Convert a replied video to GIF
@@ -48,6 +50,123 @@ CARD_TEXT_SECONDARY = (140, 150, 170) # Muted text
 CARD_ACCENT_CYAN = (0, 220, 220)     # Cyan glow
 CARD_ACCENT_PURPLE = (140, 80, 220)  # Purple accent
 CARD_REPLY_BG = (35, 38, 55)         # Reply container background
+
+# ─── Quote Card Background Colors ────────────────────────────────────────────
+# /q <color> / /q <hex> — named colors and hex codes accepted by parse_quote_color().
+# Keys are lowercase, with spaces/underscores/hyphens stripped (so "sky blue",
+# "sky_blue" and "skyblue" all match).
+
+DEFAULT_QUOTE_BG_COLOR = (26, 24, 34)  # Original dark card background
+
+QUOTE_COLORS = {
+    "black": (0, 0, 0),
+    "white": (255, 255, 255),
+    "red": (255, 0, 0),
+    "green": (0, 128, 0),
+    "blue": (0, 0, 255),
+    "yellow": (255, 255, 0),
+    "orange": (255, 165, 0),
+    "purple": (128, 0, 128),
+    "pink": (255, 192, 203),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "teal": (0, 128, 128),
+    "lime": (0, 255, 0),
+    "brown": (165, 42, 42),
+    "gray": (128, 128, 128),
+    "grey": (128, 128, 128),
+    "gold": (255, 215, 0),
+    "silver": (192, 192, 192),
+    "navy": (0, 0, 128),
+    "maroon": (128, 0, 0),
+    "olive": (128, 128, 0),
+    "coral": (255, 127, 80),
+    "salmon": (250, 128, 114),
+    "skyblue": (135, 206, 235),
+    "violet": (238, 130, 238),
+    "indigo": (75, 0, 130),
+    "beige": (245, 245, 220),
+    "dark": (26, 24, 34),
+    "light": (245, 245, 245),
+}
+
+
+def parse_quote_color(value) -> Optional[Tuple[int, int, int]]:
+    """Parse a /q color argument into an (R, G, B) tuple, or None if invalid.
+
+    Accepts:
+      - Named colors (case-insensitive): ``yellow``, ``Red``, ``sky blue``.
+      - Hex, with or without a leading '#', 3 or 6 digits, case-insensitive:
+        ``#FFD700``, ``#ffd700``, ``#F00``, ``FFD700``, ``F00``.
+    Returns None for unknown names, malformed hex, empty/None input, or
+    anything that is not a string. Never raises for user input.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    if not v:
+        return None
+    # Named color first (spaces/underscores/hyphens ignored, '#' ignored).
+    name_key = re.sub(r"[\s_-]+", "", v.lstrip("#"))
+    if name_key in QUOTE_COLORS:
+        return QUOTE_COLORS[name_key]
+    # Hex: 3 or 6 hex digits, with or without '#'.
+    hex_part = v[1:] if v.startswith("#") else v
+    if re.fullmatch(r"[0-9a-f]{3}|[0-9a-f]{6}", hex_part):
+        if len(hex_part) == 3:
+            hex_part = "".join(ch * 2 for ch in hex_part)
+        return (
+            int(hex_part[0:2], 16),
+            int(hex_part[2:4], 16),
+            int(hex_part[4:6], 16),
+        )
+    return None
+
+
+def _relative_luminance(rgb: Tuple[int, int, int]) -> float:
+    """Relative luminance of an RGB color (0 = black, 1 = white), per WCAG."""
+    def _linear(c: int) -> float:
+        s = c / 255.0
+        return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4
+    r, g, b = (_linear(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _is_light_color(rgb: Tuple[int, int, int]) -> bool:
+    """True when a background is light enough to need dark text."""
+    return _relative_luminance(rgb) > 0.5
+
+
+def _shade_color(rgb: Tuple[int, int, int], factor: float) -> Tuple[int, int, int]:
+    """Multiply every channel by ``factor``, clamped to 0-255."""
+    return tuple(max(0, min(255, int(round(c * factor)))) for c in rgb)
+
+
+def _derive_quote_palette(bg_rgb: Tuple[int, int, int]):
+    """Derive readable (border, text, reply_text, user_accent, reply_accent)
+    colors for a given card background, based on its luminance.
+
+    Light backgrounds get dark text and darker accents; dark backgrounds
+    keep the original light text and bright cyan/pink accents. The border
+    is a darker shade of a light bg, or a slightly lightened shade of a
+    dark bg, so the card edge stays visible without clashing.
+    """
+    if _is_light_color(bg_rgb):
+        border = _shade_color(bg_rgb, 0.70)
+        text = (20, 20, 25)
+        reply_text = (35, 35, 45)
+        user_accent = (0, 110, 105)    # Dark teal — readable on light bg
+        reply_accent = (180, 20, 90)   # Dark pink — readable on light bg
+    else:
+        border = tuple(
+            max(0, min(255, int(c + (255 - c) * 0.18))) for c in bg_rgb
+        )
+        text = (245, 246, 250)
+        reply_text = (235, 238, 245)
+        user_accent = (42, 212, 183)   # #2AD4B7 — original
+        reply_accent = (224, 86, 151)  # #E05697 — original
+    return border, text, reply_text, user_accent, reply_accent
+
 
 # Avatar color palette — vibrant, varied colors for initial-letter placeholder avatars
 AVATAR_COLORS = [
@@ -371,6 +490,7 @@ def generate_quote_card(
     reply_text: Optional[str] = None,
     reply_avatar_bytes: Optional[bytes] = None,
     timestamp: Optional[str] = None,
+    bg_color=None,
 ) -> bytes:
     """
     Generate a Telegram/Quotly-style quote card as a 512px WEBP sticker.
@@ -383,9 +503,32 @@ def generate_quote_card(
     The card reserves a timestamp-safe zone (extra right/bottom space
     plus transparent canvas below) so Telegram's bottom-right
     timestamp pill does not cover the last words.
+    bg_color: optional card background — an (R, G, B) tuple, or a color
+    name / hex string accepted by parse_quote_color() (e.g. "yellow",
+    "#FFD700"). Defaults to the original dark (26, 24, 34) when None
+    or unparseable. Border, text and accent colors are derived from
+    the background's luminance so text stays readable on light and
+    dark backgrounds alike.
     """
     text = _clean_text(text) or "(no text)"
     username = _clean_text(username) or "User"
+
+    # Resolve the card background (accept tuple, name, or hex string).
+    if bg_color is None:
+        resolved_bg = DEFAULT_QUOTE_BG_COLOR
+    elif isinstance(bg_color, str):
+        resolved_bg = parse_quote_color(bg_color) or DEFAULT_QUOTE_BG_COLOR
+    elif isinstance(bg_color, (tuple, list)) and len(bg_color) == 3:
+        try:
+            resolved_bg = tuple(max(0, min(255, int(c))) for c in bg_color)
+        except (TypeError, ValueError):
+            resolved_bg = DEFAULT_QUOTE_BG_COLOR
+    else:
+        resolved_bg = DEFAULT_QUOTE_BG_COLOR
+    BORDER_COLOR, TEXT_COLOR, REPLY_TEXT_COLOR, USER_ACCENT, REPLY_ACCENT = (
+        _derive_quote_palette(resolved_bg)
+    )
+    BG_COLOR = resolved_bg
 
     PADDING = 18
     AVATAR_SIZE = 48
@@ -469,9 +612,8 @@ def generate_quote_card(
     img = Image.new("RGBA", (int(card_w), int(card_h)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Background card: Sleek dark glassmorphism
-    BG_COLOR = (26, 24, 34)
-    BORDER_COLOR = (46, 43, 58)
+    # Background card: Sleek dark glassmorphism (or the requested /q color).
+    # BG_COLOR / BORDER_COLOR are derived from bg_color above, before this point.
     draw.rounded_rectangle(
         [(0, 0), (card_w - 1, card_h - 1)],
         radius=20,
@@ -490,15 +632,13 @@ def generate_quote_card(
     else:
         _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username, glow=True)
 
-    # Draw author name (cyan/turquoise accent)
-    USER_ACCENT = (42, 212, 183)  # #2AD4B7
+    # Draw author name (accent derived from the card background)
     _draw_text_with_emoji(draw, (content_x, avatar_y + 2), username, font_user, emoji_font, fill=USER_ACCENT)
 
     cur_y = avatar_y + 32
 
     # Draw Reply Section if present
     if has_reply:
-        REPLY_ACCENT = (224, 86, 151)  # #E05697 Pink bar and author
         bar_x = content_x
         bar_h = reply_h - 6
         draw.line([(bar_x, cur_y), (bar_x, cur_y + bar_h)], fill=REPLY_ACCENT, width=3)
@@ -508,13 +648,12 @@ def generate_quote_card(
 
         ry = cur_y + 22
         for rline in reply_lines:
-            _draw_text_with_emoji(draw, (bar_x + 10, ry), rline, font_reply_text_font, emoji_font_small, fill=(235, 238, 245))
+            _draw_text_with_emoji(draw, (bar_x + 10, ry), rline, font_reply_text_font, emoji_font_small, fill=REPLY_TEXT_COLOR)
             ry += rline_h
 
         cur_y += reply_h + 4
 
     # Draw Main Message text
-    TEXT_COLOR = (245, 246, 250)
     for bline in body_lines:
         _draw_text_with_emoji(draw, (content_x, cur_y), bline, font_body, emoji_font, fill=TEXT_COLOR)
         cur_y += line_h

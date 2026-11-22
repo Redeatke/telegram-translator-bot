@@ -152,8 +152,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     body = (
         f"👋 Welcome, <b>{html.escape(first_name)}</b>!\n"
         f"\n"
-        f"I'm your personal translator and media assistant. Send me any\n"
-        f"text and I'll translate it instantly.\n"
+        f"I'm your personal translator and media assistant. Use /tr to\n"
+        f"translate — reply to a message with /tr, or /tr &lt;text&gt;.\n"
         f"\n"
         f"─── ⚙️ Your Settings ───\n"
         f"\n"
@@ -161,7 +161,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"\n"
         f"─── 🚀 Quick Start ───\n"
         f"\n"
-        f"  • Send any text to translate it\n"
+        f"  • /tr &lt;text&gt; — translate text, or reply with /tr\n"
         f"  • /tr — translate in groups or reply to images\n"
         f"  • /sticker — make/add stickers from images, stickers, or text\n"
         f"  • /gif — convert video to animated GIF\n"
@@ -192,7 +192,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /target    Set target language\n"
         f"  /languages Interactive language picker\n"
         f"  /sticker   Create / add sticker (photo, sticker, quote)\n"
-        f"  /q         Quote as sticker (use <code>/q r</code> with reply)\n"
+        f"  /q         Quote as sticker (use <code>/q r</code> with reply, <code>/q yellow</code> or <code>/q #FFD700</code> for color)\n"
         f"  /gif       Convert video to GIF\n"
         f"  /voice     Amharic Voice Assistant\n"
         f"  /status    View your settings\n"
@@ -638,6 +638,9 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
       /sticker     – Convert replied image/video/sticker to sticker pack
       /q           – Quote the replied text message (or media caption) as a card sticker
       /q r         – Quote with reply context (shows who they replied to)
+      /q yellow    – Quote with a yellow card background (named color or hex)
+      /q #FFD700  – Quote with a custom hex-color card background
+      /q r yellow  – Quote with reply context and a yellow background
       /sticker 1 3 – For video: clip from 1s to 3s as a video sticker
       /q 2 5       – Video sticker clip
     """
@@ -686,9 +689,61 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
     multi_count = 0
     video_start = None
     video_end = None
+    quote_bg_color = None
 
     if args:
-        if args[0].lower() in ("r", "reply", "-r"):
+        if is_quote_cmd:
+            # /q arg parsing: reply flag, numeric (video/multi-count) and
+            # color tokens may appear in any order, e.g. /q yellow,
+            # /q #FFD700, /q r yellow, /q yellow r. Numeric handling is
+            # unchanged from before: one number = multi-count / video end,
+            # two numbers = video clip start/end.
+            numeric_args: List[str] = []
+            color_args: List[str] = []
+            for tok in args:
+                low = tok.lower()
+                if low in ("r", "reply", "-r"):
+                    include_reply_context = True
+                elif low.replace(".", "", 1).isdigit():
+                    numeric_args.append(tok)
+                else:
+                    color_args.append(tok)
+            if len(color_args) > 1:
+                await msg.reply_text(
+                    fmt_error(
+                        "Please use only one color with /q, e.g. <code>/q yellow</code> or <code>/q #FFD700</code>."
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+            if color_args:
+                parsed_color = quote_sticker.parse_quote_color(color_args[0])
+                if parsed_color is None:
+                    valid_names = ", ".join(sorted(quote_sticker.QUOTE_COLORS))
+                    await msg.reply_text(
+                        fmt_error(
+                            f"Unknown color “{html.escape(color_args[0])}”. Try a named color "
+                            f"like <code>/q yellow</code> or a hex code like <code>/q #FFD700</code>.\n"
+                            f"Named colors: {html.escape(valid_names)}"
+                        ),
+                        parse_mode="HTML",
+                    )
+                    return
+                quote_bg_color = parsed_color
+            if len(numeric_args) == 1 and numeric_args[0].isdigit():
+                num = int(numeric_args[0])
+                if target_msg and (target_msg.video or target_msg.video_note or target_msg.animation):
+                    video_start = 0.0
+                    video_end = float(num)
+                else:
+                    multi_count = min(num, 10)
+            elif len(numeric_args) >= 2:
+                try:
+                    video_start = float(numeric_args[0])
+                    video_end = float(numeric_args[1])
+                except ValueError:
+                    pass
+        elif args[0].lower() in ("r", "reply", "-r"):
             include_reply_context = True
         elif len(args) == 1 and args[0].isdigit():
             num = int(args[0])
@@ -711,6 +766,9 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
                 f"  <code>/sticker</code> — Convert photo/video/sticker to your pack\n"
                 f"  <code>/q</code> — Quote text message or media caption as a sticker\n"
                 f"  <code>/q r</code> — Quote with replied message context\n"
+                f"  <code>/q yellow</code> — Quote with a yellow background\n"
+                f"  <code>/q #FFD700</code> — Quote with a custom hex-color background\n"
+                f"  <code>/q r yellow</code> — Quote with reply context and a color\n"
                 f"\n"
                 f"  <b>For videos:</b>\n"
                 f"  <code>/sticker</code> — Video sticker (first 3s)\n"
@@ -982,6 +1040,7 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
                 reply_username=reply_username,
                 reply_text=reply_text,
                 reply_avatar_bytes=reply_avatar_bytes,
+                bg_color=quote_bg_color,
             )
 
             pack_name = await _find_or_create_sticker_pack(
@@ -1378,7 +1437,14 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Translate incoming text messages in private chats."""
+    """Handle plain (non-command) text messages.
+
+    Plain text is NOT auto-translated — not in DMs, not anywhere.
+    Translation is explicit only, via /tr (see tr_command).
+    The only thing this handler still does for plain text is track
+    URLs sent in a private chat, so /gif can reuse the last DM link
+    or video (via _track_dm_media / handle_dm_media_tracker).
+    """
     user = update.effective_user
     if not user or not update.message or not update.message.text:
         return
@@ -1393,7 +1459,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message.text.startswith("/"):
         return
 
-    # Do not auto-translate if message contains HTTP/HTTPS URLs
+    # Track URLs sent in a private chat for /gif, then stop — no translation.
     text_lower = update.message.text.lower()
     if "http://" in text_lower or "https://" in text_lower:
         if update.effective_chat.type == "private":
@@ -1402,57 +1468,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 _track_dm_media(update.effective_chat.id, extracted_url, None)
         return
 
-    # Only auto-translate in private chats
-    if update.effective_chat.type != "private":
-        return
-
-    config = get_user_config(user.id)
-    target_lang = config["target"]
-    text = update.message.text
-
-    if len(text) > MAX_TRANSLATION_CHARS:
-        await update.message.reply_text(
-            fmt_error(f"That text is too long ({len(text)} chars, max {MAX_TRANSLATION_CHARS}). Please send a shorter message."),
-            parse_mode="HTML"
-        )
-        return
-
-    _kind = "ai" if has_ai else "free"
-    if not check_rate_limit(user.id, _kind):
-        await update.message.reply_text(
-            fmt_warning("You've hit the hourly translation limit. Please try again in a little while."),
-            parse_mode="HTML"
-        )
-        return
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-    src_lang = detect_language_code(text)
-
-    translated_text = None
-    fallback = False
-
-    # 1. Try AI engine if available
-    if has_ai:
-        try:
-            translated_text = await translate_ai(text, target_lang)
-        except Exception as e:
-            logger.error(f"AI translation failed: {e}. Falling back to free engine.")
-            fallback = True
-
-    # 2. Free engine (or fallback)
-    if not translated_text:
-        try:
-            translated_text = await translate_free(text, target_lang, src_lang=src_lang)
-        except Exception:
-            await update.message.reply_text(
-                fmt_error("Translation failed. Please try again later."),
-                parse_mode="HTML"
-            )
-            return
-
-    response_msg = fmt_translation(src_lang, target_lang, translated_text, fallback=fallback)
-    await update.message.reply_text(response_msg, parse_mode="HTML")
+    # Plain text in DMs (and elsewhere) does nothing. Use /tr to translate.
+    return
 
 
 async def handle_dm_media_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1667,7 +1684,7 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
             text=(
                 f"👋 <b>Hello {html.escape(chat.title or 'everyone')}!</b>\n\n"
                 f"I'm your <b>Translator & Media Downloader Bot</b>!\n"
-                f"• Auto-translates text in private chats\n"
+                f"• Translate with /tr — reply to a message or use /tr &lt;text&gt;\n"
                 f"• Downloads video/media from <b>YouTube, Twitter, Twitch Clips, TikTok, Instagram, Threads, and Reddit</b>\n\n"
                 f"<i>Group Administrators can run /downloads to configure platform permissions.</i>"
             ),

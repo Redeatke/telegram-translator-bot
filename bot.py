@@ -71,6 +71,7 @@ from config import (
     has_ai,
     should_skip_message,
     check_rate_limit,
+    rate_limit_remaining,
     MAX_TRANSLATION_CHARS,
     safe_answer_query,
     logger,
@@ -135,6 +136,8 @@ from downloaders import (
 from twitter_handler import handle_twitter_message
 from voice_agent import handle_voice_message, voice_command
 import quote_sticker
+import chat_agent
+import redster
 import card
 import telethon_downloader
 
@@ -163,6 +166,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"\n"
         f"  • /tr &lt;text&gt; — translate text, or reply with /tr\n"
         f"  • /tr — translate in groups or reply to images\n"
+        f"  • /ask &lt;question&gt; — chat with the bot\n"
+        f"  • redster ... — reply to a message with “redster quote this” to quote it, or say “redster hello” to chat\n"
         f"  • /sticker — make/add stickers from images, stickers, or text\n"
         f"  • /gif — convert video to animated GIF\n"
         f"  • /target es — switch target language to Spanish\n"
@@ -189,10 +194,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /start     Start the bot\n"
         f"  /help      This help page\n"
         f"  /tr        Translate text or reply\n"
+        f"  /ask       Chat with the bot\n"
+        f"  /chat      Turn group chat on/off (group admins)\n"
         f"  /target    Set target language\n"
         f"  /languages Interactive language picker\n"
         f"  /sticker   Create / add sticker (photo, sticker, quote)\n"
         f"  /q         Quote as sticker (use <code>/q r</code> with reply, <code>/q yellow</code> or <code>/q #FFD700</code> for color)\n"
+        f"  redster quote this — quote by keyword: reply to a message and say “redster quote this”, “redster quote this in yellow”, or “redster quote and add a background color of red”\n"
         f"  /gif       Convert video to GIF\n"
         f"  /voice     Amharic Voice Assistant\n"
         f"  /status    View your settings\n"
@@ -633,6 +641,82 @@ async def _find_or_create_sticker_pack(bot, user, sticker_input, is_video=False,
     raise RuntimeError("Could not find or create a sticker pack")
 
 
+async def _send_quote_card(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           msg, target_msg, include_reply_context: bool,
+                           quote_bg_color=None, command_hint: str = "/q r") -> bool:
+    """Build a quote card sticker from target_msg's text/caption and send it.
+
+    Shared by /q (handle_sticker_or_quote) and the "redster quote ..."
+    keyword (handle_redster_quote). Returns True when a card was sent,
+    False when the target has no quotable text.
+    """
+    user = update.effective_user
+    msg_text = (target_msg.text or target_msg.caption or "").strip()
+    if not msg_text:
+        return False
+
+    username, avatar_bytes = await _extract_author_and_avatar(context.bot, target_msg)
+    if username == "User":
+        # No username bug was reproduced locally — the generator
+        # renders "Red" correctly — but log it so a live
+        # recurrence is diagnosable from Northflank logs.
+        logger.warning(
+            "Could not determine author name for /q target "
+            f"message {getattr(target_msg, 'message_id', None)} "
+            f"in chat {update.effective_chat.id}; using 'User'"
+        )
+
+    # Check for reply context (who target_msg replied to).
+    # _resolve_reply_context() first uses the reply in the
+    # Telegram update, then falls back to the reply-chain
+    # tracker — the update alone omits the nested reply in
+    # DMs, which is why "/q r white" used to come out with
+    # no reply context at all.
+    reply_username = None
+    reply_text = None
+    reply_avatar_bytes = None
+    reply_context_missing = False
+    if include_reply_context:
+        reply_username, reply_text, reply_avatar_bytes = await _resolve_reply_context(
+            context.bot, target_msg, update.effective_chat.id
+        )
+        if not reply_text:
+            reply_context_missing = True
+            logger.warning(
+                "/q r requested but no reply context found for "
+                f"message {getattr(target_msg, 'message_id', None)} "
+                f"in chat {update.effective_chat.id}"
+            )
+
+    sticker_bytes = quote_sticker.generate_quote_card(
+        username=username,
+        text=msg_text,
+        avatar_bytes=avatar_bytes,
+        reply_username=reply_username,
+        reply_text=reply_text,
+        reply_avatar_bytes=reply_avatar_bytes,
+        bg_color=quote_bg_color,
+    )
+
+    pack_name = await _find_or_create_sticker_pack(
+        context.bot, user, sticker_bytes, is_video=False
+    )
+    sticker_set = await context.bot.get_sticker_set(pack_name)
+    last_sticker = sticker_set.stickers[-1]
+    await msg.reply_sticker(sticker=last_sticker.file_id)
+    if reply_context_missing:
+        await msg.reply_text(
+            fmt_warning(
+                "Made the quote, but I couldn't see what that message was "
+                "replying to — Telegram doesn't always include the reply chain "
+                "in DMs, and it wasn't in my recent-message memory. "
+                f"Try {command_hint} again on a message sent after the bot restarted."
+            ),
+            parse_mode="HTML",
+        )
+    return True
+
+
 async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_TYPE, is_quote_cmd: bool = False) -> None:
     """Quote a message or convert media/stickers into sticker pack.
 
@@ -1023,65 +1107,10 @@ async def handle_sticker_or_quote(update: Update, context: ContextTypes.DEFAULT_
 
         # ── Quote Card Sticker (from text / caption) ──
         if msg_text:
-            username, avatar_bytes = await _extract_author_and_avatar(context.bot, target_msg)
-            if username == "User":
-                # No username bug was reproduced locally — the generator
-                # renders "Red" correctly — but log it so a live
-                # recurrence is diagnosable from Northflank logs.
-                logger.warning(
-                    "Could not determine author name for /q target "
-                    f"message {getattr(target_msg, 'message_id', None)} "
-                    f"in chat {update.effective_chat.id}; using 'User'"
-                )
-
-            # Check for reply context (who target_msg replied to).
-            # _resolve_reply_context() first uses the reply in the
-            # Telegram update, then falls back to the reply-chain
-            # tracker — the update alone omits the nested reply in
-            # DMs, which is why "/q r white" used to come out with
-            # no reply context at all.
-            reply_username = None
-            reply_text = None
-            reply_avatar_bytes = None
-            reply_context_missing = False
-            if include_reply_context:
-                reply_username, reply_text, reply_avatar_bytes = await _resolve_reply_context(
-                    context.bot, target_msg, update.effective_chat.id
-                )
-                if not reply_text:
-                    reply_context_missing = True
-                    logger.warning(
-                        "/q r requested but no reply context found for "
-                        f"message {getattr(target_msg, 'message_id', None)} "
-                        f"in chat {update.effective_chat.id}"
-                    )
-
-            sticker_bytes = quote_sticker.generate_quote_card(
-                username=username,
-                text=msg_text,
-                avatar_bytes=avatar_bytes,
-                reply_username=reply_username,
-                reply_text=reply_text,
-                reply_avatar_bytes=reply_avatar_bytes,
-                bg_color=quote_bg_color,
+            await _send_quote_card(
+                update, context, msg, target_msg,
+                include_reply_context, quote_bg_color,
             )
-
-            pack_name = await _find_or_create_sticker_pack(
-                context.bot, user, sticker_bytes, is_video=False
-            )
-            sticker_set = await context.bot.get_sticker_set(pack_name)
-            last_sticker = sticker_set.stickers[-1]
-            await msg.reply_sticker(sticker=last_sticker.file_id)
-            if reply_context_missing:
-                await msg.reply_text(
-                    fmt_warning(
-                        "Made the quote, but I couldn't see what that message was "
-                        "replying to — Telegram doesn't always include the reply chain "
-                        "in DMs, and it wasn't in my recent-message memory. "
-                        "Try /q r again on a message sent after the bot restarted."
-                    ),
-                    parse_mode="HTML",
-                )
             return
 
         await msg.reply_text(
@@ -1130,6 +1159,262 @@ async def q_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sticker command: converts media to sticker by default, falls back to text."""
     await handle_sticker_or_quote(update, context, is_quote_cmd=False)
+
+
+# ─── "redster ..." keyword + interactive chat ────────────────────────────────
+
+async def handle_redster_quote(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict) -> None:
+    """Handle a parsed "redster quote ..." message (see redster.py).
+
+    The message must reply to the message to quote. Colour and reply
+    context come from the parsed dict; the card itself is built by the
+    same _send_quote_card() helper /q uses, so behaviour matches.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    target_msg = msg.reply_to_message
+    if not target_msg:
+        await msg.reply_text(
+            fmt_warning("Reply to the message you want me to quote, then say <code>redster quote this</code>."),
+            parse_mode="HTML",
+        )
+        return
+
+    if parsed.get("unknown_color"):
+        valid_names = ", ".join(sorted(quote_sticker.QUOTE_COLORS))
+        await msg.reply_text(
+            fmt_error(
+                f"I don't know the color “{html.escape(str(parsed['unknown_color']))}”. Try a named color "
+                f"like <code>redster quote this in yellow</code> or a hex code like "
+                f"<code>redster quote this in #FFD700</code>.\n"
+                f"Named colors: {html.escape(valid_names)}"
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    _track_message_for_quote(update.effective_chat.id, msg)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="choose_sticker")
+    try:
+        sent = await _send_quote_card(
+            update, context, msg, target_msg,
+            bool(parsed.get("with_reply", False)),
+            parsed.get("color"),
+            command_hint="redster quote this with reply",
+        )
+        if not sent:
+            await msg.reply_text(
+                fmt_warning("Couldn't find quotable text in that message."),
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Redster quote error: {type(e).__name__}: {e}", exc_info=True)
+        await msg.reply_text(
+            fmt_error("Failed to make that quote. Please try again."),
+            parse_mode="HTML"
+        )
+
+
+def _chat_enabled_for(chat) -> bool:
+    """DMs: chat is always on. Groups: off by default, /chat on enables it."""
+    if not chat or getattr(chat, "type", "") == "private":
+        return True
+    return bool(get_chat_config(chat.id).get("chat", False))
+
+
+async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         user_text: str, msg=None) -> None:
+    """One chat turn, shared by /ask, @mention, reply-to-bot and redster chat.
+
+    Plain text reply (no parse_mode) — AI output may contain stray
+    <b> / <a> fragments that would break Telegram HTML parsing.
+    Rate-limited on the separate "chat" bucket (20/hr, admins 5x).
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = msg or update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    text = (user_text or "").strip()
+    if not text:
+        await msg.reply_text(
+            "Hey! What do you want to ask? Try /ask <your question> or just say “redster …”.",
+        )
+        return
+
+    if not _chat_enabled_for(chat):
+        await msg.reply_text(
+            fmt_warning("Chat is off in this group. A group admin can turn it on with <code>/chat on</code>."),
+            parse_mode="HTML",
+        )
+        return
+
+    if not check_rate_limit(user.id, "chat"):
+        remaining = rate_limit_remaining(user.id, "chat")
+        await msg.reply_text(
+            fmt_warning(
+                f"You've hit the hourly chat limit — {remaining} chats left this hour "
+                f"(20/hr). Please try again in a little while."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if chat.type == "private":
+        history_key = chat_agent.history_key_for_dm(user.id)
+    else:
+        history_key = chat_agent.history_key_for_group(chat.id)
+
+    await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    try:
+        reply = await chat_agent.chat_reply(text, history_key)
+    except Exception as e:
+        logger.error(f"Chat reply failed: {type(e).__name__}: {e}")
+        await msg.reply_text(
+            fmt_error("Sorry, I couldn't answer that just now. Please try again."),
+            parse_mode="HTML",
+        )
+        return
+
+    await msg.reply_text(reply, reply_to_message_id=msg.message_id)
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Chat with the bot: /ask <text>, or reply to a message with /ask."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if is_maintenance_active_for_user(user.id):
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text and msg.reply_to_message:
+        text = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+
+    if not text:
+        await msg.reply_text(
+            fmt_card("💬 /ask — Chat",
+                "  Ask me anything:\n"
+                "  <code>/ask what is the capital of France?</code>\n"
+                "  Or reply to a message with /ask to ask about it.\n"
+                "  In DMs you can also just say <code>redster ...</code>.\n"
+                "  In groups, mention me or reply to one of my messages."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    await _do_chat_reply(update, context, text, msg=msg)
+
+
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle interactive chat for a group: /chat on|off (group admins only).
+
+    In DMs chat is always on, so /chat there just explains how to chat.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    if chat.type == "private":
+        await msg.reply_text(
+            fmt_card("💬 Chat",
+                "  Chat is always on in DMs.\n"
+                "  • <code>/ask &lt;question&gt;</code>\n"
+                "  • Say <code>redster ...</code> — e.g. <code>redster hello</code>\n"
+                "  • Reply to one of my messages"
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    is_admin = user.id in ADMIN_USER_IDS
+    if not is_admin:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            is_admin = member.status in ("administrator", "creator")
+        except Exception as e:
+            logger.error(f"Admin check error in /chat: {e}")
+            await msg.reply_text(
+                fmt_error("Failed to verify your admin privileges. Please try again later."),
+                parse_mode="HTML"
+            )
+            return
+    if not is_admin:
+        await msg.reply_text(
+            fmt_error("Only group admins can change the chat setting."),
+            parse_mode="HTML"
+        )
+        return
+
+    arg = (context.args[0].lower() if context.args else "")
+    cfg = get_chat_config(chat.id)
+    if arg in ("on", "enable", "true", "yes"):
+        cfg["chat"] = True
+        save_chat_configs()
+        await msg.reply_text(
+            fmt_success("Chat is now <b>on</b> in this group. Mention me or reply to my messages to chat, or use <code>/ask</code>."),
+            parse_mode="HTML"
+        )
+    elif arg in ("off", "disable", "false", "no"):
+        cfg["chat"] = False
+        save_chat_configs()
+        await msg.reply_text(
+            fmt_success("Chat is now <b>off</b> in this group."),
+            parse_mode="HTML"
+        )
+    else:
+        state = "on" if cfg.get("chat", False) else "off"
+        await msg.reply_text(
+            fmt_card("💬 Chat Settings",
+                f"  Chat is currently <b>{state}</b> in this group.\n\n"
+                f"  <code>/chat on</code> — enable\n"
+                f"  <code>/chat off</code> — disable"
+            ),
+            parse_mode="HTML",
+        )
+
+
+_MENTION_RE = re.compile(r"@(?:r3dster_bot|redster_bot|redsterbot|redster|r3dster)\b", re.IGNORECASE)
+
+
+def _strip_bot_mention(text: str) -> Optional[str]:
+    """If `text` mentions the bot, return it with the mention removed.
+
+    Returns None when the message does not mention the bot. Catches
+    mentions anywhere in the text ("hey @R3dSter_Bot ..."); a leading
+    mention is already handled by redster.parse_redster_message().
+    """
+    if not text:
+        return None
+    m = _MENTION_RE.search(text)
+    if not m:
+        return None
+    return (text[:m.start()] + text[m.end():]).strip(" \t,!:.")
+
+
+def _is_bot_message(msg, context) -> bool:
+    """True when `msg` was sent by this bot (by username, else by bot id)."""
+    sender = getattr(msg, "from_user", None)
+    if not sender or not getattr(sender, "is_bot", False):
+        return False
+    username = (getattr(sender, "username", "") or "").lower()
+    if username in {"r3dster_bot", "redster_bot", "redsterbot", "r3dster"}:
+        return True
+    try:
+        bot_id = getattr(context.bot, "id", None)
+    except Exception:
+        bot_id = None
+    return bool(bot_id) and getattr(sender, "id", None) == bot_id
 
 
 # ─── GIF Command (/gif) ──────────────────────────────────────────────────────
@@ -1588,9 +1873,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     Plain text is NOT auto-translated — not in DMs, not anywhere.
     Translation is explicit only, via /tr (see tr_command).
-    The only thing this handler still does for plain text is track
-    URLs sent in a private chat, so /gif can reuse the last DM link
-    or video (via _track_dm_media / handle_dm_media_tracker).
+    Plain text does trigger, in order: (1) the "redster ..." keyword
+    (quote or chat), (2) an @mention of the bot, (3) a reply to one of
+    the bot's own messages — all via chat_agent (see _do_chat_reply).
+    Anything else only tracks URLs sent in a private chat, so /gif can
+    reuse the last DM link or video (via _track_dm_media /
+    handle_dm_media_tracker).
     """
     user = update.effective_user
     if not user or not update.message or not update.message.text:
@@ -1614,6 +1902,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if update.message.text.startswith("/"):
+        return
+
+    text = update.message.text
+
+    # 1. "redster ..." keyword — quote takes priority over chat.
+    #    (Also handles a leading "@R3dSter_Bot ..." mention.)
+    parsed = redster.parse_redster_message(text)
+    if parsed is not None:
+        if parsed["intent"] == "quote":
+            await handle_redster_quote(update, context, parsed)
+        else:
+            await _do_chat_reply(update, context, parsed.get("chat_text") or "", msg=update.message)
+        return
+
+    # 2. @mention of the bot anywhere else in the text chats with the remainder.
+    mention_text = _strip_bot_mention(text)
+    if mention_text is not None:
+        await _do_chat_reply(update, context, mention_text, msg=update.message)
+        return
+
+    # 3. Replying to one of the bot's own messages chats with the text.
+    replied = update.message.reply_to_message
+    if replied and _is_bot_message(replied, context):
+        await _do_chat_reply(update, context, text, msg=update.message)
         return
 
     # Track URLs sent in a private chat for /gif, then stop — no translation.
@@ -1997,6 +2309,8 @@ def main() -> None:
     application.add_handler(CommandHandler("gif", gif_command, block=False))
     application.add_handler(MessageHandler(filters.CaptionRegex(r"^/gif(?:\s|$)"), gif_command, block=False))
     application.add_handler(CommandHandler("voice", voice_command))
+    application.add_handler(CommandHandler("ask", ask_command))
+    application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message, block=False))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)

@@ -80,6 +80,7 @@ import collections
 RATE_LIMIT_AI_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_AI_PER_HOUR", "20")))
 RATE_LIMIT_FREE_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_FREE_PER_HOUR", "60")))
 RATE_LIMIT_VOICE_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_VOICE_PER_HOUR", "10")))
+RATE_LIMIT_CHAT_PER_HOUR = max(1, int(os.getenv("RATE_LIMIT_CHAT_PER_HOUR", "20")))
 MAX_TRANSLATION_CHARS = max(100, int(os.getenv("MAX_TRANSLATION_CHARS", "4000")))
 MAX_VOICE_DURATION_SECONDS = max(30, int(os.getenv("MAX_VOICE_DURATION_SECONDS", "300")))
 MAX_VOICE_FILE_MB = max(1, int(os.getenv("MAX_VOICE_FILE_MB", "5")))
@@ -88,6 +89,7 @@ _RATE_LIMITS = {
     "ai": RATE_LIMIT_AI_PER_HOUR,
     "free": RATE_LIMIT_FREE_PER_HOUR,
     "voice": RATE_LIMIT_VOICE_PER_HOUR,
+    "chat": RATE_LIMIT_CHAT_PER_HOUR,
 }
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: Dict[Tuple[int, str], "collections.deque"] = {}
@@ -497,6 +499,7 @@ DEFAULT_CHAT_CONFIG = {
     "threads": True,
     "reddit": True,
     "auto_download": True,
+    "chat": False,
 }
 
 _config_bot = None

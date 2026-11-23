@@ -1317,14 +1317,17 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def _handle_images(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          query: str, msg=None, rate_checked: bool = False) -> None:
-    """Search Openverse for `query` and send up to 3 photos as a group.
+    """Search the web for `query` and send up to 3 photos as a group.
 
-    Search-and-send only — no AI image generation. Images are downloaded
-    with the same guards as downloaders.py (public URL, <= 5 MB,
-    image/* content-type). Sends whatever downloaded (1-3); if none,
-    replies politely. Attribution (creator + licence) goes in the
-    caption, as CC licences require. Rate-limited on the "chat" bucket
-    unless the caller already consumed a hit (rate_checked=True).
+    Search-and-send only — no AI image generation. First source is
+    DuckDuckGo Images (general web images, source page credited in
+    the caption — these are NOT only CC-licensed), then Openverse /
+    Wikimedia Commons (CC images, creator + licence credited, as CC
+    licences require). Images are downloaded with the same guards as
+    downloaders.py (public URL, <= 5 MB, image/* content-type).
+    Sends whatever downloaded (1-3); if none, replies politely.
+    Rate-limited on the "chat" bucket unless the caller already
+    consumed a hit (rate_checked=True).
     """
     user = update.effective_user
     chat = update.effective_chat

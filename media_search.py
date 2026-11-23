@@ -1,17 +1,26 @@
 """
 Image search-and-send for interactive chat (search, NOT generation)
 ───────────────────────────────────────────────────────────────────
-"redster send me a dog with a red ball" -> the top 3 openly-licensed
-photos of that, sent as a Telegram media group with attribution.
+"redster send me a dog with a red ball" -> the top 3 photos of that,
+sent as a Telegram media group with attribution.
 
-Source: Openverse API (https://api.openverse.org/v1/images/) — free,
-no API key, Creative Commons / public-domain images with creator +
-licence metadata in every result. Anonymous tier is limited (~100
-requests/day reported), so this module has its own process-wide daily
-cap (50 searches) and a 10-minute cache. If Openverse fails or is
-empty, Wikimedia Commons search API is the fallback (also free, no
-key) — Openverse is Cloudflare-protected and challenges some
-datacenter/egress IPs.
+Sources, in order (all free, no API key):
+1. DuckDuckGo Images — general web images (the ones users actually
+   ask for: celebrities, movie posters, memes). Token (vqd) + i.js
+   JSON endpoint, moderate safe search (p=1). Results are general web
+   images, NOT only CC-licensed — attribution is the source page, and
+   no CC licence is claimed for them.
+2. Openverse API (https://api.openverse.org/v1/images/) — Creative
+   Commons / public-domain images with creator + licence metadata.
+   Anonymous tier is limited (~100 requests/day reported), so this
+   module has its own process-wide daily cap (50 searches) and a
+   10-minute cache.
+3. Wikimedia Commons search API — also free, no key, CC images.
+
+DuckDuckGo HTML is bot-protected and challenges some datacenter /
+egress IPs (observed from the sandbox); the fallbacks exist so image
+search still works on such networks. If every source fails or is
+empty, search returns [] and the caller replies politely.
 
 Images are downloaded with the same guards as downloaders.py
 (is_public_url equivalent, replicated here so this module stays
@@ -23,9 +32,11 @@ and the caller replies politely instead.
 from __future__ import annotations
 
 import ipaddress
+import random
 import re
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 from urllib.parse import quote_plus, urlparse
@@ -120,7 +131,7 @@ def clear_image_cache() -> None:
 
 
 def image_searches_today() -> int:
-    """How many Openverse searches this process has done today (UTC)."""
+    """How many image searches this process has done today (UTC)."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with _cache_lock:
         return _searches_by_day.get(today, 0)
@@ -140,6 +151,128 @@ def _note_search() -> bool:
 def reset_daily_cap_for_tests() -> None:
     with _cache_lock:
         _searches_by_day.clear()
+
+
+# ─── Surprise-me topics ────────────────────────────────────────────────────
+# "send me an image, any image, surprise me" has no real topic — answer
+# with a random topic from this list instead of searching the literal
+# phrase (which returns nothing anywhere).
+SURPRISE_TOPICS = [
+    "puppy",
+    "sunset over the ocean",
+    "cute cat",
+    "mountains",
+    "city skyline at night",
+    "space nebula",
+    "forest",
+    "beach",
+    "funny dog",
+    "ocean waves",
+    "red panda",
+    "northern lights",
+]
+
+
+def surprise_topic() -> str:
+    """A random topic for a 'surprise me / any image' request."""
+    return random.choice(SURPRISE_TOPICS)
+
+
+# Words that carry no topic on their own — if a query is only these,
+# it is a surprise-me request, not a search for that literal phrase.
+_SURPRISE_FILLERS = {
+    "any", "random", "surprise", "me", "something", "anything",
+    "image", "images", "picture", "pictures", "photo", "photos",
+    "pic", "pics", "a", "an", "the", "some", "please", "for", "of", "with",
+}
+
+
+def _is_surprise_request(query: str) -> bool:
+    """True when `query` has no content word left after filler removal."""
+    words = re.findall(r"[\w]+", (query or "").lower(), flags=re.UNICODE)
+    return bool(words) and not any(w not in _SURPRISE_FILLERS for w in words)
+
+
+# ─── DuckDuckGo Images (first source — general web images) ─────────────────
+_VQD_RE = re.compile(r"""vqd=['"]([\d-]+)['"]""")
+
+
+def extract_vqd(html: str) -> Optional[str]:
+    """Extract the DuckDuckGo search token (vqd) from a results page.
+
+    Pure/testable. Returns None when the page is a challenge/block page
+    with no token — the caller then falls through to Openverse.
+    """
+    if not html or not isinstance(html, str):
+        return None
+    m = _VQD_RE.search(html)
+    return m.group(1) if m else None
+
+
+def parse_ddg_images_json(payload: dict, count: int = DEFAULT_COUNT) -> List[Dict[str, str]]:
+    """Parse a DuckDuckGo i.js images response into result dicts.
+
+    DDG results are general web images, not CC-licensed: `license` is
+    always "" and `attribution` is the source page URL, `creator` the
+    source domain. Entries without a direct image URL are skipped.
+    """
+    try:
+        items = payload.get("results") or []
+    except AttributeError:
+        return []
+    out: List[Dict[str, str]] = []
+    for item in items[:count]:
+        url = str(item.get("image") or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        source_url = str(item.get("url") or "").strip()
+        creator = ""
+        try:
+            creator = urlparse(source_url).hostname or ""
+        except Exception:
+            creator = ""
+        out.append(
+            {
+                "url": url,
+                "title": str(item.get("title") or "Untitled").strip(),
+                "creator": creator,
+                "license": "",
+                "attribution": source_url,
+            }
+        )
+    return out
+
+
+async def _search_ddg_images(query: str, count: int, _get) -> List[Dict[str, str]]:
+    """DuckDuckGo Images: fetch the search page for its vqd token, then
+    the i.js JSON endpoint. Moderate safe search (p=1). Returns [] on
+    any failure / challenge / empty result — never raises."""
+    page_url = (
+        "https://duckduckgo.com/?q=" + quote_plus(query)
+        + "&iax=images&ia=images"
+    )
+    resp = await _get(page_url, {"User-Agent": _BROWSER_UA}, IMAGE_TIMEOUT)
+    if getattr(resp, "status_code", 200) != 200:
+        return []
+    vqd = extract_vqd(getattr(resp, "text", "") or "")
+    if not vqd:
+        return []
+    api_url = (
+        "https://duckduckgo.com/i.js?l=us-en&o=json&q=" + quote_plus(query)
+        + "&vqd=" + vqd + "&f=,,,,,&p=1"
+    )
+    resp = await _get(api_url, {"User-Agent": _BROWSER_UA}, IMAGE_TIMEOUT)
+    if getattr(resp, "status_code", 200) != 200:
+        return []
+    try:
+        payload = resp.json() if hasattr(resp, "json") else None
+        if payload is None:
+            import json as _json
+
+            payload = _json.loads(resp.text)
+    except Exception:
+        return []
+    return parse_ddg_images_json(payload, count)
 
 
 # ─── Openverse search ────────────────────────────────────────────────────────
@@ -237,7 +370,13 @@ async def search_images(
     count: int = DEFAULT_COUNT,
     _get: Optional[Callable] = None,
 ) -> List[Dict[str, str]]:
-    """Search Openverse for `query`. Returns [] on failure / cap — never raises."""
+    """Search for images of `query`, best source first.
+
+    DuckDuckGo Images (general web images) first, then Openverse
+    (CC), then Wikimedia Commons (CC). Returns [] on failure / cap —
+    never raises. One daily-cap hit and one cache entry per call,
+    regardless of how many sources were tried.
+    """
     if not query or not isinstance(query, str) or not query.strip():
         return []
     query = query.strip()
@@ -248,25 +387,34 @@ async def search_images(
         return []
 
     get = _get or _default_get
-    url = (
-        "https://api.openverse.org/v1/images/?q=" + quote_plus(query)
-        + f"&page_size={count}&filter_dead=True&mature=false"
-    )
     results: List[Dict[str, str]] = []
+    # 1. DuckDuckGo Images — the only source that covers celebrity /
+    #    movie / meme queries. DDG challenges some egress IPs, so a
+    #    failure here is normal and just means "try the next source".
     try:
-        resp = await get(url, {"User-Agent": _BROWSER_UA}, IMAGE_TIMEOUT)
-        if getattr(resp, "status_code", 200) == 200:
-            payload = resp.json() if hasattr(resp, "json") else None
-            if payload is None:
-                import json as _json
-
-                payload = _json.loads(resp.text)
-            results = parse_openverse_json(payload, count)
+        results = await _search_ddg_images(query, count, get)
     except Exception:
         results = []
     if not results:
-        # Openverse is Cloudflare-protected and challenges some egress
-        # IPs — fall back to Wikimedia Commons so the feature still works.
+        # 2. Openverse (CC photos).
+        url = (
+            "https://api.openverse.org/v1/images/?q=" + quote_plus(query)
+            + f"&page_size={count}&filter_dead=True&mature=false"
+        )
+        try:
+            resp = await get(url, {"User-Agent": _BROWSER_UA}, IMAGE_TIMEOUT)
+            if getattr(resp, "status_code", 200) == 200:
+                payload = resp.json() if hasattr(resp, "json") else None
+                if payload is None:
+                    import json as _json
+
+                    payload = _json.loads(resp.text)
+                results = parse_openverse_json(payload, count)
+        except Exception:
+            results = []
+    if not results:
+        # 3. Wikimedia Commons — second independent source so the
+        #    feature still works where DDG/Openverse are challenged.
         try:
             results = await _search_wikimedia(query, count, get)
         except Exception:
@@ -327,84 +475,165 @@ async def download_image(
 
 # ─── Parsing an image request out of chat text ───────────────────────────────
 _MEDIA_WORDS = r"(?:pictures?|images?|photos?|pics?)"
-_LEADING_ARTICLES = ("a ", "an ", "the ", "some ")
+_VERBS = r"(?:send|show|find|give|get)"
+_LEADING_ARTICLES = ("a ", "an ", "the ", "some ", "any ", "random ")
+
+# A cleaned query that is only one of these words is not an image
+# request at all ("send me a message" must not search for "message").
+_NON_IMAGE_WORDS = {
+    "message", "messages", "text", "texts", "email", "emails",
+    "dm", "dms", "note", "notes", "link", "links", "file", "files",
+}
 
 
-def _strip_articles(query: str) -> str:
-    q = query.strip()
-    low = q.lower()
-    for art in _LEADING_ARTICLES:
-        if low.startswith(art):
-            q = q[len(art):].strip()
+def _drop_emoji(text: str) -> str:
+    """Drop emoji/symbols, keep letters in any script.
+
+    Emoji live above U+2500; letters (Latin, Amharic U+1200–U+137F,
+    Cyrillic, CJK, ...) are kept via their Unicode category, so
+    "አዲስ አበባ" survives while "🐸" / "🐶" / variation selectors do not.
+    """
+    out = []
+    for ch in text:
+        if ord(ch) <= 0x2500 or unicodedata.category(ch).startswith("L"):
+            out.append(ch)
+    return "".join(out)
+
+
+def _clean_query(query: str) -> str:
+    """Normalise a captured image query.
+
+    Loops (max 3 passes) until stable: drops emoji, strips leading
+    articles/determiners ("a", "the", "any", "random"), a leading
+    "please" / "for me" / "surprise me (with)", a leading media word
+    ("picture of", "pic", "images of"), a trailing "please", and
+    surrounding punctuation. The loop matters because the pieces can
+    stack — "a picture of will smith..." needs article, then media
+    word, in that order — and the old code stripped them in the wrong
+    order, leaving "picture of will smith eating spaghetti" as the
+    search query.
+    """
+    q = (query or "").strip()
+    for _ in range(3):
+        before = q
+        q = _drop_emoji(q)
+        q = q.strip(" \t\r\n,.;:!?\"'()[]")
+        low = q.lower()
+        if low.startswith("please "):
+            q = q[len("please "):].strip()
+            low = q.lower()
+        if low.startswith("for me "):
+            q = q[len("for me "):].strip()
+            low = q.lower()
+        if low.startswith("surprise me"):
+            q = q[len("surprise me"):].strip()
+            low = q.lower()
+            if low.startswith("with "):
+                q = q[len("with "):].strip()
+                low = q.lower()
+        for art in _LEADING_ARTICLES:
+            if low.startswith(art):
+                q = q[len(art):].strip()
+                low = q.lower()
+                break
+        m = re.match(
+            r"^(?:pictures?|images?|photos?|pics?)\s+(?:of\s+)?(.*)$",
+            q,
+            re.IGNORECASE,
+        )
+        if m:
+            q = m.group(1).strip()
+            low = q.lower()
+        if low.endswith(" please"):
+            q = q[: -len(" please")].strip()
+        q = q.strip(" \t\r\n,.;:!?\"'()[]")
+        if q == before:
             break
-    return q.strip(" .!?")
-
-
-def _strip_media_prefix(query: str) -> str:
-    """Strip a leading "pictures of / images of / pics of" from a query."""
-    q = query.strip()
-    m = re.match(
-        r"^(?:pictures?|images?|photos?|pics?)\s+(?:of\s+)?(.+)$",
-        q,
-        re.IGNORECASE,
-    )
-    return m.group(1).strip() if m else q
+    return q
 
 
 def _parse_broad(text: str) -> Optional[str]:
     """Wake-word / mention context: "send me <anything>" is an image ask.
 
     Used when the message already had a trigger (redster wake, @mention,
-    reply-to-bot, /ask) — "send me a dog with a red ball" -> the query.
+    reply-to-bot, /ask). Returns "" when it matched an image request
+    but no topic is left ("send me an image" -> surprise-me), and
+    None when it is not an image request at all ("send me a message").
     """
+    s = text.strip()
+    # Verb + optional "me" + optional article + media word + "of" + topic.
+    # Covers "send a picture of batman part 2", "send me a picture of
+    # will smith eating spaghetti", "send me pictures of cats".
     m = re.match(
-        r"^(?:send|show|find|give|get)\s+me\s+(?:some\s+)?(.+)$",
-        text.strip(),
+        r"^" + _VERBS + r"\s+(?:me\s+)?(?:some\s+|a\s+|an\s+|the\s+)?"
+        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
+        s,
         re.IGNORECASE,
     )
     if m:
-        return _strip_articles(_strip_media_prefix(m.group(1))) or None
+        return _clean_query(m.group(1))
+    # Verb + "me" + anything ("send me a dog with a red ball").
+    m = re.match(r"^" + _VERBS + r"\s+me\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        q = _clean_query(m.group(1))
+        if q.lower() in _NON_IMAGE_WORDS:
+            return None
+        return q
+    # Verb + optional article + media word + "of" + topic (no "me").
     m = re.match(
-        r"^(?:send|show|find)\s+(?:some\s+)?" + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        text.strip(),
+        r"^" + _VERBS + r"\s+(?:some\s+|a\s+|an\s+|the\s+)?"
+        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
+        s,
         re.IGNORECASE,
     )
     if m:
-        return _strip_articles(m.group(1)) or None
+        return _clean_query(m.group(1))
+    # Bare "<media word> of <topic>" ("picture of cats").
+    m = re.match(
+        r"^(?:a\s+|an\s+|the\s+)?" + _MEDIA_WORDS + r"\s+of\s+(.+)$",
+        s,
+        re.IGNORECASE,
+    )
+    if m:
+        return _clean_query(m.group(1))
     return None
 
 
 def _parse_narrow(text: str) -> Optional[str]:
     """No wake word: only an explicit picture request counts, so plain
-    chat ("send me a message", "tell me about dogs") never misfires."""
+    chat ("send me a message", "tell me about dogs") never misfires.
+    Same patterns as _parse_broad minus the bare "send me <anything>"."""
+    s = text.strip()
     m = re.match(
-        r"^(?:send|show|find|give|get)\s+me\s+(?:some\s+|a\s+|an\s+|the\s+)?" + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        text.strip(),
+        r"^" + _VERBS + r"\s+(?:me\s+)?(?:some\s+|a\s+|an\s+|the\s+)?"
+        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
+        s,
         re.IGNORECASE,
     )
     if m:
-        return _strip_articles(m.group(1)) or None
+        return _clean_query(m.group(1))
     m = re.match(
-        r"^(?:send|show|find)\s+(?:some\s+)?" + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        text.strip(),
+        r"^" + _VERBS + r"\s+(?:some\s+|a\s+|an\s+|the\s+)?"
+        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
+        s,
         re.IGNORECASE,
     )
     if m:
-        return _strip_articles(m.group(1)) or None
+        return _clean_query(m.group(1))
     m = re.match(
-        r"^(?:a\s+)?(?:picture|image|photo|pic)\s+of\s+(.+)$",
-        text.strip(),
+        r"^(?:a\s+|an\s+|the\s+)?" + _MEDIA_WORDS + r"\s+of\s+(.+)$",
+        s,
         re.IGNORECASE,
     )
     if m:
-        return _strip_articles(m.group(1)) or None
+        return _clean_query(m.group(1))
     return None
 
 
 def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> Optional[str]:
     """Extract an image query from chat text, or None.
 
-    - "/pic <query>" -> query.
+    - "/pic <query>" -> query ("/pic" with no query -> None).
     - parsed_redster with intent "quote" -> None (quote wins).
     - parsed_redster with intent "chat" -> broad parse of its chat_text.
     - Otherwise: strip a leading bot @mention / redster wake word if
@@ -413,6 +642,9 @@ def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> 
     - broad=True (used when the caller already knows a trigger fired,
       e.g. a redster wake word, @mention, reply-to-bot or /ask):
       "send me <anything>" counts even without picture words.
+    - A request with no real topic ("send me an image, any image,
+      surprise me") returns a random SURPRISE_TOPICS topic, never the
+      literal filler phrase.
     """
     if not text or not isinstance(text, str):
         return None
@@ -423,7 +655,9 @@ def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> 
     # Explicit command: /pic <query>
     if s.lower().startswith("/pic"):
         rest = s[4:].strip()
-        return _strip_articles(rest) or None
+        if not rest:
+            return None
+        return _resolve_query(_clean_query(rest))
 
     # Redster-parsed input (bot.py passes its parse result through).
     if parsed_redster is not None:
@@ -432,12 +666,12 @@ def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> 
         chat_text = (parsed_redster.get("chat_text") or "").strip()
         if not chat_text:
             return None
-        return _parse_broad(chat_text)
+        return _resolve_query(_parse_broad(chat_text))
 
     # Leading @mention counts as a trigger ("@R3dSter_Bot send me ...").
     m = re.match(r"^@\S+\s+(.+)$", s)
     if m:
-        return _parse_broad(m.group(1))
+        return _resolve_query(_parse_broad(m.group(1)))
 
     # Leading redster wake word counts as a trigger.
     try:
@@ -447,13 +681,24 @@ def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> 
         if parsed is not None:
             if parsed.get("intent") == "quote":
                 return None
-            return _parse_broad(parsed.get("chat_text") or "")
+            return _resolve_query(_parse_broad(parsed.get("chat_text") or ""))
     except Exception:
         pass
 
     if broad:
-        return _parse_broad(s)
-    return _parse_narrow(s)
+        return _resolve_query(_parse_broad(s))
+    return _resolve_query(_parse_narrow(s))
+
+
+def _resolve_query(query: Optional[str]) -> Optional[str]:
+    """Turn a parser result into the final query: None stays None (not
+    an image request), "" or a filler-only phrase becomes a random
+    surprise topic, anything else is the search query."""
+    if query is None:
+        return None
+    if not query or _is_surprise_request(query):
+        return surprise_topic()
+    return query
 
 
 def attribution_caption(item: Dict[str, str]) -> str:

@@ -65,6 +65,9 @@ def build_system_prompt(now: Optional[datetime] = None) -> str:
         + "the web search results provided in this conversation if "
         + "present; if no search results are present, say you don't "
         + "know rather than guessing a date or release status."
+        + " You CAN send images — the bot can search the web for "
+        + "pictures and send them, so never tell the user you can only "
+        + "respond with text or cannot send images."
     )
 
 # ─── In-memory history ───────────────────────────────────────────────────────

@@ -184,7 +184,34 @@ _SURPRISE_FILLERS = {
     "any", "random", "surprise", "me", "something", "anything",
     "image", "images", "picture", "pictures", "photo", "photos",
     "pic", "pics", "a", "an", "the", "some", "please", "for", "of", "with",
+    # Adjectives from _ADJECTIVES: "send a random image" / "send an
+    # interesting pic" leave nothing but the adjective behind.
+    "interesting", "cool", "nice", "beautiful", "funny", "cute",
+    "awesome", "great", "amazing", "breathtaking",
 }
+
+
+def _strip_leading_filler(s: str) -> str:
+    """Strip leading filler words/phrases from a request.
+
+    "Now send a random image" -> "send a random image";
+    "can you send me a pic of dogs" -> "send me a pic of dogs";
+    "please, send me a picture of a cat" -> "send me a picture of a cat".
+    Loops until stable (fillers can stack: "now please send me ...").
+    The word boundary (\\b) keeps "so" from eating "some" and "ok"
+    from eating "okay"; trailing punctuation after a filler ("please,")
+    is consumed too.
+    """
+    s = (s or "").strip()
+    for _ in range(6):
+        before = s
+        s = s.strip(" \t\r\n,.;:!?\"'()[]")
+        m = _LEADING_FILLER_RE.match(s)
+        if m:
+            s = s[m.end():].strip(" \t\r\n,.;:!?\"'()[]")
+        if s == before:
+            break
+    return s
 
 
 def _is_surprise_request(query: str) -> bool:
@@ -478,6 +505,29 @@ _MEDIA_WORDS = r"(?:pictures?|images?|photos?|pics?)"
 _VERBS = r"(?:send|show|find|give|get)"
 _LEADING_ARTICLES = ("a ", "an ", "the ", "some ", "any ", "random ")
 
+# Adjectives users put between the verb/article and the media word
+# ("send an interesting pic", "show me a cool photo of mountains").
+# They carry no topic on their own, so they are stripped when they
+# sit directly in front of a media word, and count as filler when a
+# query is only made of them ("send a random image" -> surprise-me).
+_ADJECTIVES = (
+    "interesting", "random", "cool", "nice", "beautiful", "funny",
+    "cute", "awesome", "great", "amazing", "breathtaking",
+)
+_ADJECTIVE_RE = (
+    r"(?:interesting|random|cool|nice|beautiful|funny|cute|awesome|"
+    r"great|amazing|breathtaking)"
+)
+
+# Filler words/phrases users put in front of a request ("Now send a
+# random image", "can you send me a pic of dogs"). Stripped from the
+# start of the text (repeatedly) before the image patterns run.
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:can you|could you|would you|will you|now|please|hey|okay|ok|"
+    r"and|then|so|just|also)\b[\s,.;:!?]*",
+    re.IGNORECASE,
+)
+
 # A cleaned query that is only one of these words is not an image
 # request at all ("send me a message" must not search for "message").
 _NON_IMAGE_WORDS = {
@@ -536,6 +586,18 @@ def _clean_query(query: str) -> str:
                 q = q[len(art):].strip()
                 low = q.lower()
                 break
+        # Adjectives directly in front of a media word carry no topic
+        # ("a beautiful picture of a sunset" -> "picture of a sunset").
+        # Only stripped when a media word follows — "a cool dog" keeps
+        # "cool", because there the adjective IS part of the topic.
+        m = re.match(
+            r"^(?:" + _ADJECTIVE_RE + r"\s+)+(?=" + _MEDIA_WORDS + r"\b)",
+            q,
+            re.IGNORECASE,
+        )
+        if m:
+            q = q[m.end():].strip()
+            low = q.lower()
         m = re.match(
             r"^(?:pictures?|images?|photos?|pics?)\s+(?:of\s+)?(.*)$",
             q,
@@ -552,6 +614,63 @@ def _clean_query(query: str) -> str:
     return q
 
 
+def _match_image_patterns(s: str, allow_anything: bool) -> Optional[str]:
+    """Match the image-request patterns against `s` (filler already
+    stripped). Returns "" when it matched an image request but no
+    topic is left ("send a random image" -> surprise-me), and None
+    when it is not an image request at all ("send me a message").
+
+    Patterns are tried anchored first, then with re.search so a
+    request buried mid-sentence ("btw send me a picture of cats")
+    still matches. The bare "<media> of <topic>" pattern is only
+    tried anchored — searching for it mid-sentence would misfire on
+    plain chat like "I saw a picture of cats yesterday".
+    """
+    s = _strip_leading_filler(s)
+    if not s:
+        return None
+
+    # Verb + [me] + [article] + [adjectives] + media word + [tail].
+    # The tail (topic) is optional: "send a random image" has none,
+    # so it returns "" (surprise-me) instead of None. The tail allows
+    # a stray comma ("send me an image, any image, surprise me").
+    media_body = (
+        _VERBS + r"\s+(?:me\s+)?(?:some\s+|a\s+|an\s+|the\s+)?"
+        + r"(?:" + _ADJECTIVE_RE + r"\s+)*" + _MEDIA_WORDS
+        + r"(?:\s*,?\s*(?:of\s+)?(.+))?$"
+    )
+    # Verb + "me" + anything (broad only): "send me a dog with a
+    # red ball". Guarded by _NON_IMAGE_WORDS ("send me a message").
+    anything_body = _VERBS + r"\s+me\s+(.+)$"
+    # Bare "<media> of <topic>" ("picture of cats") — anchored only.
+    bare_body = (
+        r"(?:a\s+|an\s+|the\s+)?(?:"
+        + _ADJECTIVE_RE + r"\s+)*" + _MEDIA_WORDS + r"\s+of\s+(.+)$"
+    )
+
+    for body, group, is_anything, allow_search in (
+        (media_body, 1, False, True),
+        (anything_body, 1, True, True) if allow_anything else (None, 0, False, False),
+        (bare_body, 1, False, False),
+    ):
+        if body is None:
+            continue
+        m = re.match(r"^" + body, s, re.IGNORECASE)
+        if m is None and allow_search:
+            # Buried mid-sentence: "btw send me a picture of cats".
+            m = re.search(r"\b" + body, s, re.IGNORECASE)
+        if m is None:
+            continue
+        raw = m.group(group)
+        if raw is None:
+            return ""
+        q = _clean_query(raw)
+        if is_anything and q.lower() in _NON_IMAGE_WORDS:
+            return None
+        return q
+    return None
+
+
 def _parse_broad(text: str) -> Optional[str]:
     """Wake-word / mention context: "send me <anything>" is an image ask.
 
@@ -560,74 +679,14 @@ def _parse_broad(text: str) -> Optional[str]:
     but no topic is left ("send me an image" -> surprise-me), and
     None when it is not an image request at all ("send me a message").
     """
-    s = text.strip()
-    # Verb + optional "me" + optional article + media word + "of" + topic.
-    # Covers "send a picture of batman part 2", "send me a picture of
-    # will smith eating spaghetti", "send me pictures of cats".
-    m = re.match(
-        r"^" + _VERBS + r"\s+(?:me\s+)?(?:some\s+|a\s+|an\s+|the\s+)?"
-        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    # Verb + "me" + anything ("send me a dog with a red ball").
-    m = re.match(r"^" + _VERBS + r"\s+me\s+(.+)$", s, re.IGNORECASE)
-    if m:
-        q = _clean_query(m.group(1))
-        if q.lower() in _NON_IMAGE_WORDS:
-            return None
-        return q
-    # Verb + optional article + media word + "of" + topic (no "me").
-    m = re.match(
-        r"^" + _VERBS + r"\s+(?:some\s+|a\s+|an\s+|the\s+)?"
-        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    # Bare "<media word> of <topic>" ("picture of cats").
-    m = re.match(
-        r"^(?:a\s+|an\s+|the\s+)?" + _MEDIA_WORDS + r"\s+of\s+(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    return None
+    return _match_image_patterns(text, allow_anything=True)
 
 
 def _parse_narrow(text: str) -> Optional[str]:
     """No wake word: only an explicit picture request counts, so plain
     chat ("send me a message", "tell me about dogs") never misfires.
     Same patterns as _parse_broad minus the bare "send me <anything>"."""
-    s = text.strip()
-    m = re.match(
-        r"^" + _VERBS + r"\s+(?:me\s+)?(?:some\s+|a\s+|an\s+|the\s+)?"
-        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    m = re.match(
-        r"^" + _VERBS + r"\s+(?:some\s+|a\s+|an\s+|the\s+)?"
-        + _MEDIA_WORDS + r"\s+(?:of\s+)?(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    m = re.match(
-        r"^(?:a\s+|an\s+|the\s+)?" + _MEDIA_WORDS + r"\s+of\s+(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    return None
+    return _match_image_patterns(text, allow_anything=False)
 
 
 def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> Optional[str]:
@@ -658,6 +717,13 @@ def parse_image_request(text: str, parsed_redster=None, broad: bool = False) -> 
         if not rest:
             return None
         return _resolve_query(_clean_query(rest))
+
+    # Leading filler ("Now redster send me ..." / "please send me ...")
+    # is stripped before the wake-word / mention checks below, so a
+    # request buried behind "now" / "can you" still routes correctly.
+    s = _strip_leading_filler(s)
+    if not s:
+        return None
 
     # Redster-parsed input (bot.py passes its parse result through).
     if parsed_redster is not None:

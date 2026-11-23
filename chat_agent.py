@@ -21,6 +21,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+import httpx
+
 from config import ai_client, has_ai, OPENROUTER_MODEL, logger
 from web_search import format_search_context, needs_web_search, search_web
 
@@ -30,6 +32,60 @@ MAX_HISTORY_KEYS = 200          # distinct DM users / group chats kept
 MAX_INPUT_CHARS = 1000          # per user message, truncated with a note
 CHAT_MAX_TOKENS = 600           # output cap — keeps replies short and cheap
 CHAT_TEMPERATURE = 0.7
+AI_RETRY_DELAY_SECONDS = 2.0    # pause before the one retry (tests set 0)
+AI_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable_ai_error(exc: Exception) -> bool:
+    """True for transient AI failures worth one retry: timeouts /
+    transport errors, or an API error with a retryable status
+    (429 rate-limited, 500/502/503/504 server errors). 400/401/403
+    and config errors are NOT retried. Duck-typed so stubbed clients
+    in tests (an error object with a .status_code) work too."""
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+    try:
+        return int(status) in AI_RETRYABLE_STATUSES
+    except (TypeError, ValueError):
+        return False
+
+
+async def _create_completion(messages: List[Dict[str, str]]):
+    """One OpenRouter call (sync client, run in an executor), with a
+    single retry on transient failures. Raises the last error when
+    both attempts fail, or immediately for non-retryable errors."""
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        return ai_client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=messages,
+            temperature=CHAT_TEMPERATURE,
+            max_tokens=CHAT_MAX_TOKENS,
+        )
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:  # noqa: BLE001 — classified below
+            last_exc = e
+            if attempt == 0 and _is_retryable_ai_error(e):
+                logger.warning(
+                    f"Chat: AI call failed ({type(e).__name__}), "
+                    f"retrying once after {AI_RETRY_DELAY_SECONDS}s"
+                )
+                await asyncio.sleep(AI_RETRY_DELAY_SECONDS)
+                continue
+            raise
+    # Unreachable (the loop always returns or raises), but keeps the
+    # type checker and any future edit honest.
+    assert last_exc is not None
+    raise last_exc
 
 SYSTEM_PROMPT = (
     "You are Redster, the friendly assistant inside the R3dSter "
@@ -68,6 +124,11 @@ def build_system_prompt(now: Optional[datetime] = None) -> str:
         + " You CAN send images — the bot can search the web for "
         + "pictures and send them, so never tell the user you can only "
         + "respond with text or cannot send images."
+        + " You cannot attach images yourself, though. Never say "
+        + "'here is a picture/image/photo' or describe an image as if "
+        + "you sent it. If an image request reaches you in text, "
+        + "reply briefly and tell the user to use /pic followed by "
+        + "what they want (for example: /pic a dog with a red ball)."
     )
 
 # ─── In-memory history ───────────────────────────────────────────────────────
@@ -156,16 +217,7 @@ async def chat_reply(user_text: str, history_key: str) -> str:
     messages.extend(history)
     messages.append({"role": "user", "content": capped})
 
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: ai_client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=messages,
-            temperature=CHAT_TEMPERATURE,
-            max_tokens=CHAT_MAX_TOKENS,
-        ),
-    )
+    response = await _create_completion(messages)
     reply = ""
     try:
         reply = (response.choices[0].message.content or "").strip()

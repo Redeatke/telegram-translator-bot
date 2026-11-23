@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from config import ai_client, has_ai, OPENROUTER_MODEL, logger
+from web_search import format_search_context, needs_web_search, search_web
 
 # ─── Limits ──────────────────────────────────────────────────────────────────
 MAX_HISTORY_TURNS = 10          # turns (user+assistant pairs) kept per key
@@ -40,6 +42,30 @@ SYSTEM_PROMPT = (
     "settings — if asked, say so politely and offer what you can do "
     "instead (translate with /tr, quote with /q, chat here)."
 )
+
+
+def build_system_prompt(now: Optional[datetime] = None) -> str:
+    """System prompt with today's date injected.
+
+    The model (Gemini 2.5 Flash) has knowledge frozen ~2024 and no
+    clock — without this it told users "It's 2024!" and that the 2025
+    Superman movie "isn't out yet". The date is computed per turn from
+    UTC so it is always current, and the model is told to rely on web
+    search results (when present) for anything after 2024, and to say
+    it doesn't know rather than guess a date or release status.
+    Pure/testable: pass `now` to pin the date.
+    """
+    current = now or datetime.now(timezone.utc)
+    date_str = current.strftime("%A, %B %d, %Y")
+    return (
+        SYSTEM_PROMPT
+        + f"\nToday is {date_str}."
+        + " Your knowledge was frozen in 2024, so for anything after "
+        + "that, or anything about today or current events, rely on "
+        + "the web search results provided in this conversation if "
+        + "present; if no search results are present, say you don't "
+        + "know rather than guessing a date or release status."
+    )
 
 # ─── In-memory history ───────────────────────────────────────────────────────
 # Keys: "dm:<user_id>" for private chats, "group:<chat_id>" for groups.
@@ -102,7 +128,28 @@ async def chat_reply(user_text: str, history_key: str) -> str:
         raise ValueError("Empty message.")
 
     history = get_history(history_key)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    now = datetime.now(timezone.utc)
+    messages = [{"role": "system", "content": build_system_prompt(now)}]
+    # Live facts, at most one search per turn: when the question looks
+    # like it needs post-2024 / current info, search first and give the
+    # model the results to answer from (with sources). On failure the
+    # search returns [] and the date instruction above covers saying
+    # "I don't know" instead of guessing.
+    if needs_web_search(capped):
+        try:
+            results = await search_web(capped)
+        except Exception as e:
+            logger.warning(f"Chat web search failed: {e}")
+            results = []
+        if results:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": format_search_context(
+                        capped[:200], results, now.strftime("%A, %B %d, %Y")
+                    ),
+                }
+            )
     messages.extend(history)
     messages.append({"role": "user", "content": capped})
 

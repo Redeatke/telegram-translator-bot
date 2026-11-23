@@ -138,6 +138,7 @@ from voice_agent import handle_voice_message, voice_command
 import quote_sticker
 import chat_agent
 import redster
+import media_search
 import card
 import telethon_downloader
 
@@ -167,7 +168,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"  • /tr &lt;text&gt; — translate text, or reply with /tr\n"
         f"  • /tr — translate in groups or reply to images\n"
         f"  • /ask &lt;question&gt; — chat with the bot\n"
-        f"  • redster ... — reply to a message with “redster quote this” to quote it, or say “redster hello” to chat\n"
+        f"  • /pic &lt;thing&gt; — send the top 3 pictures of it\n"
+        f"  • redster ... — reply to a message with “redster quote this” to quote it, say “redster hello” to chat, or “redster send me a dog with a red ball” for pictures\n"
         f"  • /sticker — make/add stickers from images, stickers, or text\n"
         f"  • /gif — convert video to animated GIF\n"
         f"  • /target es — switch target language to Spanish\n"
@@ -195,6 +197,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /help      This help page\n"
         f"  /tr        Translate text or reply\n"
         f"  /ask       Chat with the bot\n"
+        f"  /pic       Send the top 3 pictures of something\n"
         f"  /chat      Turn group chat on/off (group admins)\n"
         f"  /target    Set target language\n"
         f"  /languages Interactive language picker\n"
@@ -1226,12 +1229,19 @@ def _chat_enabled_for(chat) -> bool:
 
 
 async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                         user_text: str, msg=None) -> None:
+                         user_text: str, msg=None, allow_broad_image: bool = False) -> None:
     """One chat turn, shared by /ask, @mention, reply-to-bot and redster chat.
 
     Plain text reply (no parse_mode) — AI output may contain stray
     <b> / <a> fragments that would break Telegram HTML parsing.
     Rate-limited on the separate "chat" bucket (20/hr, admins 5x).
+
+    Image requests are handled here first, before plain chat: "send me
+    a dog with a red ball" (broad when the caller already knows a
+    trigger fired — redster wake, @mention, reply-to-bot) or "send me
+    pictures of cats" (narrow, picture words required) goes to
+    _handle_images instead of the AI. An explicit-content request is
+    refused without consuming a rate-limit hit.
     """
     user = update.effective_user
     chat = update.effective_chat
@@ -1251,6 +1261,28 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             fmt_warning("Chat is off in this group. A group admin can turn it on with <code>/chat on</code>."),
             parse_mode="HTML",
         )
+        return
+
+    # Image request? (before plain chat — and before the rate check for
+    # explicit refusals, which must not consume a hit.)
+    image_query = media_search.parse_image_request(text, broad=allow_broad_image)
+    if image_query is not None:
+        if media_search.is_explicit_query(image_query):
+            await msg.reply_text(
+                "I can't search for that kind of picture — try something else."
+            )
+            return
+        if not check_rate_limit(user.id, "chat"):
+            remaining = rate_limit_remaining(user.id, "chat")
+            await msg.reply_text(
+                fmt_warning(
+                    f"You've hit the hourly chat limit — {remaining} chats left this hour "
+                    f"(20/hr). Please try again in a little while."
+                ),
+                parse_mode="HTML",
+            )
+            return
+        await _handle_images(update, context, image_query, msg, rate_checked=True)
         return
 
     if not check_rate_limit(user.id, "chat"):
@@ -1281,6 +1313,130 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     await msg.reply_text(reply, reply_to_message_id=msg.message_id)
+
+
+async def _handle_images(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         query: str, msg=None, rate_checked: bool = False) -> None:
+    """Search Openverse for `query` and send up to 3 photos as a group.
+
+    Search-and-send only — no AI image generation. Images are downloaded
+    with the same guards as downloaders.py (public URL, <= 5 MB,
+    image/* content-type). Sends whatever downloaded (1-3); if none,
+    replies politely. Attribution (creator + licence) goes in the
+    caption, as CC licences require. Rate-limited on the "chat" bucket
+    unless the caller already consumed a hit (rate_checked=True).
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = msg or update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    query = (query or "").strip()
+    if not query:
+        return
+
+    if media_search.is_explicit_query(query):
+        await msg.reply_text(
+            "I can't search for that kind of picture — try something else."
+        )
+        return
+
+    if not _chat_enabled_for(chat):
+        await msg.reply_text(
+            fmt_warning("Chat is off in this group. A group admin can turn it on with <code>/chat on</code>."),
+            parse_mode="HTML",
+        )
+        return
+
+    if not rate_checked and not check_rate_limit(user.id, "chat"):
+        remaining = rate_limit_remaining(user.id, "chat")
+        await msg.reply_text(
+            fmt_warning(
+                f"You've hit the hourly chat limit — {remaining} chats left this hour "
+                f"(20/hr). Please try again in a little while."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat.id, action="upload_photo")
+    try:
+        results = await media_search.search_images(query, count=3)
+    except Exception as e:
+        logger.error(f"Image search failed: {type(e).__name__}: {e}")
+        results = []
+    if not results:
+        await msg.reply_text(
+            f"I couldn't find any pictures of “{html.escape(query)}” right now — try different words.",
+            parse_mode="HTML",
+        )
+        return
+
+    downloaded = []  # list of (bytes, item)
+    for item in results:
+        data = await media_search.download_image(item["url"])
+        if data:
+            downloaded.append((data, item))
+    if not downloaded:
+        await msg.reply_text(
+            f"I found pictures of “{html.escape(query)}” but couldn't download any of them — please try again.",
+            parse_mode="HTML",
+        )
+        return
+
+    caption_lines = [f"Here are {len(downloaded)} picture(s) of “{query}”:"]
+    caption_lines += [media_search.attribution_caption(item) for _, item in downloaded]
+    caption = "\n".join(caption_lines)[:1000]
+    media_group = [
+        InputMediaPhoto(
+            media=data,
+            caption=html.escape(caption) if i == 0 else None,
+            parse_mode="HTML" if i == 0 else None,
+        )
+        for i, (data, _item) in enumerate(downloaded)
+    ]
+    try:
+        await context.bot.send_media_group(
+            chat_id=chat.id, media=media_group,
+            reply_to_message_id=msg.message_id,
+        )
+    except Exception as e:
+        logger.error(f"Sending image group failed: {type(e).__name__}: {e}")
+        await msg.reply_text(
+            fmt_error("Found the pictures but couldn't send them. Please try again."),
+            parse_mode="HTML",
+        )
+
+
+async def pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send pictures: /pic <query>, or reply to a message with /pic."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if is_maintenance_active_for_user(user.id):
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query and msg.reply_to_message:
+        query = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+
+    if not query:
+        await msg.reply_text(
+            fmt_card("🖼️ /pic — Send pictures",
+                "  Send the top 3 openly-licensed pictures for a search:\n"
+                "  <code>/pic dog with a red ball</code>\n"
+                "  Or just say <code>redster send me a dog with a red ball</code>.\n"
+                "  Or reply to a message with /pic to search for its text."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    await _handle_images(update, context, query, msg=msg)
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1875,10 +2031,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Translation is explicit only, via /tr (see tr_command).
     Plain text does trigger, in order: (1) the "redster ..." keyword
     (quote or chat), (2) an @mention of the bot, (3) a reply to one of
-    the bot's own messages — all via chat_agent (see _do_chat_reply).
-    Anything else only tracks URLs sent in a private chat, so /gif can
-    reuse the last DM link or video (via _track_dm_media /
-    handle_dm_media_tracker).
+    the bot's own messages — all via chat_agent (see _do_chat_reply) —
+    and (4) a bare image request ("send me pictures of cats"), routed
+    to images by _do_chat_reply. Anything else only tracks URLs sent
+    in a private chat, so /gif can reuse the last DM link or video
+    (via _track_dm_media / handle_dm_media_tracker).
     """
     user = update.effective_user
     if not user or not update.message or not update.message.text:
@@ -1913,18 +2070,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if parsed["intent"] == "quote":
             await handle_redster_quote(update, context, parsed)
         else:
-            await _do_chat_reply(update, context, parsed.get("chat_text") or "", msg=update.message)
+            await _do_chat_reply(update, context, parsed.get("chat_text") or "", msg=update.message, allow_broad_image=True)
         return
 
     # 2. @mention of the bot anywhere else in the text chats with the remainder.
     mention_text = _strip_bot_mention(text)
     if mention_text is not None:
-        await _do_chat_reply(update, context, mention_text, msg=update.message)
+        await _do_chat_reply(update, context, mention_text, msg=update.message, allow_broad_image=True)
         return
 
     # 3. Replying to one of the bot's own messages chats with the text.
     replied = update.message.reply_to_message
     if replied and _is_bot_message(replied, context):
+        await _do_chat_reply(update, context, text, msg=update.message, allow_broad_image=True)
+        return
+
+    # 4. Bare image request ("send me pictures of cats") — a trigger in
+    #    itself, so it chats (and _do_chat_reply routes it to images).
+    #    Plain text with no trigger still does nothing below this.
+    if media_search.parse_image_request(text):
         await _do_chat_reply(update, context, text, msg=update.message)
         return
 
@@ -2311,6 +2475,7 @@ def main() -> None:
     application.add_handler(CommandHandler("voice", voice_command))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("chat", chat_command))
+    application.add_handler(CommandHandler("pic", pic_command, block=False))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message, block=False))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)

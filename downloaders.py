@@ -840,6 +840,22 @@ _active_yt_downloads = set()
 _active_yt_downloads_lock = threading.Lock()
 
 
+async def _safe_edit_status(status_msg, text: str) -> None:
+    """Edit a status message, never raising.
+
+    A failed edit must not turn a user-facing failure into a silent
+    one (2026-11-24 live bug: unguarded edits in the failure branches
+    could raise — e.g. status_msg None, or the message deleted — and
+    the user was left stuck at "Looking for…" with no error).
+    """
+    if status_msg is None:
+        return
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        pass
+
+
 async def execute_youtube_download(target_message, yt_url: str, context: ContextTypes.DEFAULT_TYPE, status_msg=None, quality=1080) -> None:
     """Execute download and upload for YouTube video or audio with queue management and memory streaming."""
     global _queued_downloads_count
@@ -855,9 +871,23 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
     # Check-then-add must be atomic: with concurrent_updates=True two
     # handlers could both see the key as absent and start duplicate downloads.
     with _active_yt_downloads_lock:
-        if key in _active_yt_downloads:
-            return
-        _active_yt_downloads.add(key)
+        _duplicate = key in _active_yt_downloads
+        if not _duplicate:
+            _active_yt_downloads.add(key)
+    if _duplicate:
+        # Tell the user instead of returning silently (2026-11-24
+        # live bug: a second /song resolving to the same YouTube URL
+        # died here with no message while its status stayed
+        # "Looking for…" forever).
+        _dup_text = f"⏳ This {label} is already being fetched — one moment…"
+        if status_msg is not None:
+            await _safe_edit_status(status_msg, _dup_text)
+        else:
+            try:
+                await target_message.reply_text(_dup_text)
+            except Exception:
+                pass
+        return
 
     try:
         # If all download slots are currently occupied, notify user of queue position
@@ -895,7 +925,8 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                 if duration and duration > MAX_VIDEO_DURATION:
                     mins = duration // 60
                     secs = duration % 60
-                    await status_msg.edit_text(
+                    await _safe_edit_status(
+                        status_msg,
                         fmt_warning(f"Media is too long ({mins}m {secs}s). Max allowed duration is 30 minutes.")
                     )
                     return
@@ -934,13 +965,14 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
                     mb_size = file_size / (1024 * 1024)
 
                 if file_size > max_bytes:
-                    await status_msg.edit_text(
+                    await _safe_edit_status(
+                        status_msg,
                         fmt_warning(f"File is too large for Telegram ({mb_size:.1f} MB). Max limit is {MAX_UPLOAD_SIZE_MB} MB.")
                     )
                     return
 
                 upload_note = " (large file, may take a moment)" if mb_size > 40 else ""
-                await status_msg.edit_text(f"📤 Uploading to Telegram ({mb_size:.1f} MB){upload_note}...")
+                await _safe_edit_status(status_msg, f"📤 Uploading to Telegram ({mb_size:.1f} MB){upload_note}...")
 
                 if is_audio:
                     await context.bot.send_chat_action(
@@ -980,18 +1012,21 @@ async def execute_youtube_download(target_message, yt_url: str, context: Context
         error_str = str(e)
         logger.error(f"YouTube DownloadError for {yt_url}: {error_str}")
         error_lower = error_str.lower()
+        # Every branch edits via the safe helper: an unguarded edit
+        # here could itself raise (status deleted / None) and the user
+        # would be left with a stuck status and no error at all.
         if 'is a live stream' in error_lower or 'live stream' in error_lower or 'is live' in error_lower:
-            await status_msg.edit_text(fmt_warning("This is an active live stream and cannot be downloaded until it ends."))
+            await _safe_edit_status(status_msg, fmt_warning("This is an active live stream and cannot be downloaded until it ends."))
         elif '429' in error_lower or 'too many requests' in error_lower:
-            await status_msg.edit_text(fmt_warning("YouTube is temporarily rate-limiting requests. Please try again in a moment."))
+            await _safe_edit_status(status_msg, fmt_warning("YouTube is temporarily rate-limiting requests. Please try again in a moment."))
         elif 'sign in to confirm' in error_lower or 'not a bot' in error_lower:
-            await status_msg.edit_text(fmt_warning("YouTube blocked this server's request (bot verification required)."))
+            await _safe_edit_status(status_msg, fmt_warning("YouTube blocked this server's request (bot verification required)."))
         elif 'private' in error_lower or 'unavailable' in error_lower:
-            await status_msg.edit_text(fmt_error("This video is private or unavailable."))
+            await _safe_edit_status(status_msg, fmt_error("This video is private or unavailable."))
         elif 'age' in error_lower:
-            await status_msg.edit_text(fmt_error("This video is age-restricted and cannot be downloaded."))
+            await _safe_edit_status(status_msg, fmt_error("This video is age-restricted and cannot be downloaded."))
         else:
-            await status_msg.edit_text(fmt_error("Couldn't download this video."))
+            await _safe_edit_status(status_msg, fmt_error("Couldn't download this video."))
         await send_media_error_dm(context, target_message, yt_url, "YouTube", error_str)
     except Exception as e:
         error_str = str(e)

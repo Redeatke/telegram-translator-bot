@@ -12,9 +12,15 @@ message with::
     redster hello, how are you?
 
 Pure functions — no Telegram imports — so they are unit-testable
-without a bot. Fuzzy matching (difflib) tolerates typos in the wake
-word ("redstr"), in "quote" ("qoute") and in colour names ("yello",
-"purpl", "blu", "gren").
+without a bot. Fuzzy matching (difflib) tolerates typos in "quote"
+("qoute") and in colour names ("yello", "purpl", "blu", "gren").
+
+The WAKE WORD is EXACTLY "redster" (case-insensitive) — NO fuzzy
+matching on it. A typo ("redstr", "redstar", "r3dster") or a
+look-alike word ("trendsetter", 0.78-similar to "redster") must NOT
+trigger; the user has to type "redster" again. (2026-11-24: a group
+message "#trendsetter negn ende" was answered as chat because the
+fuzzy wake matched "trendsetter".)
 
 Design notes / trade-offs:
 - Colour fuzzy cutoff is 0.8, stricter than quote (0.75) and wake
@@ -38,12 +44,13 @@ from typing import Dict, Optional
 import quote_sticker
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
-WAKE_CUTOFF = 0.7    # "redstr" (0.92), "redstar" (0.86) still match "redster"
 QUOTE_CUTOFF = 0.75  # "qoute" is exactly 0.80-similar to "quote"
 COLOR_CUTOFF = 0.8   # see module docstring — "blurple" (0.77) must NOT match
 REPLY_CUTOFF = 0.75  # "replay" (0.91) still matches "reply"
 
-_WAKE_WORDS = {"redster", "redstr", "redstar", "redsterbot", "r3dster", "r3dster_bot", "red"}
+# Wake word: EXACTLY "redster" only (lowercased by _clean). No fuzzy
+# matching, no aliases — a typo must not trigger (see module docstring).
+_WAKE_WORDS = {"redster"}
 _QUOTE_WORDS = {"quote", "qoute", "quoute", "qote", "quotee"}
 _REPLY_WORDS = {"reply", "replay", "replies", "r"}
 _FILLERS = {"hey", "please", "yo", "hi", "hello", "ok", "okay"}
@@ -100,12 +107,13 @@ def parse_redster_message(text: str, bot_username: str = "R3dSter_Bot") -> Optio
 
     # 1. Leading @mention of the bot counts as the wake word:
     #    "@R3dSter_Bot quote this" — but "@someone_else ..." does not.
+    #    Exact match only: the bot username, or "redster" itself.
+    #    No fuzzy matching and no aliases ("@r3dster" does not count).
     first_clean = _clean(tokens[0])
     if tokens[0].startswith("@"):
         mentioned = _norm_username(first_clean.lstrip("@"))
         bot_norm = _norm_username(bot_username)
-        if mentioned == bot_norm or mentioned in {"redster", "r3dster", "redsterbot"} or \
-                _fuzzy(mentioned, [bot_norm, "redster"], WAKE_CUTOFF):
+        if mentioned == bot_norm or mentioned == "redster":
             wake = tokens[0]
             idx = 1
             if idx >= len(tokens):
@@ -124,16 +132,15 @@ def parse_redster_message(text: str, bot_username: str = "R3dSter_Bot") -> Optio
     if idx >= len(tokens):
         return None
 
-    # 3. Wake word — exact, then fuzzy ("redstr", "redstar", "red").
+    # 3. Wake word — EXACT "redster" only (case-insensitive, via
+    #    _clean). No fuzzy matching: "redstr", "redstar", "r3dster"
+    #    and look-alikes like "trendsetter" must NOT trigger.
     if wake is None:
         w = _clean(tokens[idx])
         if w in _WAKE_WORDS:
             wake = tokens[idx]
         else:
-            match = _fuzzy(w, ["redster", "r3dster"], WAKE_CUTOFF)
-            if not match:
-                return None
-            wake = tokens[idx]
+            return None
         idx += 1
 
     remainder = tokens[idx:]

@@ -29,6 +29,10 @@ from typing import Callable, Dict, List, Optional
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 MAX_SONG_SECONDS = 600  # 10 minutes — longer results are rejected at search
+SEARCH_TIMEOUT_SECONDS = 30  # yt-dlp search cap — a hung search must
+# never leave the user stuck at "Looking for…" (2026-11-24 live bug:
+# the search ran in an executor with NO timeout, so a blocked/slow
+# YouTube search never returned and no error was ever shown).
 CACHE_TTL_SECONDS = 600  # 10 minutes
 CACHE_MAX_ENTRIES = 100
 DEFAULT_SEARCH_PREFIX = "ytsearch1:"
@@ -182,6 +186,16 @@ def _parse_broad(text: str) -> Optional[str]:
         return _clean_query(m.group(1))
     # "play <query>" — broad only. "play blinding lights" -> the song.
     m = re.match(r"^play\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        return _clean_query(m.group(1))
+    # Bare "send <query>" — broad only: "redster send blinding lights".
+    # No "me" (the "send me <x>" rule above stays stricter: music only
+    # with a music word or "by <artist>", so "send me a dog with a
+    # red ball" is still an image) and no media word (guarded at the
+    # top). TRADEOFF: this claims any bare "send <x>" for music before
+    # images can see it, so a failed music search answers "couldn't
+    # find as a song" instead of sending a picture.
+    m = re.match(r"^send\s+(?!me\s)(.+)$", s, re.IGNORECASE)
     if m:
         return _clean_query(m.group(1))
     # Verb + "me" + anything, but ONLY when a music word is present
@@ -408,7 +422,15 @@ async def search_song(
     search = _search or _default_search
     try:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, search, query)
+        # A hung yt-dlp search (blocked/slow YouTube from the host's
+        # IP) must time out instead of leaving the user stuck at
+        # "Looking for…" forever — wait_for raises TimeoutError, which
+        # is caught below and returns None like any other failure.
+        # (The executor thread itself keeps running; only the wait ends.)
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, search, query),
+            timeout=SEARCH_TIMEOUT_SECONDS,
+        )
     except Exception:
         return None
     try:

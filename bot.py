@@ -1560,7 +1560,19 @@ async def _handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # The existing downloader owns the rest: queue slot, download,
     # size/duration checks, upload as audio, status updates and its
     # own error messages. It deletes/edits the status message itself.
-    await execute_youtube_download(msg, url, context, status_msg=status_msg, quality="audio")
+    # Belt-and-braces: if it ever raises instead (it should not), the
+    # user still gets an answer instead of a stuck "Looking for…".
+    try:
+        await execute_youtube_download(msg, url, context, status_msg=status_msg, quality="audio")
+    except Exception as e:
+        logger.error(f"Song download failed for {query}: {type(e).__name__}: {e}")
+        try:
+            await status_msg.edit_text(
+                fmt_error("I found the song but couldn't send it. Please try again."),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 async def song_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

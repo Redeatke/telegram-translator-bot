@@ -129,6 +129,10 @@ def build_system_prompt(now: Optional[datetime] = None) -> str:
         + "you sent it. If an image request reaches you in text, "
         + "reply briefly and tell the user to use /pic followed by "
         + "what they want (for example: /pic a dog with a red ball)."
+        + " Never mention your training data, knowledge base, or a "
+        + "cutoff year — do not say 'my knowledge was last updated "
+        + "in 2024' or any year. If you do not know something, just "
+        + "say you don't know — do not explain it with a cutoff date."
     )
 
 # ─── In-memory history ───────────────────────────────────────────────────────

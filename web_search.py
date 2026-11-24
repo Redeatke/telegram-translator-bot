@@ -46,11 +46,27 @@ _BROWSER_UA = (
 # Phrases (lowercase, substring match) that mean "this needs live info".
 # Explicit and testable — no per-topic special cases (no "superman" rule):
 # a 2025/2026 year in the text triggers via the year regex instead.
+# Deliberately NOT included: bare "will" (so "will you translate this"
+# stays False) — only "will it" / "will there be" trigger.
 _SEARCH_PHRASES = (
     "what year", "what date", "what day is it", "today", "current",
     "latest", "recent", "news", "who won", "when did", "is it out",
     "has it come out", "out yet", "released", "release date",
     "how much did it make", "box office", "score", "result", "weather",
+    # Entertainment / media: a question naming a movie/show almost
+    # always wants current info (release, cast, trailer, season...).
+    "movie", "film", "trailer", "tv show", "tv series", "season",
+    "episode", "upcoming", "announced", "announcement", "cast",
+    "who plays", "who is playing", "directed by", "directed", "marvel", "anime",
+    "streaming", "netflix", "coming out", "comes out",
+    "when is it coming", "is it coming", "new movie", "new film",
+    "new season", "new album", "new song", "new game", "concert", "tour",
+    # Future tense / speculation about real-world things.
+    "gonna", "going to", "will it", "will there be", "is there gonna",
+    "is there going to", "what's next", "what is next",
+    # Release / status.
+    "release", "premiere", "premieres", "in theaters", "delayed",
+    "cancelled", "renewed",
 )
 _YEAR_RE = re.compile(r"\b(2025|2026)\b")
 

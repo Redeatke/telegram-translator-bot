@@ -129,6 +129,7 @@ from downloaders import (
     handle_tiktok_message,
     handle_reddit_message,
     handle_pending_download_button,
+    execute_youtube_download,
     download_generic_media,
     download_video_source,
 )
@@ -139,6 +140,7 @@ import quote_sticker
 import chat_agent
 import redster
 import media_search
+import music_search
 import card
 import telethon_downloader
 
@@ -169,7 +171,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"  • /tr — translate in groups or reply to images\n"
         f"  • /ask &lt;question&gt; — chat with the bot\n"
         f"  • /pic &lt;thing&gt; — send the top 3 pictures of it\n"
-        f"  • redster ... — reply to a message with “redster quote this” to quote it, say “redster hello” to chat, or “redster send me a dog with a red ball” for pictures\n"
+        f"  • /song &lt;song&gt; by &lt;artist&gt; — send a song as MP3 (max 10 min)\n"
+        f"  • redster ... — reply to a message with “redster quote this” to quote it, say “redster hello” to chat, “redster send me a dog with a red ball” for pictures, or “redster send me pound the alarm by nicki minaj” for a song\n"
         f"  • /sticker — make/add stickers from images, stickers, or text\n"
         f"  • /gif — convert video to animated GIF\n"
         f"  • /target es — switch target language to Spanish\n"
@@ -198,6 +201,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /tr        Translate text or reply\n"
         f"  /ask       Chat with the bot\n"
         f"  /pic       Send the top 3 pictures of something\n"
+        f"  /song      Send a song as MP3 (e.g. /song pound the alarm by nicki minaj, max 10 min)\n"
         f"  /chat      Turn group chat on/off (group admins)\n"
         f"  /target    Set target language\n"
         f"  /languages Interactive language picker\n"
@@ -1241,7 +1245,10 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     trigger fired — redster wake, @mention, reply-to-bot) or "send me
     pictures of cats" (narrow, picture words required) goes to
     _handle_images instead of the AI. An explicit-content request is
-    refused without consuming a rate-limit hit.
+    refused without consuming a rate-limit hit. Music requests are
+    checked before images: "send me pound the alarm by nicki minaj"
+    goes to _handle_music (YouTube audio download), not to images
+    and not to the AI.
     """
     user = update.effective_user
     chat = update.effective_chat
@@ -1261,6 +1268,24 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             fmt_warning("Chat is off in this group. A group admin can turn it on with <code>/chat on</code>."),
             parse_mode="HTML",
         )
+        return
+
+    # Music request? (before images and before plain chat — music
+    # words are more specific than "send me <anything>", and the
+    # image parser would also match "send me <song> by <artist>".)
+    music_query = music_search.parse_music_request(text, broad=allow_broad_image)
+    if music_query is not None:
+        if not check_rate_limit(user.id, "chat"):
+            remaining = rate_limit_remaining(user.id, "chat")
+            await msg.reply_text(
+                fmt_warning(
+                    f"You've hit the hourly chat limit — {remaining} chats left this hour "
+                    f"(20/hr). Please try again in a little while."
+                ),
+                parse_mode="HTML",
+            )
+            return
+        await _handle_music(update, context, music_query, msg, rate_checked=True)
         return
 
     # Image request? (before plain chat — and before the rate check for
@@ -1440,6 +1465,133 @@ async def pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await _handle_images(update, context, query, msg=msg)
+
+
+async def _handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        query: str, msg=None, rate_checked: bool = False) -> None:
+    """Search YouTube for `query` and send the song as an MP3 audio file.
+
+    Search-and-send only — no AI generation. The query is resolved to
+    a YouTube URL by music_search.search_song (top result, max 10
+    minutes — longer results are rejected before any download), then
+    the download + upload is done entirely by the EXISTING
+    downloaders.execute_youtube_download with quality="audio"
+    (pytubefix fast audio engine, yt-dlp FFmpegExtractAudio fallback,
+    residential relay fallback, Telethon >49MB fallback, download
+    queue semaphore, temp-dir cleanup, 50MB/2000MB size limits and
+    its own error messages). This function adds no download code of
+    its own. Rate-limited on the "chat" bucket unless the caller
+    already consumed a hit (rate_checked=True). No explicit-content
+    blocklist for music — song titles are not filtered the way image
+    queries are.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = msg or update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    query = (query or "").strip()
+    if not query:
+        return
+
+    if not _chat_enabled_for(chat):
+        await msg.reply_text(
+            fmt_warning("Chat is off in this group. A group admin can turn it on with <code>/chat on</code>."),
+            parse_mode="HTML",
+        )
+        return
+
+    if not rate_checked and not check_rate_limit(user.id, "chat"):
+        remaining = rate_limit_remaining(user.id, "chat")
+        await msg.reply_text(
+            fmt_warning(
+                f"You've hit the hourly chat limit — {remaining} chats left this hour "
+                f"(20/hr). Please try again in a little while."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat.id, action="upload_document")
+    status_msg = await msg.reply_text(
+        f"🎵 Looking for “{html.escape(query)}”…",
+        parse_mode="HTML",
+    )
+    try:
+        result = await music_search.search_song(query)
+    except Exception as e:
+        logger.error(f"Song search failed: {type(e).__name__}: {e}")
+        result = None
+    if result is None:
+        try:
+            await status_msg.edit_text(
+                f"I couldn't find “{html.escape(query)}” as a song right now — try the artist and song name, or /song &lt;song&gt; by &lt;artist&gt;.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+    if result.get("error") == "too_long":
+        mins = int(result.get("duration_seconds") or 0) // 60
+        try:
+            await status_msg.edit_text(
+                fmt_warning(
+                    f"“{html.escape(str(result.get('title') or query))}” is too long ({mins} min). "
+                    f"I can only send songs up to 10 minutes."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    url = str(result.get("url") or "").strip()
+    if not url:
+        try:
+            await status_msg.edit_text(
+                fmt_error("I found the song but couldn't get a link for it. Please try again."),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    # The existing downloader owns the rest: queue slot, download,
+    # size/duration checks, upload as audio, status updates and its
+    # own error messages. It deletes/edits the status message itself.
+    await execute_youtube_download(msg, url, context, status_msg=status_msg, quality="audio")
+
+
+async def song_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a song as MP3: /song <song> by <artist>, or reply with /song."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if is_maintenance_active_for_user(user.id):
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query and msg.reply_to_message:
+        query = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+
+    if not query:
+        await msg.reply_text(
+            fmt_card("🎵 /song — Send a song",
+                "  Send a song as an MP3 audio file:\n"
+                "  <code>/song pound the alarm by nicki minaj</code>\n"
+                "  Or just say <code>redster send me pound the alarm by nicki minaj</code>.\n"
+                "  Or reply to a message with /song to send that song.\n"
+                "  1 song per request, max 10 minutes."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    await _handle_music(update, context, query, msg=msg)
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2035,8 +2187,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Plain text does trigger, in order: (1) the "redster ..." keyword
     (quote or chat), (2) an @mention of the bot, (3) a reply to one of
     the bot's own messages — all via chat_agent (see _do_chat_reply) —
-    and (4) a bare image request ("send me pictures of cats"), routed
-    to images by _do_chat_reply. Anything else only tracks URLs sent
+    and (4) a bare music request ("send me the song hello by adele")
+    or a bare image request ("send me pictures of cats"), routed to
+    music / images by _do_chat_reply. Anything else only tracks URLs sent
     in a private chat, so /gif can reuse the last DM link or video
     (via _track_dm_media / handle_dm_media_tracker).
     """
@@ -2088,9 +2241,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _do_chat_reply(update, context, text, msg=update.message, allow_broad_image=True)
         return
 
-    # 4. Bare image request ("send me pictures of cats") — a trigger in
-    #    itself, so it chats (and _do_chat_reply routes it to images).
-    #    Plain text with no trigger still does nothing below this.
+    # 4. Bare music request ("send me the song hello by adele") or
+    #    bare image request ("send me pictures of cats") — triggers in
+    #    themselves, so they chat (and _do_chat_reply routes them to
+    #    music / images). Music is checked first: a song request must
+    #    never fall through to the image parser. Plain text with no
+    #    trigger still does nothing below this.
+    if music_search.parse_music_request(text):
+        await _do_chat_reply(update, context, text, msg=update.message)
+        return
+
     if media_search.parse_image_request(text):
         await _do_chat_reply(update, context, text, msg=update.message)
         return
@@ -2479,6 +2639,7 @@ def main() -> None:
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(CommandHandler("pic", pic_command, block=False))
+    application.add_handler(CommandHandler("song", song_command, block=False))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message, block=False))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)

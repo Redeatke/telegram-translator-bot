@@ -508,6 +508,15 @@ def generate_quote_card(
     from the card. Text may therefore run close to the card's right
     edge, like the reference; that is intended, because the pill is
     below the card, not to its right.
+    The avatar sits ALONE in its own circle on the transparent
+    background, fully clear of the card: the card is shifted right
+    and down a little, leaving a gap of wallpaper between the avatar
+    and the card's left edge, and the avatar's centre is level with
+    the author's name. The name and message start to the right of
+    the avatar, inside the card.
+    The name and message start to the right of the avatar, inside
+    the card. Everything outside the card (and below it, for the
+    timestamp) is transparent, so the chat wallpaper shows through.
     bg_color: optional card background — an (R, G, B) tuple, or a color
     name / hex string accepted by parse_quote_color() (e.g. "yellow",
     "#FFD700"). Defaults to the original dark (26, 24, 34) when None
@@ -536,7 +545,19 @@ def generate_quote_card(
     BG_COLOR = resolved_bg
 
     PADDING = 18
+    BOTTOM_PADDING = 28
     AVATAR_SIZE = 48
+    # ── Avatar-outside layout ────────────────────────────────────────
+    # The avatar sits ALONE in its own circle on the transparent
+    # background, fully clear of the card: the card is shifted right
+    # (CARD_X) and down a little (CARD_Y), leaving an AVATAR_GAP of
+    # wallpaper between the avatar and the card's left edge. The
+    # avatar's centre is level with the author's name, and the text
+    # starts right of the avatar, inside the card. Touching or
+    # overlapping the card edge looked like a layering glitch.
+    AVATAR_GAP = 10
+    CARD_X = AVATAR_SIZE + AVATAR_GAP
+    CARD_Y = 10
     # ── Timestamp-safe zone ──────────────────────────────────────────
     # Telegram overlays its "9:31 AM ✓✓" pill at the bottom-right of a
     # sticker. The old layout reserved empty space INSIDE the card
@@ -548,15 +569,18 @@ def generate_quote_card(
     #     no empty space inside the card.
     #   * TIMESTAMP_CANVAS_PAD is the only protection: 48px of
     #     transparent canvas appended below the scaled card.
-    # MAX_CARD_W is 512 (was 432) so normal sentences fit on one line:
-    # "Ur mum is ai generated stfu" is 295px and "Gonna test the colors
-    # now with reply" is 387px at 21px font; with content_x=80 and
-    # PADDING=18, max_content_w is 512-80-18 = 414, so both fit on one
-    # line. Longer sentences still wrap, but at 414px instead of 262px.
+    # MAX_CARD_W is 512 minus CARD_X (was 432) so normal sentences
+    # fit on one line: "Ur mum is ai generated stfu" is 295px and
+    # "Gonna test the colors now with reply" is 387px at 21px font;
+    # with content_x=56 and PADDING=18, max_content_w is
+    # 488-56-18 = 414, so both fit on one line. Longer sentences
+    # still wrap, but at 414px instead of 262px. The 512 cap applies
+    # to the whole canvas (card + avatar overhang), so the card
+    # itself is at most 512 - CARD_X wide.
     TIMESTAMP_RIGHT_RESERVE = 0
     TIMESTAMP_BOTTOM_RESERVE = 0
-    TIMESTAMP_CANVAS_PAD = 48
-    MAX_CARD_W = 512
+    TIMESTAMP_CANVAS_PAD = 56
+    MAX_CARD_W = 512 - CARD_X
 
     font_user = FONT_USERNAME(22)
     font_body = FONT_BODY(21)
@@ -569,9 +593,12 @@ def generate_quote_card(
     dummy_img = Image.new("RGBA", (1, 1))
     dd = ImageDraw.Draw(dummy_img)
 
-    content_x = PADDING + AVATAR_SIZE + 14
+    content_x = CARD_X + PADDING + 14
     # Full width for text — no right reserve deducted (see above).
-    max_content_w = MAX_CARD_W - content_x - PADDING - TIMESTAMP_RIGHT_RESERVE
+    # content_x is in canvas coords; the card starts at CARD_X, so
+    # the text width available inside the card is measured from the
+    # card's own left edge.
+    max_content_w = MAX_CARD_W - (content_x - CARD_X) - PADDING - TIMESTAMP_RIGHT_RESERVE
 
     # 1. Author username width
     user_w = _measure_text_width(username, font_user, emoji_font, dd)
@@ -609,29 +636,32 @@ def generate_quote_card(
     # + padding. The time pill is kept off the card by the transparent
     # canvas below it, not by empty space inside it.
     needed_content_w = max(header_w, reply_w, body_max_w, 140)
-    card_w = min(content_x + needed_content_w + PADDING + TIMESTAMP_RIGHT_RESERVE, MAX_CARD_W)
+    card_w = min((content_x - CARD_X) + needed_content_w + PADDING + TIMESTAMP_RIGHT_RESERVE, MAX_CARD_W)
     card_w = max(card_w, 230)
 
     total_content_h = 30 + (reply_h + 8 if has_reply else 0) + body_h
-    card_h = max(total_content_h + (PADDING * 2) + TIMESTAMP_BOTTOM_RESERVE, AVATAR_SIZE + (PADDING * 2), 90)
+    card_h = max(total_content_h + PADDING + BOTTOM_PADDING + TIMESTAMP_BOTTOM_RESERVE, AVATAR_SIZE + PADDING + BOTTOM_PADDING, 90)
     card_h = min(card_h, 512)
 
-    img = Image.new("RGBA", (int(card_w), int(card_h)), (0, 0, 0, 0))
+    img = Image.new("RGBA", (int(CARD_X + card_w), int(CARD_Y + card_h)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     # Background card: Sleek dark glassmorphism (or the requested /q color).
     # BG_COLOR / BORDER_COLOR are derived from bg_color above, before this point.
+    # The card is offset by (CARD_X, CARD_Y) so the avatar can straddle
+    # its top-left edge; everything outside the card stays transparent.
     draw.rounded_rectangle(
-        [(0, 0), (card_w - 1, card_h - 1)],
+        [(CARD_X, CARD_Y), (CARD_X + card_w - 1, CARD_Y + card_h - 1)],
         radius=20,
         fill=BG_COLOR,
         outline=BORDER_COLOR,
         width=2,
     )
 
-    # Draw Avatar top-left
-    avatar_x = PADDING
-    avatar_y = PADDING
+    # Draw Avatar alone in its own circle on the transparent
+    # background, clear of the card, centre level with the name.
+    avatar_x = 0
+    avatar_y = CARD_Y + 6
     if avatar_bytes:
         drawn = _draw_circular_avatar(img, avatar_bytes, avatar_x, avatar_y, AVATAR_SIZE)
         if not drawn:
@@ -640,9 +670,9 @@ def generate_quote_card(
         _draw_avatar_placeholder(draw, avatar_x, avatar_y, AVATAR_SIZE, username, glow=True)
 
     # Draw author name (accent derived from the card background)
-    _draw_text_with_emoji(draw, (content_x, avatar_y + 2), username, font_user, emoji_font, fill=USER_ACCENT)
+    _draw_text_with_emoji(draw, (content_x, CARD_Y + PADDING + 2), username, font_user, emoji_font, fill=USER_ACCENT)
 
-    cur_y = avatar_y + 32
+    cur_y = CARD_Y + PADDING + 32
 
     # Draw Reply Section if present
     if has_reply:

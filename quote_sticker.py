@@ -567,8 +567,12 @@ def generate_quote_card(
     # and puts the pill on transparent canvas BELOW the card, so:
     #   * TIMESTAMP_RIGHT_RESERVE / TIMESTAMP_BOTTOM_RESERVE are 0 —
     #     no empty space inside the card.
-    #   * TIMESTAMP_CANVAS_PAD is the only protection: 48px of
-    #     transparent canvas appended below the scaled card.
+    #   * TIMESTAMP_CANVAS_PAD is the only protection: 84px of
+    #     transparent canvas appended below the scaled card. It was
+    #     48, then 56: desktop Telegram keeps the pill in the strip,
+    #     but iOS draws the pill higher, riding up onto the card's
+    #     bottom-right corner with a 48-56px strip, so the strip has
+    #     to be tall enough for the phone client too.
     # MAX_CARD_W is 512 minus CARD_X (was 432) so normal sentences
     # fit on one line: "Ur mum is ai generated stfu" is 295px and
     # "Gonna test the colors now with reply" is 387px at 21px font;
@@ -579,7 +583,7 @@ def generate_quote_card(
     # itself is at most 512 - CARD_X wide.
     TIMESTAMP_RIGHT_RESERVE = 0
     TIMESTAMP_BOTTOM_RESERVE = 0
-    TIMESTAMP_CANVAS_PAD = 56
+    TIMESTAMP_CANVAS_PAD = 84
     MAX_CARD_W = 512 - CARD_X
 
     font_user = FONT_USERNAME(22)
@@ -656,6 +660,24 @@ def generate_quote_card(
         fill=BG_COLOR,
         outline=BORDER_COLOR,
         width=2,
+    )
+
+    # Chat-bubble tail on the card's left edge, pointing left toward
+    # the avatar (like a normal Telegram message bubble). Centred on
+    # the author's name line; the tip stops just short of the avatar
+    # so the two never touch. Drawn after the card so it sits on top
+    # of the card edge, before the avatar.
+    TAIL_LEN = 14
+    TAIL_HALF_H = 11
+    tail_cy = CARD_Y + PADDING + 13
+    draw.polygon(
+        [
+            (CARD_X, tail_cy - TAIL_HALF_H),
+            (CARD_X, tail_cy + TAIL_HALF_H),
+            (CARD_X - TAIL_LEN, tail_cy),
+        ],
+        fill=BG_COLOR,
+        outline=BORDER_COLOR,
     )
 
     # Draw Avatar alone in its own circle on the transparent

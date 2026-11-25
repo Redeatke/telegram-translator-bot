@@ -39,6 +39,7 @@ from config import (
     IS_TERMUX,
     YOUTUBE_COOKIES_FILE,
     INSTAGRAM_COOKIES_FILE,
+    LINKEDIN_COOKIES_FILE,
     INSTAGRAM_PROXY,
     get_instagram_proxy,
     INSTAGRAM_MAX_CONCURRENT,
@@ -1611,7 +1612,11 @@ async def execute_generic_media_download(target_message, url: str, platform_name
         error_msg = str(e)
         logger.error(f"{platform_name} download failed for {url}: {type(e).__name__}: {e}")
         try:
-            await status_msg.edit_text(fmt_error(classify_media_error(error_msg)), parse_mode="HTML")
+            await status_msg.edit_text(fmt_error(classify_media_error(
+                error_msg,
+                platform=platform_name,
+                cookies_configured=bool(cookiefile and os.path.exists(cookiefile)),
+            )), parse_mode="HTML")
         except Exception:
             pass
         await send_media_error_dm(context, target_message, url, platform_name, error_msg)
@@ -2518,16 +2523,88 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
         await send_media_error_dm(context, update.message, canonical_url, "Reddit", str(e))
 
 
+_LINKEDIN_SHORT_HOSTS = {"lnkd.in", "www.lnkd.in"}
+
+# Browser User-Agent for short-link resolution (lnkd.in is a plain redirector,
+# but a real UA avoids bot-check walls on the redirect hops).
+_LINKEDIN_RESOLVE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+
+
+async def resolve_linkedin_short_link(url: str, client=None) -> Optional[str]:
+    """Resolve a lnkd.in short link to its final linkedin.com post URL.
+
+    HEAD first (follow_redirects=True, max 5 redirects, 10s timeout), GET
+    fallback when HEAD fails. Returns:
+      - the final URL (query/fragment stripped) when it lands on a LinkedIn
+        video post (matches LINKEDIN_URL_PATTERN),
+      - "" when it resolved fine but is NOT a LinkedIn video post (profile,
+        company page, login page, ...),
+      - None when resolution itself failed (timeout, HTTP error, redirect
+        loop). Never raises. Only the stripped URL is logged — never query
+        parameters.
+    `client` is an injectable httpx-like client for tests; when omitted a
+    real httpx.AsyncClient is created and closed here.
+    """
+    own_client = client is None
+    try:
+        if own_client:
+            client = httpx.AsyncClient(
+                timeout=10.0, follow_redirects=True, max_redirects=5,
+                headers=_LINKEDIN_RESOLVE_HEADERS,
+            )
+        final_url = None
+        try:
+            resp = await client.head(url)
+            if 200 <= resp.status_code < 400:
+                final_url = str(resp.url)
+        except Exception:
+            final_url = None
+        if final_url is None:
+            try:
+                resp = await client.get(url)
+                if 200 <= resp.status_code < 400:
+                    final_url = str(resp.url)
+            except Exception:
+                return None
+        if not final_url:
+            return None
+        clean = final_url.split("?")[0].split("#")[0]
+        host = urlparse(clean).netloc.lower()
+        if host not in ("linkedin.com", "www.linkedin.com"):
+            logger.info("lnkd.in short link resolved to a non-LinkedIn host; ignoring.")
+            return ""
+        if not LINKEDIN_URL_PATTERN.search(clean):
+            logger.info("lnkd.in short link resolved to a LinkedIn page without video; ignoring.")
+            return ""
+        logger.info("Resolved lnkd.in short link to a LinkedIn post.")
+        return clean
+    except Exception as e:
+        logger.warning(f"Failed to resolve lnkd.in short link: {e}")
+        return None
+    finally:
+        if own_client and client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
 async def handle_linkedin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-detect LinkedIn post links (video posts only, public posts).
 
     Mirrors handle_tiktok_message: the generic yt-dlp path
     (download_generic_media via execute_generic_media_download) does the
     work — LinkedIn ships a yt-dlp extractor (LinkedInIE), so no
-    platform-specific extraction is needed. No cookies are used: public
-    posts only. If LinkedIn answers with its login wall / HTTP 999,
-    classify_media_error says so plainly instead of claiming the video
-    doesn't exist.
+    platform-specific extraction is needed. lnkd.in short links (the form
+    LinkedIn's app share hands out) are resolved to the real post URL
+    first; anything that doesn't land on a video post is refused with a
+    friendly message instead of being downloaded. When LINKEDIN_COOKIES is
+    configured (LINKEDIN_COOKIES env var or linkedin_cookies.txt, same
+    format as Instagram's), the cookies are passed to yt-dlp so
+    logged-in-only posts can download; otherwise a 999/login-wall error
+    says cookies may help. Cookie contents are never logged or shown.
     """
     if not update.message or not update.message.text: return
     user = update.effective_user
@@ -2544,6 +2621,28 @@ async def handle_linkedin_message(update: Update, context: ContextTypes.DEFAULT_
     if not is_downloader_enabled(chat_id, "linkedin"):
         return
 
+    # lnkd.in short links: resolve to the real post URL before anything
+    # else, so the button and the downloader both see the real URL.
+    if urlparse(url).netloc.lower() in _LINKEDIN_SHORT_HOSTS:
+        resolved = await resolve_linkedin_short_link(url)
+        if resolved is None:
+            await update.message.reply_text(
+                fmt_error("I couldn't open that LinkedIn link — it may have expired, or LinkedIn didn't answer. Try sharing the full linkedin.com post link instead."),
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+        if resolved == "":
+            await update.message.reply_text(
+                fmt_error("That LinkedIn link doesn't point to a video post I can download. I can only download videos from public LinkedIn posts."),
+                parse_mode="HTML",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+        url = resolved
+
+    cookiefile = LINKEDIN_COOKIES_FILE if (LINKEDIN_COOKIES_FILE and os.path.exists(LINKEDIN_COOKIES_FILE)) else None
+
     auto_dl = get_download_mode(chat_id)
     if not auto_dl:
         short_id = store_pending_download(url, "LinkedIn")
@@ -2551,7 +2650,7 @@ async def handle_linkedin_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("💼 <b>LinkedIn Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
         return
 
-    await execute_generic_media_download(update.message, url, "LinkedIn", context)
+    await execute_generic_media_download(update.message, url, "LinkedIn", context, cookiefile=cookiefile)
 
 
 async def handle_pending_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2591,6 +2690,9 @@ async def handle_pending_download_button(update: Update, context: ContextTypes.D
     elif platform == "Threads":
         await execute_threads_download(query.message, url, context, status_msg=status_msg)
     else:
-        await execute_generic_media_download(query.message, url, platform, context, status_msg=status_msg)
+        _cookiefile = None
+        if platform == "LinkedIn" and LINKEDIN_COOKIES_FILE and os.path.exists(LINKEDIN_COOKIES_FILE):
+            _cookiefile = LINKEDIN_COOKIES_FILE
+        await execute_generic_media_download(query.message, url, platform, context, status_msg=status_msg, cookiefile=_cookiefile)
 
 

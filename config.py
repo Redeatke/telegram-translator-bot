@@ -229,6 +229,7 @@ def _normalize_cookies(
     domain_markers: Tuple[str, ...],
     label: str,
     header_domain: Optional[str] = None,
+    header_marker: str = "sessionid=",
 ) -> str:
     """Normalize Netscape, escaped \\n/\\t, base64, Cookie-Editor JSON, or header-style cookies."""
     raw = raw.strip()
@@ -275,7 +276,7 @@ def _normalize_cookies(
             pass
 
     # 4. Header-style: "key=val; key2=val2"
-    if header_domain and "sessionid=" in raw and "\t" not in raw and "\n" not in raw.strip():
+    if header_domain and header_marker in raw and "\t" not in raw and "\n" not in raw.strip():
         pairs = [p.strip() for p in raw.split(";") if "=" in p]
         lines = ["# Netscape HTTP Cookie File", ""]
         for pair in pairs:
@@ -294,6 +295,11 @@ def _normalize_cookies(
 def _normalize_instagram_cookies(raw: str) -> str:
     """Normalize various Instagram cookie formats into a proper Netscape cookies.txt."""
     return _normalize_cookies(raw, ("instagram.com",), "Instagram", header_domain=".instagram.com")
+
+
+def _normalize_linkedin_cookies(raw: str) -> str:
+    """Normalize various LinkedIn cookie formats into a proper Netscape cookies.txt."""
+    return _normalize_cookies(raw, ("linkedin.com",), "LinkedIn", header_domain=".linkedin.com", header_marker="li_at=")
 
 YOUTUBE_COOKIES_FILE = None
 cookies_env = os.getenv("YOUTUBE_COOKIES") or os.getenv("YOUTUBE_COOKIE")
@@ -372,6 +378,61 @@ if not INSTAGRAM_COOKIES_FILE:
     logger.warning(
         "No Instagram cookies configured. Instagram Reels/posts may fail. "
         "Set INSTAGRAM_COOKIES env var or place instagram_cookies.txt next to the bot."
+    )
+
+# ─── LinkedIn Cookies Setup ───────────────────────────────────────────────────
+# LinkedIn blocks datacenter IPs with HTTP 999 / a login wall for many video
+# posts. Set LINKEDIN_COOKIES env var to a Netscape-format cookie string, or
+# place linkedin_cookies.txt next to the bot. Export from your browser with
+# the "Get cookies.txt LOCALLY" extension while logged into linkedin.com.
+#
+# Accepted formats are the same as Instagram's (see _normalize_cookies):
+# Netscape cookies.txt, one-line paste with literal \n and \t, base64,
+# Cookie-Editor JSON, or a bare "li_at=...;JSESSIONID=..." header string.
+# The login cookie that matters is li_at — without it, downloads will
+# likely still be blocked.
+
+LINKEDIN_COOKIES_FILE = None
+_li_cookies_env = os.getenv("LINKEDIN_COOKIES") or os.getenv("LINKEDIN_COOKIE")
+if _li_cookies_env:
+    try:
+        _li_cookie_text = _normalize_linkedin_cookies(_li_cookies_env)
+        if _li_cookie_text:
+            _li_cookie_path = os.path.join(tempfile.gettempdir(), "li_cookies.txt")
+            with open(_li_cookie_path, "w", encoding="utf-8") as f:
+                f.write(_li_cookie_text)
+            LINKEDIN_COOKIES_FILE = _li_cookie_path
+            _has_li_at = "li_at" in _li_cookie_text.lower()
+            logger.info(
+                f"Loaded LinkedIn cookies from env var "
+                f"(li_at={'present' if _has_li_at else 'MISSING'})."
+            )
+            if not _has_li_at:
+                logger.warning(
+                    "LinkedIn cookies loaded but li_at is MISSING. "
+                    "Downloads will likely fail. Re-export cookies while logged in."
+                )
+        else:
+            logger.warning("LINKEDIN_COOKIES env var is set but empty after normalization.")
+    except Exception as e:
+        logger.error(f"Failed to write LINKEDIN_COOKIES to temp file: {e}")
+elif os.path.exists("linkedin_cookies.txt"):
+    LINKEDIN_COOKIES_FILE = os.path.abspath("linkedin_cookies.txt")
+    try:
+        with open(LINKEDIN_COOKIES_FILE, "r", encoding="utf-8") as f:
+            _file_text = f.read()
+        _has_li_at = "li_at" in _file_text.lower()
+        logger.info(
+            f"Loaded LinkedIn cookies from local file "
+            f"(li_at={'present' if _has_li_at else 'MISSING'})."
+        )
+    except Exception:
+        logger.info("Loaded LinkedIn cookies from local linkedin_cookies.txt file.")
+
+if not LINKEDIN_COOKIES_FILE:
+    logger.warning(
+        "No LinkedIn cookies configured. LinkedIn video downloads may be blocked (HTTP 999). "
+        "Set LINKEDIN_COOKIES env var or place linkedin_cookies.txt next to the bot."
     )
 
 # ─── Proxy & Throttling Setup (Instagram + YouTube) ──────────────────────────
@@ -800,9 +861,13 @@ REDDIT_URL_PATTERN = re.compile(
 
 LINKEDIN_URL_PATTERN = re.compile(
     # Post URLs that can carry video only: /posts/<slug>-activity-<id> and
-    # /feed/update/urn:li:activity:<id>. Deliberately NOT matched: profiles
-    # (/in/), companies, jobs, Pulse articles, or lnkd.in short links.
-    r'(?:https?://)?(?:www\.)?linkedin\.com/(?:posts/[^\s?#]*activity-\d{10,}[^\s?#]*|feed/update/urn:li:activity:\d{10,})',
+    # /feed/update/urn:li:activity:<id>, plus lnkd.in short links (the form
+    # LinkedIn's app share hands out — resolved to the real post URL before
+    # download; see resolve_linkedin_short_link in downloaders.py).
+    # Deliberately NOT matched: profiles (/in/), companies, jobs, Pulse
+    # articles, or lnkd.in links with no path segment.
+    r'(?:https?://)?(?:www\.)?linkedin\.com/(?:posts/[^\s?#]*activity-\d{10,}[^\s?#]*|feed/update/urn:li:activity:\d{10,})'
+    r'|(?:https?://)?(?:www\.)?lnkd\.in/(?:p/[A-Za-z0-9_-]+|[A-Za-z0-9_-]{2,})',
     re.IGNORECASE
 )
 
@@ -855,14 +920,21 @@ _RESTRICTED_MEDIA_ERROR_MARKERS = (
     "age-restricted", "age restricted", "private video", "content isn't available",
 )
 
-def classify_media_error(error_str: str) -> str:
-    """Map a raw download error into a clean user-friendly message, without leaking raw stack traces."""
+def classify_media_error(error_str: str, platform: str | None = None, cookies_configured: bool = False) -> str:
+    """Map a raw download error into a clean user-friendly message, without leaking raw stack traces.
+
+    For LinkedIn login-wall blocks, when no LinkedIn cookies are configured,
+    the message adds one line saying cookies may help.
+    """
     low = error_str.lower()
     # LinkedIn login wall / datacenter block (HTTP 999). Checked first:
     # the restricted markers below also catch "login required"/"sign in",
     # but for LinkedIn the cause is a block, not missing content.
     if "999" in low or ("linkedin" in low and any(m in low for m in ("login", "sign in", "log in", "member"))):
-        return "LinkedIn blocked this request (login wall / HTTP 999) — the post may need a LinkedIn login, or LinkedIn refused the server's request. Try a public post, or try again later."
+        msg = "LinkedIn blocked this request (login wall / HTTP 999) — the post may need a LinkedIn login, or LinkedIn refused the server's request. Try a public post, or try again later."
+        if ("linkedin" in low or (platform or "").lower() == "linkedin") and not cookies_configured:
+            msg += " Adding LinkedIn cookies (LINKEDIN_COOKIES) may help — LinkedIn often requires a login for video."
+        return msg
     if any(marker in low for marker in _RESTRICTED_MEDIA_ERROR_MARKERS):
         return "This content isn't available due to restrictions (private, age-restricted, or region-locked)."
     if "429" in low or "too many requests" in low:

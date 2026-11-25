@@ -1804,6 +1804,24 @@ def _is_bot_message(msg, context) -> bool:
     return bool(bot_id) and getattr(sender, "id", None) == bot_id
 
 
+def _is_media_message(msg) -> bool:
+    """True when a Telegram message carries media: photo, video, audio,
+    document, animation, video note, voice note, or sticker. A caption
+    does not make it text — a captioned photo/video is still media."""
+    if not msg:
+        return False
+    return bool(
+        getattr(msg, "photo", None)
+        or getattr(msg, "video", None)
+        or getattr(msg, "audio", None)
+        or getattr(msg, "document", None)
+        or getattr(msg, "animation", None)
+        or getattr(msg, "video_note", None)
+        or getattr(msg, "voice", None)
+        or getattr(msg, "sticker", None)
+    )
+
+
 # ─── GIF Command (/gif) ──────────────────────────────────────────────────────
 
 # Cache of last link or video sent in DM per chat (chat_id -> (url, video_obj, timestamp))
@@ -2262,10 +2280,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Translation is explicit only, via /tr (see tr_command).
     Plain text does trigger, in order: (1) the "redster ..." keyword
     (quote or chat), (2) an @mention of the bot, (3) a reply to one of
-    the bot's own messages — all via chat_agent (see _do_chat_reply) —
-    and (4) a bare music request ("send me the song hello by adele")
-    or a bare image request ("send me pictures of cats"), routed to
-    music / images by _do_chat_reply. Anything else only tracks URLs sent
+    the bot's own PLAIN-TEXT messages — all via chat_agent (see
+    _do_chat_reply) — and (4) a bare music request ("send me the song
+    hello by adele") or a bare image request ("send me pictures of
+    cats"), routed to music / images by _do_chat_reply. A reply to a
+    media message the bot sent (photo/video/song/sticker) does NOT
+    auto-chat: users reply to those to tag friends or talk among
+    themselves (2026-11-25). Anything else only tracks URLs sent
     in a private chat, so /gif can reuse the last DM link or video
     (via _track_dm_media / handle_dm_media_tracker).
     """
@@ -2311,9 +2332,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _do_chat_reply(update, context, mention_text, msg=update.message, allow_broad_image=True)
         return
 
-    # 3. Replying to one of the bot's own messages chats with the text.
+    # 3. Replying to one of the bot's own messages chats with the text —
+    #    UNLESS the bot message is media. Users reply to a photo/video/
+    #    song/sticker the bot sent to tag a friend or chat among
+    #    themselves; the bot jumping in with the AI there is noise, so
+    #    those replies stay silent (2026-11-25, Red: "only stop the
+    #    auto-reply"). Replies to the bot's plain-text messages still
+    #    chat, and "redster ..." / @mentions (rules 1–2 above) still
+    #    chat even on media replies.
     replied = update.message.reply_to_message
-    if replied and _is_bot_message(replied, context):
+    if replied and _is_bot_message(replied, context) and not _is_media_message(replied):
         await _do_chat_reply(update, context, text, msg=update.message, allow_broad_image=True)
         return
 

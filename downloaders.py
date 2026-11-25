@@ -20,6 +20,7 @@ import time
 import asyncio
 import tempfile
 import threading
+import subprocess
 import uuid
 from typing import Optional
 import ipaddress
@@ -581,6 +582,69 @@ async def download_youtube_via_relay(url: str, output_dir: str, quality=1080) ->
         }
 
 
+# MP3 bitrate for audio downloads (2026-11-25: Red asked for 320 kbps —
+# the ~130 kbps raw YouTube stream sounded bad). YouTube's own audio
+# streams top out around 160 kbps Opus / 128 kbps AAC, so 320 kbps
+# cannot add detail that isn't in the source — but it guarantees a
+# genuine MP3 file, which matters because the pytubefix fast path just
+# saves YouTube's raw stream with an .mp3 filename and never re-encodes.
+MP3_BITRATE_KBPS = 320
+# Hard cap on the re-encode step: the whole download already has a
+# 300s outer cap, and libmp3lame on a 0.1 vCPU box is slow — a re-encode
+# that would blow the budget must fail fast and fall back to the raw
+# file instead of failing the whole download.
+_MP3_REENCODE_TIMEOUT_SECONDS = 120
+
+
+def _reencode_to_mp3_320(src_path: str) -> Optional[str]:
+    """Re-encode an audio file to a genuine 320 kbps MP3 with ffmpeg.
+
+    Returns the path of the new file, or None when ffmpeg is missing
+    or the re-encode fails for any reason — the caller then keeps the
+    raw downloaded file, so the send never fails because of the
+    re-encode. When a new file is returned the caller owns deleting
+    the source file. Runs synchronously: callers run it inside the
+    download executor thread, never on the event loop.
+    """
+    if not src_path or not os.path.exists(src_path):
+        return None
+    dst_path = os.path.splitext(src_path)[0] + "_320.mp3"
+    if os.path.abspath(dst_path) == os.path.abspath(src_path):
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", src_path,
+             "-vn", "-c:a", "libmp3lame", "-b:a", f"{MP3_BITRATE_KBPS}k",
+             dst_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=_MP3_REENCODE_TIMEOUT_SECONDS, check=False,
+        )
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found — sending audio without 320 kbps re-encode")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg 320 kbps re-encode timed out — sending original audio file")
+        _remove_quietly(dst_path)
+        return None
+    except Exception as e:
+        logger.warning(f"ffmpeg 320 kbps re-encode failed ({e}) — sending original audio file")
+        _remove_quietly(dst_path)
+        return None
+    if proc.returncode != 0 or not os.path.exists(dst_path) or os.path.getsize(dst_path) == 0:
+        logger.warning("ffmpeg 320 kbps re-encode failed — sending original audio file")
+        _remove_quietly(dst_path)
+        return None
+    return dst_path
+
+
+def _remove_quietly(path: str) -> None:
+    """Best-effort file removal, never raising."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> dict:
     """Download a YouTube video directly on the local host with optimized mobile clients."""
     filename = f"{uuid.uuid4().hex}"
@@ -665,6 +729,13 @@ async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> di
                     if stream:
                         fp = stream.download(output_path=output_dir, filename=f"{filename}.mp3")
                         if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                            # The raw stream is Opus/AAC merely named .mp3 —
+                            # re-encode it to a genuine 320 kbps MP3. If the
+                            # re-encode fails, send the raw file instead.
+                            encoded = _reencode_to_mp3_320(fp)
+                            if encoded:
+                                _remove_quietly(fp)
+                                fp = encoded
                             return {
                                 'filepath': fp,
                                 'title': yt.title or 'Audio',
@@ -685,7 +756,7 @@ async def _download_youtube_local(url: str, output_dir: str, quality=1080) -> di
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
-                        'preferredquality': '192',
+                        'preferredquality': '320',
                     }],
                     'concurrent_fragment_downloads': _concurrent_frags,
                     'socket_timeout': _sock_timeout,

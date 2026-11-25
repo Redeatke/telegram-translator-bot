@@ -37,6 +37,12 @@ ADMIN_USER_IDS=123456789,987654321
 # YouTube OAuth (see step 3 below — recommended for reliable downloads)
 YOUTUBE_OAUTH_DATA=<base64 token from setup_oauth.py>
 
+# YouTube Data API v3 key (optional — enables reliable song search via /song)
+# Without it, song search uses yt-dlp, which YouTube blocks from datacenter IPs.
+# Create one at console.cloud.google.com (enable YouTube Data API v3, then
+# Credentials -> Create credentials -> API key). Free quota: ~100 searches/day.
+YOUTUBE_API_KEY=<your-youtube-data-api-v3-key>
+
 # Auto-pinger (optional — keeps free-tier hosts awake)
 PING_URL=https://your-service-url.onrender.com
 PING_INTERVAL=60

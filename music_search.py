@@ -15,12 +15,23 @@ Limits: 1 song per request, top result only, max 10 minutes
 (MAX_SONG_SECONDS=600, enforced at the search stage so a long video
 is never downloaded), results cached 10 minutes. No new dependency:
 yt-dlp is already in requirements.txt (imported lazily, only when a
-real search runs, so this module stays importable without it).
-Never raises for user input — search failures return None.
+real search runs, so this module stays importable without it) and
+httpx is already used by web_search.py (imported lazily here too).
+
+Search order (2026-11-25): when YOUTUBE_API_KEY is set, the
+YouTube Data API v3 is tried FIRST — yt-dlp ytsearch always goes
+out as the web client, which YouTube challenges from datacenter
+IPs, so no player-client setting can fix it; the official API is
+immune to that wall. When the key is absent, or the API fails or
+finds nothing, search falls back to yt-dlp ytsearch (the caller's
+web fallback is the last resort). Never raises for user input —
+search failures return None or {"error": "search_unavailable"}.
 """
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import re
 import threading
@@ -28,6 +39,8 @@ import time
 import unicodedata
 from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+
+logger = logging.getLogger(__name__)
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 MAX_SONG_SECONDS = 600  # 10 minutes — longer results are rejected at search
@@ -38,6 +51,16 @@ SEARCH_TIMEOUT_SECONDS = 30  # yt-dlp search cap — a hung search must
 CACHE_TTL_SECONDS = 600  # 10 minutes
 CACHE_MAX_ENTRIES = 100
 DEFAULT_SEARCH_PREFIX = "ytsearch1:"
+
+# YouTube Data API v3 (official search, tried first when a key is
+# configured). search.list costs 100 quota units, videos.list 1 —
+# 101 per song search out of the free 10,000/day quota (~100
+# searches/day). 10s per call, 25s for the whole API attempt, so a
+# hung API can never stall the user longer than the yt-dlp search
+# would have on its own.
+YOUTUBE_DATA_API_BASE = "https://www.googleapis.com/youtube/v3"
+YOUTUBE_API_TIMEOUT_SECONDS = 10
+YOUTUBE_API_MAX_TOTAL_SECONDS = 25
 
 # Whole words that mark a request as music. "play" is broad-only (see
 # _parse_broad): in plain chat "play football" must never misfire.
@@ -421,41 +444,223 @@ def parse_search_result(info: Optional[dict]) -> Optional[Dict[str, object]]:
     }
 
 
-def _default_search(query: str) -> Optional[dict]:
+def _default_search(query: str):
     """Run yt-dlp ytsearch1 for `query`, return the raw info dict.
 
     yt-dlp is imported lazily so this module stays importable without
     it. Runs in an executor (blocking call) — the caller is async.
-    Returns None on any failure. Never raises.
+    Returns None ONLY when the search ran and found nothing.
+    Returns {"error": "search_unavailable"} when yt-dlp is missing
+    or raised. Previously every failure collapsed into None, which
+    made the caller's "YouTube search isn't answering" message
+    unreachable (found 2026-11-25: a raised search and an empty
+    search looked identical). Never raises.
     """
     try:
         import yt_dlp
     except ImportError:
-        return None
+        return {"error": "search_unavailable"}
     try:
         with yt_dlp.YoutubeDL(_youtube_search_opts()) as ydl:
             return ydl.extract_info(DEFAULT_SEARCH_PREFIX + query, download=False)
     except Exception:
+        return {"error": "search_unavailable"}
+
+
+def _get_youtube_api_key() -> str:
+    """Read the YouTube Data API v3 key from config (preferred,
+    mirroring how YOUTUBE_COOKIES_FILE is read) or the environment.
+    Returns "" when unset. The value is never logged."""
+    try:
+        from config import YOUTUBE_API_KEY
+
+        if YOUTUBE_API_KEY:
+            return str(YOUTUBE_API_KEY).strip()
+    except Exception:
+        pass
+    return (os.getenv("YOUTUBE_API_KEY") or "").strip()
+
+
+_ISO8601_DURATION_RE = re.compile(
+    r"^P(?:(?P<days>\d+)D)?"
+    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?$"
+)
+
+
+def _parse_iso8601_duration(value) -> Optional[int]:
+    """Parse an ISO 8601 duration (YouTube contentDetails.duration,
+    e.g. PT3M43S, PT1H2M3S) into seconds, or None when unparsable
+    or carrying no time at all ("PT0S" counts as unknown — the
+    downloader's own caps are the backstop then). Pure/testable."""
+    if not value or not isinstance(value, str):
         return None
+    m = _ISO8601_DURATION_RE.match(value.strip())
+    if not m:
+        return None
+    try:
+        total = (
+            int(m.group("days") or 0) * 86400
+            + int(m.group("hours") or 0) * 3600
+            + int(m.group("minutes") or 0) * 60
+            + float(m.group("seconds") or 0)
+        )
+    except (TypeError, ValueError):
+        return None
+    return int(total) if total > 0 else None
+
+
+async def _default_api_get(url: str, params: dict, timeout: float):
+    """Default Data API fetcher: one httpx AsyncClient per call (low
+    volume), mirroring web_search._default_get. `params` go in the
+    query string, which is how the YouTube Data API takes its key."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        return await client.get(url, params=params)
+
+
+async def _youtube_api_duration(video_id: str, get, key: str) -> Optional[int]:
+    """videos.list contentDetails for one video id (1 quota unit).
+
+    Returns the duration in seconds, or None when the call fails —
+    the caller then returns the result without a duration and lets
+    the downloader enforce its caps (same posture as
+    probe_video_duration). Never raises. Never logs the key."""
+    try:
+        resp = await get(
+            f"{YOUTUBE_DATA_API_BASE}/videos",
+            {"part": "contentDetails", "id": video_id, "key": key},
+            YOUTUBE_API_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.debug("YouTube Data API videos.list failed: %s", type(e).__name__)
+        return None
+    if getattr(resp, "status_code", 200) != 200:
+        logger.debug(
+            "YouTube Data API videos.list returned HTTP %s",
+            getattr(resp, "status_code", "?"),
+        )
+        return None
+    try:
+        payload = resp.json() if hasattr(resp, "json") else json.loads(resp.text)
+    except Exception:
+        return None
+    try:
+        items = (payload or {}).get("items") or []
+        if not items or not isinstance(items[0], dict):
+            return None
+        raw = ((items[0].get("contentDetails") or {}).get("duration") or "")
+        return _parse_iso8601_duration(raw)
+    except Exception:
+        return None
+
+
+async def _search_youtube_api(
+    query: str,
+    _get: Optional[Callable] = None,
+    _api_key: Optional[str] = None,
+) -> Optional[Dict[str, object]]:
+    """Search YouTube via the Data API v3 (official search endpoint).
+
+    Returns the top result {video_id, title, artist,
+    duration_seconds, url}, or {"error": "too_long", ...} when the
+    top video exceeds MAX_SONG_SECONDS. Returns None when the API
+    found nothing (zero items) OR when the API call itself failed
+    (non-200, timeout, malformed body) — the caller falls through
+    to yt-dlp in both cases, silently, so no API-specific error
+    ever reaches the user. The key value is never logged. When the
+    key is absent (no _api_key and none configured) the API is not
+    called at all. Never raises.
+    """
+    key = _api_key if _api_key is not None else _get_youtube_api_key()
+    if not key:
+        return None
+    get = _get or _default_api_get
+    try:
+        resp = await get(
+            f"{YOUTUBE_DATA_API_BASE}/search",
+            {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": 1,
+                "key": key,
+            },
+            YOUTUBE_API_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.debug("YouTube Data API search request failed: %s", type(e).__name__)
+        return None
+    if getattr(resp, "status_code", 200) != 200:
+        logger.debug(
+            "YouTube Data API search returned HTTP %s; falling back to yt-dlp",
+            getattr(resp, "status_code", "?"),
+        )
+        return None
+    try:
+        payload = resp.json() if hasattr(resp, "json") else json.loads(resp.text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    items = payload.get("items") or []
+    if not items or not isinstance(items[0], dict):
+        return None
+    top = items[0]
+    video_id = ""
+    if isinstance(top.get("id"), dict):
+        video_id = str(top["id"].get("videoId") or "").strip()
+    if not _VIDEO_ID_RE.match(video_id):
+        return None
+    snippet = top.get("snippet") or {}
+    title = str(snippet.get("title") or "Unknown").strip() or "Unknown"
+    artist = str(snippet.get("channelTitle") or "").strip()
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    duration = await _youtube_api_duration(video_id, get=get, key=key)
+    if duration and duration > MAX_SONG_SECONDS:
+        return {
+            "error": "too_long",
+            "title": title,
+            "duration_seconds": duration,
+        }
+    return {
+        "video_id": video_id,
+        "title": title,
+        "artist": artist,
+        "duration_seconds": duration or 0,
+        "url": url,
+    }
 
 
 async def search_song(
     query: str,
     _search: Optional[Callable[[str], Optional[dict]]] = None,
+    _api_get: Optional[Callable] = None,
+    _api_key: Optional[str] = None,
 ) -> Optional[Dict[str, object]]:
     """Search YouTube for `query`, return the top result or None.
+
+    Search order: (1) YouTube Data API v3 when YOUTUBE_API_KEY is
+    set (or _api_key is passed) — the official endpoint, immune to
+    the datacenter-IP wall that blocks yt-dlp ytsearch; (2) yt-dlp
+    ytsearch1; the caller tries the web fallback after this. Any
+    Data API failure or zero items falls through to yt-dlp silently.
 
     Result: {video_id, title, artist, duration_seconds, url}, or
     {"error": "too_long", "title", "duration_seconds"} when the top
     result exceeds MAX_SONG_SECONDS (10 min) — the caller surfaces
-    that instead of downloading. A failed search (yt-dlp raised, or
-    the 30s timeout hit — the live symptom on a blocked datacenter
-    IP) returns {"error": "search_unavailable"} instead of None, so
-    the caller can tell "YouTube search isn't answering" apart from
-    "no such song": None now means only "the search ran and found
-    nothing". Results are cached 10 minutes (failures are not cached).
-    `_search` is an injectable raw-info fetcher for tests; the default
-    runs yt-dlp. Never raises.
+    that instead of downloading. A failed yt-dlp search (yt-dlp
+    raised, yt-dlp missing, or the 30s timeout hit) returns
+    {"error": "search_unavailable"} instead of None, so the caller
+    can tell "YouTube search isn't answering" apart from "no such
+    song": None now means only "the search ran and found nothing"
+    (previously _default_search swallowed every yt-dlp exception
+    into None, so search_unavailable was only reachable via the
+    timeout — fixed 2026-11-25). Results are cached 10 minutes
+    (failures are not cached). `_search` is an injectable raw-info
+    fetcher for tests; `_api_get` is an injectable Data API fetcher
+    (url, params, timeout) -> response; `_api_key` overrides the
+    configured key (None = read it, "" = no key). Never raises.
     """
     if not query or not isinstance(query, str) or not query.strip():
         return None
@@ -464,6 +669,22 @@ async def search_song(
     if cached is not None:
         return cached
 
+    # 1. YouTube Data API v3 first, when a key is configured. Any
+    # failure or zero items falls through to yt-dlp below.
+    api_key = _api_key if _api_key is not None else _get_youtube_api_key()
+    if api_key:
+        try:
+            api_result = await asyncio.wait_for(
+                _search_youtube_api(query, _get=_api_get, _api_key=api_key),
+                timeout=YOUTUBE_API_MAX_TOTAL_SECONDS,
+            )
+        except Exception:
+            api_result = None
+        if api_result is not None:
+            _cache_put(query, api_result)
+            return api_result
+
+    # 2. yt-dlp ytsearch1 (top result only).
     search = _search or _default_search
     try:
         loop = asyncio.get_running_loop()
@@ -477,6 +698,11 @@ async def search_song(
             timeout=SEARCH_TIMEOUT_SECONDS,
         )
     except Exception:
+        return {"error": "search_unavailable"}
+    # _default_search returns the search_unavailable sentinel (not
+    # None) when yt-dlp raised — a failed search must stay
+    # distinguishable from "ran, found nothing".
+    if isinstance(info, dict) and info.get("error") == "search_unavailable":
         return {"error": "search_unavailable"}
     try:
         result = parse_search_result(info)

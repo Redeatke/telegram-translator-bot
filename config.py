@@ -163,6 +163,22 @@ if _config_channel_id_raw:
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
+# YouTube Data API v3 key (optional — enables reliable song search).
+# Without it, /song search uses yt-dlp ytsearch, which YouTube
+# challenges from datacenter IPs (verified 2026-11-25: ytsearch
+# always goes out as the web client, so no player-client setting
+# can shield it, and the DuckDuckGo fallback is challenge-blocked
+# from the same IPs). With a key set, song search tries the Data
+# API first (search.list, 100 quota units per search out of the
+# free 10,000/day — about 100 song searches/day) and falls back to
+# yt-dlp when the API fails or finds nothing. Create a key at
+# console.cloud.google.com (enable "YouTube Data API v3", then
+# Credentials -> Create credentials -> API key) and set it as
+# YOUTUBE_API_KEY. The value is never logged.
+YOUTUBE_API_KEY = (os.getenv("YOUTUBE_API_KEY") or "").strip()
+if YOUTUBE_API_KEY:
+    logger.info("YouTube Data API key configured — song search will use the Data API first.")
+
 AUTO_PING_ENABLED = os.getenv("AUTO_PING_ENABLED", "True").lower() == "true"
 PING_INTERVAL = float(os.getenv("PING_INTERVAL", "60.0"))
 PING_URL = os.getenv("PING_URL", "")

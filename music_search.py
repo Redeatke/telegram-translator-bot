@@ -21,11 +21,13 @@ Never raises for user input — search failures return None.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import threading
 import time
 import unicodedata
 from typing import Callable, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 MAX_SONG_SECONDS = 600  # 10 minutes — longer results are rejected at search
@@ -125,6 +127,14 @@ def _clean_query(query: str) -> str:
         )
         if m:
             q = m.group(1).strip()
+            low = q.lower()
+        # Trailing music word: "radioactive song" / "blinding lights
+        # mp3" -> the word is the request type, not part of the title.
+        # Only when another word precedes it, so a bare "song" query
+        # is left alone.
+        m2 = re.match(r"^(.+?)\s+(?:songs?|music|mp3|audio|tracks?|tunes?)$", q, re.IGNORECASE)
+        if m2:
+            q = m2.group(1).strip()
             low = q.lower()
         if low.endswith(" please"):
             q = q[: -len(" please")].strip()
@@ -328,6 +338,43 @@ def clear_music_cache() -> None:
 
 
 # ─── YouTube search (yt-dlp, top result only) ────────────────────────────────
+def _youtube_search_opts() -> dict:
+    """yt-dlp opts for song search AND direct-URL probing.
+
+    The search call used to run with bare yt-dlp defaults — no player
+    client, no cookies, no headers. The download path
+    (downloaders._make_audio_opts) already uses the Android/iOS player
+    clients, because the default web client is the one YouTube
+    challenges most from datacenter IPs, and the PO-token provider
+    installed in the Dockerfile is disabled process-wide
+    (downloaders.py stubs yt_dlp.plugins.load_plugins out: bgutil
+    spawns deno/node and stalls/OOMs the 0.1 vCPU / 256 MB box), so
+    search cannot rely on it either. Match the downloader's first
+    strategy here (Android/iOS clients + YouTube cookies when set)
+    so search is no longer the weakest link.
+    """
+    opts: dict = {
+        "quiet": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "no_warnings": True,
+        "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        "socket_timeout": 10,
+        "retries": 1,
+        "extractor_retries": 0,
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+    }
+    try:
+        from config import YOUTUBE_COOKIES_FILE
+
+        if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
+            opts["cookiefile"] = YOUTUBE_COOKIES_FILE
+    except Exception:
+        pass
+    return opts
+
+
 def parse_search_result(info: Optional[dict]) -> Optional[Dict[str, object]]:
     """Parse a yt-dlp search result (extract_info of ytsearch1:...)
     into {video_id, title, artist, duration_seconds, url}.
@@ -386,14 +433,7 @@ def _default_search(query: str) -> Optional[dict]:
     except ImportError:
         return None
     try:
-        opts = {
-            "quiet": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "extract_flat": False,
-            "no_warnings": True,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(_youtube_search_opts()) as ydl:
             return ydl.extract_info(DEFAULT_SEARCH_PREFIX + query, download=False)
     except Exception:
         return None
@@ -408,9 +448,14 @@ async def search_song(
     Result: {video_id, title, artist, duration_seconds, url}, or
     {"error": "too_long", "title", "duration_seconds"} when the top
     result exceeds MAX_SONG_SECONDS (10 min) — the caller surfaces
-    that instead of downloading. Results are cached 10 minutes.
+    that instead of downloading. A failed search (yt-dlp raised, or
+    the 30s timeout hit — the live symptom on a blocked datacenter
+    IP) returns {"error": "search_unavailable"} instead of None, so
+    the caller can tell "YouTube search isn't answering" apart from
+    "no such song": None now means only "the search ran and found
+    nothing". Results are cached 10 minutes (failures are not cached).
     `_search` is an injectable raw-info fetcher for tests; the default
-    runs yt-dlp. Never raises — failures return None.
+    runs yt-dlp. Never raises.
     """
     if not query or not isinstance(query, str) or not query.strip():
         return None
@@ -425,19 +470,131 @@ async def search_song(
         # A hung yt-dlp search (blocked/slow YouTube from the host's
         # IP) must time out instead of leaving the user stuck at
         # "Looking for…" forever — wait_for raises TimeoutError, which
-        # is caught below and returns None like any other failure.
+        # is caught below and reported as search_unavailable.
         # (The executor thread itself keeps running; only the wait ends.)
         info = await asyncio.wait_for(
             loop.run_in_executor(None, search, query),
             timeout=SEARCH_TIMEOUT_SECONDS,
         )
     except Exception:
-        return None
+        return {"error": "search_unavailable"}
     try:
         result = parse_search_result(info)
     except Exception:
-        return None
+        return {"error": "search_unavailable"}
     if result is None:
         return None
     _cache_put(query, result)
     return result
+
+
+# ─── Web fallback: resolve the song through a web search ─────────────────────
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+}
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _extract_youtube_video_id(url: str) -> Optional[str]:
+    """Return the 11-char video id of a youtube.com/watch or youtu.be
+    URL, or None. Only YouTube links are ever accepted — a web search
+    result pointing anywhere else (Spotify, lyrics sites, ...) is
+    rejected, never downloaded."""
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower().split(":")[0]
+    if host in _YOUTUBE_HOSTS:
+        vid = (parse_qs(parsed.query).get("v") or [None])[0]
+        return vid if vid and _VIDEO_ID_RE.match(vid) else None
+    if host in ("youtu.be", "www.youtu.be"):
+        vid = parsed.path.strip("/").split("/")[0]
+        return vid if _VIDEO_ID_RE.match(vid) else None
+    return None
+
+
+async def find_song_via_web(
+    query: str,
+    _search_web: Optional[Callable] = None,
+) -> Optional[str]:
+    """Second chance when yt-dlp search fails: web-search for the
+    song's YouTube video and return its watch URL, or None.
+
+    Uses web_search.search_web (DuckDuckGo HTML, Wikipedia fallback)
+    with a `site:youtube.com` query and takes the first result that
+    is a real YouTube watch/shorts link. Never raises. Returns None
+    when the web search itself fails — the caller then reports the
+    search as unavailable instead of pretending the song doesn't
+    exist.
+    """
+    if not query or not isinstance(query, str) or not query.strip():
+        return None
+    try:
+        from web_search import search_web
+    except ImportError:
+        return None
+    search = _search_web or search_web
+    try:
+        results = await search(f"site:youtube.com {query.strip()}", max_results=5)
+    except Exception:
+        return None
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        vid = _extract_youtube_video_id(str(item.get("url") or ""))
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+    return None
+
+
+async def probe_video_duration(
+    url: str,
+    _extract: Optional[Callable[[str], Optional[dict]]] = None,
+) -> Optional[int]:
+    """Return the duration in seconds of a direct YouTube URL, or None
+    when it cannot be determined (probe failed/blocked — the caller
+    then lets the downloader try anyway, since it enforces its own
+    30-minute cap and size limits as a backstop).
+
+    Used on the web-fallback path so the 10-minute song cap still
+    applies there: the yt-dlp search stage normally rejects long
+    videos before any download, and a web result has no duration
+    attached. `_extract` is an injectable info fetcher for tests.
+    Never raises.
+    """
+    if not url or not isinstance(url, str) or not url.strip():
+        return None
+
+    def _default_extract(u: str) -> Optional[dict]:
+        try:
+            import yt_dlp
+        except ImportError:
+            return None
+        try:
+            with yt_dlp.YoutubeDL(_youtube_search_opts()) as ydl:
+                return ydl.extract_info(u, download=False)
+        except Exception:
+            return None
+
+    extract = _extract or _default_extract
+    try:
+        loop = asyncio.get_running_loop()
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, extract, url.strip()),
+            timeout=15,
+        )
+    except Exception:
+        return None
+    if not info or not isinstance(info, dict):
+        return None
+    try:
+        duration = int(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        return None
+    return duration or None

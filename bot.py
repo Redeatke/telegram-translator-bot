@@ -1526,17 +1526,8 @@ async def _handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE,
         result = await music_search.search_song(query)
     except Exception as e:
         logger.error(f"Song search failed: {type(e).__name__}: {e}")
-        result = None
-    if result is None:
-        try:
-            await status_msg.edit_text(
-                f"I couldn't find “{html.escape(query)}” as a song right now — try the artist and song name, or /song &lt;song&gt; by &lt;artist&gt;.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        return
-    if result.get("error") == "too_long":
+        result = {"error": "search_unavailable"}
+    if isinstance(result, dict) and result.get("error") == "too_long":
         mins = int(result.get("duration_seconds") or 0) // 60
         try:
             await status_msg.edit_text(
@@ -1550,16 +1541,69 @@ async def _handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE,
             pass
         return
 
-    url = str(result.get("url") or "").strip()
+    # search_unavailable means yt-dlp search raised or timed out — the
+    # live failure on a blocked datacenter IP — NOT "no such song".
+    # None means the search ran and found nothing. Both get a second
+    # chance through a web search for the YouTube video; only when
+    # that fails too do we answer, and the message says which it was.
+    search_unavailable = isinstance(result, dict) and result.get("error") == "search_unavailable"
+    found_but_no_link = isinstance(result, dict) and bool(result.get("video_id")) and not str(result.get("url") or "").strip()
+    url = str((result or {}).get("url") or "").strip() if isinstance(result, dict) else ""
     if not url:
         try:
-            await status_msg.edit_text(
-                fmt_error("I found the song but couldn't get a link for it. Please try again."),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        return
+            url = (await music_search.find_song_via_web(query) or "").strip()
+        except Exception as e:
+            logger.error(f"Song web fallback failed: {type(e).__name__}: {e}")
+            url = ""
+        if url:
+            # The 10-minute cap still applies on the fallback path:
+            # yt-dlp search normally rejects long videos before any
+            # download, and a web result carries no duration. When the
+            # probe itself is blocked we let the downloader try — it
+            # enforces its own 30-minute cap and size limits.
+            try:
+                duration = await music_search.probe_video_duration(url)
+            except Exception:
+                duration = None
+            if duration and duration > music_search.MAX_SONG_SECONDS:
+                mins = int(duration) // 60
+                try:
+                    await status_msg.edit_text(
+                        fmt_warning(
+                            f"“{html.escape(query)}” is too long ({mins} min). "
+                            f"I can only send songs up to 10 minutes."
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                return
+        else:
+            if found_but_no_link:
+                try:
+                    await status_msg.edit_text(
+                        fmt_error("I found the song but couldn't get a link for it. Please try again."),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            elif search_unavailable:
+                try:
+                    await status_msg.edit_text(
+                        f"YouTube search isn't answering right now, so I couldn't look up “{html.escape(query)}” — please try again in a bit.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await status_msg.edit_text(
+                        f"I couldn't find “{html.escape(query)}” as a song right now — try the artist and song name, or /song &lt;song&gt; by &lt;artist&gt;.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            return
 
     # The existing downloader owns the rest: queue slot, download,
     # size/duration checks, upload as audio, status updates and its
@@ -1595,16 +1639,32 @@ async def song_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         query = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
 
     if not query:
-        await msg.reply_text(
-            fmt_card("🎵 /song — Send a song",
-                "  Send a song as an MP3 audio file:\n"
-                "  <code>/song pound the alarm by nicki minaj</code>\n"
-                "  Or just say <code>redster send me pound the alarm by nicki minaj</code>.\n"
-                "  Or reply to a message with /song to send that song.\n"
-                "  1 song per request, max 10 minutes."
-            ),
-            parse_mode="HTML",
+        # Bare /song must always answer with usage, never silence: the
+        # reply is retried as plain text if the formatted send fails
+        # (e.g. the box is saturated), so a failed send cannot leave
+        # the user with no visible reply.
+        usage_html = fmt_card("🎵 /song — Send a song",
+            "  Send a song as an MP3 audio file:\n"
+            "  <code>/song pound the alarm by nicki minaj</code>\n"
+            "  Or just say <code>redster send me pound the alarm by nicki minaj</code>.\n"
+            "  Or reply to a message with /song to send that song.\n"
+            "  1 song per request, max 10 minutes."
         )
+        usage_plain = (
+            "🎵 /song — Send a song\n"
+            "Send a song as an MP3 audio file:\n"
+            "/song pound the alarm by nicki minaj\n"
+            "Or just say: redster send me pound the alarm by nicki minaj\n"
+            "Or reply to a message with /song to send that song.\n"
+            "1 song per request, max 10 minutes."
+        )
+        try:
+            await msg.reply_text(usage_html, parse_mode="HTML")
+        except Exception:
+            try:
+                await msg.reply_text(usage_plain)
+            except Exception:
+                logger.error("Bare /song usage reply failed twice")
         return
 
     await _handle_music(update, context, query, msg=msg)

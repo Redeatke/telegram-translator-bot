@@ -498,6 +498,7 @@ DEFAULT_CHAT_CONFIG = {
     "instagram": True,
     "threads": True,
     "reddit": True,
+    "linkedin": True,
     "auto_download": True,
     "chat": False,
 }
@@ -797,6 +798,14 @@ REDDIT_URL_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+LINKEDIN_URL_PATTERN = re.compile(
+    # Post URLs that can carry video only: /posts/<slug>-activity-<id> and
+    # /feed/update/urn:li:activity:<id>. Deliberately NOT matched: profiles
+    # (/in/), companies, jobs, Pulse articles, or lnkd.in short links.
+    r'(?:https?://)?(?:www\.)?linkedin\.com/(?:posts/[^\s?#]*activity-\d{10,}[^\s?#]*|feed/update/urn:li:activity:\d{10,})',
+    re.IGNORECASE
+)
+
 
 # ─── Formatting Helpers ───────────────────────────────────────────────────────
 
@@ -849,6 +858,11 @@ _RESTRICTED_MEDIA_ERROR_MARKERS = (
 def classify_media_error(error_str: str) -> str:
     """Map a raw download error into a clean user-friendly message, without leaking raw stack traces."""
     low = error_str.lower()
+    # LinkedIn login wall / datacenter block (HTTP 999). Checked first:
+    # the restricted markers below also catch "login required"/"sign in",
+    # but for LinkedIn the cause is a block, not missing content.
+    if "999" in low or ("linkedin" in low and any(m in low for m in ("login", "sign in", "log in", "member"))):
+        return "LinkedIn blocked this request (login wall / HTTP 999) — the post may need a LinkedIn login, or LinkedIn refused the server's request. Try a public post, or try again later."
     if any(marker in low for marker in _RESTRICTED_MEDIA_ERROR_MARKERS):
         return "This content isn't available due to restrictions (private, age-restricted, or region-locked)."
     if "429" in low or "too many requests" in low:

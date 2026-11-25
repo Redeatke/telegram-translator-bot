@@ -68,6 +68,7 @@ from config import (
     THREADS_URL_PATTERN,
     THREADS_CANONICAL_PATTERN,
     REDDIT_URL_PATTERN,
+    LINKEDIN_URL_PATTERN,
     TWITTER_URL_PATTERN,
     media_cache,
     url_media_cache,
@@ -2517,6 +2518,42 @@ async def handle_reddit_message(update: Update, context: ContextTypes.DEFAULT_TY
         await send_media_error_dm(context, update.message, canonical_url, "Reddit", str(e))
 
 
+async def handle_linkedin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-detect LinkedIn post links (video posts only, public posts).
+
+    Mirrors handle_tiktok_message: the generic yt-dlp path
+    (download_generic_media via execute_generic_media_download) does the
+    work — LinkedIn ships a yt-dlp extractor (LinkedInIE), so no
+    platform-specific extraction is needed. No cookies are used: public
+    posts only. If LinkedIn answers with its login wall / HTTP 999,
+    classify_media_error says so plainly instead of claiming the video
+    doesn't exist.
+    """
+    if not update.message or not update.message.text: return
+    user = update.effective_user
+    if user and is_maintenance_active_for_user(user.id):
+        await update.message.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML"); return
+
+    text = update.message.text.strip()
+    match = LINKEDIN_URL_PATTERN.search(text)
+    if not match: return
+    if should_skip_message(update.message): return
+    url = match.group(0)
+
+    chat_id = update.effective_chat.id
+    if not is_downloader_enabled(chat_id, "linkedin"):
+        return
+
+    auto_dl = get_download_mode(chat_id)
+    if not auto_dl:
+        short_id = store_pending_download(url, "LinkedIn")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Download LinkedIn Video", callback_data=f"dlmed:{short_id}")]])
+        await update.message.reply_text("💼 <b>LinkedIn Link Detected</b>\n<i>Click below to download:</i>", parse_mode="HTML", reply_markup=kb, reply_to_message_id=update.message.message_id)
+        return
+
+    await execute_generic_media_download(update.message, url, "LinkedIn", context)
+
+
 async def handle_pending_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle download buttons created in button-prompt mode (dlmed:<short_id>)."""
     query = update.callback_query
@@ -2544,7 +2581,7 @@ async def handle_pending_download_button(update: Update, context: ContextTypes.D
         _platform_key = "twitter"
     _chat_id = query.message.chat_id if query.message else None
     if _chat_id is not None and _platform_key in (
-        "youtube", "twitter", "twitch", "tiktok", "instagram", "threads", "reddit",
+        "youtube", "twitter", "twitch", "tiktok", "instagram", "threads", "reddit", "linkedin",
     ) and not is_downloader_enabled(_chat_id, _platform_key):
         await query.message.reply_text(fmt_error(f"{platform} downloads are disabled in this chat."))
         return

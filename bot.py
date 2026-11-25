@@ -91,6 +91,7 @@ from config import (
     INSTAGRAM_URL_PATTERN,
     THREADS_URL_PATTERN,
     REDDIT_URL_PATTERN,
+    LINKEDIN_URL_PATTERN,
 )
 
 from translation import (
@@ -128,6 +129,7 @@ from downloaders import (
     handle_threads_message,
     handle_tiktok_message,
     handle_reddit_message,
+    handle_linkedin_message,
     handle_pending_download_button,
     execute_youtube_download,
     download_generic_media,
@@ -175,6 +177,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"  • redster ... — reply to a message with “redster quote this” to quote it, say “redster hello” to chat, “redster send me a dog with a red ball” for pictures, or “redster send me pound the alarm by nicki minaj” for a song\n"
         f"  • /sticker — make/add stickers from images, stickers, or text\n"
         f"  • /gif — convert video to animated GIF\n"
+        f"  • Paste a video link — downloads from YouTube, TikTok, Instagram, Threads, Reddit, and LinkedIn\n"
         f"  • /target es — switch target language to Spanish\n"
         f"  • /languages — interactive language list\n"
         f"  • /help — full command list"
@@ -209,6 +212,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /q         Quote as sticker (use <code>/q r</code> with reply, <code>/q yellow</code> or <code>/q #FFD700</code> for color)\n"
         f"  redster quote this — quote by keyword: reply to a message and say “redster quote this”, “redster quote this in yellow”, or “redster quote and add a background color of red”\n"
         f"  /gif       Convert video to GIF\n"
+        f"  Links      Paste a video link to download it (YouTube, TikTok, Instagram, Threads, Reddit, LinkedIn)\n"
         f"  /voice     Amharic Voice Assistant\n"
         f"  /status    View your settings\n"
         f"  /report    Report a bug\n"
@@ -2322,6 +2326,7 @@ def build_downloads_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(btn_txt("reddit", "Reddit"), callback_data="dltog:reddit"),
+            InlineKeyboardButton(btn_txt("linkedin", "LinkedIn"), callback_data="dltog:linkedin"),
         ],
         [
             InlineKeyboardButton(mode_txt, callback_data="dltog:mode"),
@@ -2347,6 +2352,7 @@ def build_downloads_text(chat_id: int, chat_title: str = "") -> str:
         ("Instagram", cfg.get("instagram", True)),
         ("Threads", cfg.get("threads", True)),
         ("Reddit", cfg.get("reddit", True)),
+        ("LinkedIn", cfg.get("linkedin", True)),
     ]
 
     status_lines = []
@@ -2437,7 +2443,7 @@ async def handle_downloads_callback(update: Update, context: ContextTypes.DEFAUL
     # arbitrary keys in the persisted chat config.
     _ALLOWED_DL_ACTIONS = {
         "youtube", "twitter", "twitch", "tiktok", "instagram", "threads",
-        "reddit", "mode", "reset", "close", "menu",
+        "reddit", "linkedin", "mode", "reset", "close", "menu",
     }
     if action not in _ALLOWED_DL_ACTIONS:
         await query.answer("❌ Unknown setting.", show_alert=True)
@@ -2499,7 +2505,7 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
                 f"👋 <b>Hello {html.escape(chat.title or 'everyone')}!</b>\n\n"
                 f"I'm your <b>Translator & Media Downloader Bot</b>!\n"
                 f"• Translate with /tr — reply to a message or use /tr &lt;text&gt;\n"
-                f"• Downloads video/media from <b>YouTube, Twitter, Twitch Clips, TikTok, Instagram, Threads, and Reddit</b>\n\n"
+                f"• Downloads video/media from <b>YouTube, Twitter, Twitch Clips, TikTok, Instagram, Threads, Reddit, and LinkedIn</b>\n\n"
                 f"<i>Group Administrators can run /downloads to configure platform permissions.</i>"
             ),
             parse_mode="HTML",
@@ -2704,6 +2710,12 @@ def main() -> None:
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(REDDIT_URL_PATTERN),
         handle_reddit_message,
+        block=False
+    ))
+
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(LINKEDIN_URL_PATTERN),
+        handle_linkedin_message,
         block=False
     ))
 

@@ -141,6 +141,7 @@ from voice_agent import handle_voice_message, voice_command
 import quote_sticker
 import chat_agent
 import redster
+import sticker_library
 import media_search
 import music_search
 import card
@@ -174,7 +175,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"  • /ask &lt;question&gt; — chat with the bot\n"
         f"  • /pic &lt;thing&gt; — send the top 3 pictures of it\n"
         f"  • /song &lt;song&gt; by &lt;artist&gt; — send a song as MP3 (max 10 min)\n"
-        f"  • redster ... — reply to a message with “redster quote this” to quote it, say “redster hello” to chat, “redster send me a dog with a red ball” for pictures, or “redster send me pound the alarm by nicki minaj” for a song\n"
+        f"  • redster ... — reply to a message with “redster quote this” to quote it, say “redster hello” to chat, “redster send me a dog with a red ball” for pictures, or “redster play pound the alarm by nicki minaj” for a song\n"
         f"  • /sticker — make/add stickers from images, stickers, or text\n"
         f"  • /gif — convert video to animated GIF\n"
         f"  • Paste a video link — downloads from YouTube, TikTok, Instagram, Threads, Reddit, and LinkedIn\n"
@@ -209,6 +210,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  /target    Set target language\n"
         f"  /languages Interactive language picker\n"
         f"  /sticker   Create / add sticker (photo, sticker, quote)\n"
+        f"  /savesticker Save a sticker by name (reply to a sticker, e.g. /savesticker angry cat)\n"
+        f"  /mystickers  List your saved stickers\n"
+        f"  redster send '&lt;name&gt;' sticker — send a saved sticker (add x3 for 3 copies, max 5)\n"
         f"  /q         Quote as sticker (use <code>/q r</code> with reply, <code>/q yellow</code> or <code>/q #FFD700</code> for color)\n"
         f"  redster quote this — quote by keyword: reply to a message and say “redster quote this”, “redster quote this in yellow”, or “redster quote and add a background color of red”\n"
         f"  /gif       Convert video to GIF\n"
@@ -1229,6 +1233,260 @@ async def handle_redster_quote(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+# ─── Named sticker library (see sticker_library.py) ────────────────────────
+
+async def handle_sticker_library_message(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict) -> bool:
+    """Handle sticker-library intents from a parsed "redster ..." message.
+
+    Returns True when the message was handled (even when the answer is
+    an error or a hint), False to fall through to _do_chat_reply
+    (music / image / chat). Called from handle_message AFTER the quote
+    intent and BEFORE _do_chat_reply. The library only claims sends
+    that say the word "sticker" ("redster send '<name>' sticker") —
+    a bare "redster send <name>" falls through to music (see
+    sticker_library.py), so there is no clash with song requests.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return False
+
+    remainder = (parsed.get("chat_text") or "").strip()
+    replied = msg.reply_to_message
+    replied_sticker = None
+    if replied is not None and getattr(replied, "sticker", None) is not None:
+        st = replied.sticker
+        replied_sticker = {
+            "file_id": st.file_id,
+            "is_video": bool(getattr(st, "is_video", False)),
+            "is_animated": bool(getattr(st, "is_animated", False)),
+        }
+
+    action = sticker_library.resolve_library_request(user.id, remainder, replied_sticker)
+    if action is None:
+        return False
+
+    kind = action["action"]
+    if kind == "list":
+        await msg.reply_text(
+            sticker_library.library_list_text(user.id), parse_mode="HTML"
+        )
+        return True
+
+    if kind == "delete":
+        if sticker_library.delete_sticker(user.id, action["name"]):
+            await msg.reply_text(
+                f"🗑️ Forgot your sticker “{html.escape(action['name'])}”.",
+                parse_mode="HTML",
+            )
+        else:
+            await msg.reply_text(
+                sticker_library.unknown_name_text(user.id, action["name"]),
+                parse_mode="HTML",
+            )
+        return True
+
+    if kind == "save_invalid":
+        await msg.reply_text(
+            fmt_error("That name doesn't work — use 1–40 letters, numbers, spaces or hyphens."),
+            parse_mode="HTML",
+        )
+        return True
+
+    if kind == "save":
+        if action.get("sticker") is None:
+            await msg.reply_text(
+                "Reply to a sticker with “redster save this as &lt;name&gt;” to save it.",
+                parse_mode="HTML",
+            )
+            return True
+        st = action["sticker"]
+        ok, replaced, err = sticker_library.save_sticker(
+            user.id, action["name"], st["file_id"], st["is_video"], st["is_animated"]
+        )
+        if not ok:
+            if err == "full":
+                await msg.reply_text(
+                    fmt_error("Your sticker library is full (50 stickers). Forget one with “redster forget sticker &lt;name&gt;” first."),
+                    parse_mode="HTML",
+                )
+            else:
+                await msg.reply_text(
+                    fmt_error("That name doesn't work — use 1–40 letters, numbers, spaces or hyphens."),
+                    parse_mode="HTML",
+                )
+            return True
+        verb = "Replaced your old" if replaced else "Saved as"
+        name = html.escape(action["name"])
+        await msg.reply_text(
+            f"✅ {verb} “{name}”. Send it with “redster send '{name}' sticker”.",
+            parse_mode="HTML",
+        )
+        return True
+
+    if kind == "send":
+        entry = sticker_library.get_sticker(user.id, action["name"])
+        if entry is None:
+            await msg.reply_text(
+                sticker_library.unknown_name_text(user.id, action["name"]),
+                parse_mode="HTML",
+            )
+            return True
+        # One "chat"-bucket hit per send request (not per copy), so a
+        # x5 still costs one of the 20/hr.
+        if not check_rate_limit(user.id, "chat"):
+            remaining = rate_limit_remaining(user.id, "chat")
+            await msg.reply_text(
+                fmt_warning(
+                    f"You've hit the hourly chat limit — {remaining} chats left this hour "
+                    f"(20/hr). Please try again in a little while."
+                ),
+                parse_mode="HTML",
+            )
+            return True
+        for _ in range(action["count"]):
+            await msg.reply_sticker(
+                sticker=entry["file_id"], reply_to_message_id=msg.message_id
+            )
+        if action["requested"] > sticker_library.MAX_COPIES:
+            await msg.reply_text("Max is 5, sending 5.", parse_mode="HTML")
+        return True
+
+    if kind == "unknown":
+        await msg.reply_text(
+            sticker_library.unknown_name_text(
+                user.id, action["name"], action.get("suggestion")
+            ),
+            parse_mode="HTML",
+        )
+        return True
+
+    return False
+
+
+async def handle_sticker_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save a sticker from its own caption: "save as <name>" or
+    "this is <name>" (optionally prefixed with "redster"). A sticker
+    with any other caption does nothing — plain stickers stay silent."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not getattr(msg, "sticker", None):
+        return
+    if is_maintenance_active_for_user(user.id):
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+    if should_skip_message(msg):
+        return
+
+    caption = (msg.caption or "").strip()
+    if not caption:
+        return
+    # Strip an optional leading wake word / @mention ("redster save
+    # this as ..." / "@R3dSter_Bot save this as ...").
+    first = caption.split(None, 1)
+    if first:
+        head = first[0].lstrip("@").lower().rstrip(".,!?:;")
+        if head in {"redster", "r3dster_bot", "redster_bot"}:
+            caption = first[1] if len(first) > 1 else ""
+    save = sticker_library.parse_save_request(caption.strip())
+    if save is None:
+        return
+
+    st = msg.sticker
+    ok, replaced, err = sticker_library.save_sticker(
+        user.id, save["name"], st.file_id,
+        bool(getattr(st, "is_video", False)),
+        bool(getattr(st, "is_animated", False)),
+    )
+    if not ok:
+        if err == "full":
+            await msg.reply_text(
+                fmt_error("Your sticker library is full (50 stickers). Forget one with “redster forget sticker &lt;name&gt;” first."),
+                parse_mode="HTML",
+            )
+        else:
+            await msg.reply_text(
+                fmt_error("That name doesn't work — use 1–40 letters, numbers, spaces or hyphens."),
+                parse_mode="HTML",
+            )
+        return
+    verb = "Replaced your old" if replaced else "Saved as"
+    name = html.escape(sticker_library.normalize_name(save["name"]))
+    await msg.reply_text(
+        f"✅ {verb} “{name}”. Send it with “redster send '{name}' sticker”.",
+        parse_mode="HTML",
+    )
+
+
+async def savesticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save the replied-to sticker under a name: /savesticker <name>."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if is_maintenance_active_for_user(user.id):
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+
+    args = context.args or []
+    if not args and msg.text:
+        tokens = msg.text.split()
+        args = tokens[1:] if tokens and tokens[0].startswith("/savesticker") else tokens
+    name = " ".join(args).strip()
+    if not name:
+        await msg.reply_text(
+            "Usage: reply to a sticker with <code>/savesticker &lt;name&gt;</code> — e.g. <code>/savesticker angry cat</code>",
+            parse_mode="HTML",
+        )
+        return
+    replied = msg.reply_to_message
+    if replied is None or getattr(replied, "sticker", None) is None:
+        await msg.reply_text(
+            "Reply to a sticker with <code>/savesticker &lt;name&gt;</code> to save it.",
+            parse_mode="HTML",
+        )
+        return
+
+    st = replied.sticker
+    ok, replaced, err = sticker_library.save_sticker(
+        user.id, name, st.file_id,
+        bool(getattr(st, "is_video", False)),
+        bool(getattr(st, "is_animated", False)),
+    )
+    if not ok:
+        if err == "full":
+            await msg.reply_text(
+                fmt_error("Your sticker library is full (50 stickers). Forget one with “redster forget sticker &lt;name&gt;” first."),
+                parse_mode="HTML",
+            )
+        else:
+            await msg.reply_text(
+                fmt_error("That name doesn't work — use 1–40 letters, numbers, spaces or hyphens."),
+                parse_mode="HTML",
+            )
+        return
+    verb = "Replaced your old" if replaced else "Saved as"
+    norm = html.escape(sticker_library.normalize_name(name))
+    await msg.reply_text(
+        f"✅ {verb} “{norm}”. Send it with “redster send '{norm}' sticker”.",
+        parse_mode="HTML",
+    )
+
+
+async def mystickers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the user's saved stickers: /mystickers."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if is_maintenance_active_for_user(user.id):
+        await msg.reply_text(MAINTENANCE_NOTICE, parse_mode="HTML")
+        return
+    await msg.reply_text(
+        sticker_library.library_list_text(user.id), parse_mode="HTML"
+    )
+
+
 def _chat_enabled_for(chat) -> bool:
     """DMs: chat is always on. Groups: off by default, /chat on enables it."""
     if not chat or getattr(chat, "type", "") == "private":
@@ -1250,9 +1508,11 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     pictures of cats" (narrow, picture words required) goes to
     _handle_images instead of the AI. An explicit-content request is
     refused without consuming a rate-limit hit. Music requests are
-    checked before images: "send me pound the alarm by nicki minaj"
-    goes to _handle_music (YouTube audio download), not to images
-    and not to the AI.
+    checked before images: "redster play pound the alarm by nicki
+    minaj" goes to _handle_music (YouTube audio download), not to
+    images and not to the AI. Music is ONLY "redster play <title>"
+    or /song (Red, 2026-11-26) — "redster send <title>" never
+    claims music, so it falls through to images/chat here.
     """
     user = update.effective_user
     chat = update.effective_chat
@@ -1274,9 +1534,18 @@ async def _do_chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         return
 
-    # Music request? (before images and before plain chat — music
-    # words are more specific than "send me <anything>", and the
-    # image parser would also match "send me <song> by <artist>".)
+    # Bare "play" with no title (Red, 2026-11-26): music is only
+    # "redster play <title>" or /song — answer with usage, never a
+    # search, and never let it fall through to the AI.
+    if music_search.is_bare_play_request(text):
+        await msg.reply_text(
+            "🎵 To play a song, say “redster play <song>” or use /song <song> by <artist>."
+        )
+        return
+
+    # Music request? (before images and before plain chat — "play
+    # <title>" is the only music trigger besides /song, and the
+    # image parser would also match some song titles.)
     music_query = music_search.parse_music_request(text, broad=allow_broad_image)
     if music_query is not None:
         if not check_rate_limit(user.id, "chat"):
@@ -1646,7 +1915,7 @@ async def song_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         usage_html = fmt_card("🎵 /song — Send a song",
             "  Send a song as an MP3 audio file:\n"
             "  <code>/song pound the alarm by nicki minaj</code>\n"
-            "  Or just say <code>redster send me pound the alarm by nicki minaj</code>.\n"
+            "  Or just say <code>redster play pound the alarm by nicki minaj</code>.\n"
             "  Or reply to a message with /song to send that song.\n"
             "  1 song per request, max 10 minutes."
         )
@@ -1654,7 +1923,7 @@ async def song_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "🎵 /song — Send a song\n"
             "Send a song as an MP3 audio file:\n"
             "/song pound the alarm by nicki minaj\n"
-            "Or just say: redster send me pound the alarm by nicki minaj\n"
+            "Or just say: redster play pound the alarm by nicki minaj\n"
             "Or reply to a message with /song to send that song.\n"
             "1 song per request, max 10 minutes."
         )
@@ -2279,16 +2548,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Plain text is NOT auto-translated — not in DMs, not anywhere.
     Translation is explicit only, via /tr (see tr_command).
     Plain text does trigger, in order: (1) the "redster ..." keyword
-    (quote or chat), (2) an @mention of the bot, (3) a reply to one of
-    the bot's own PLAIN-TEXT messages — all via chat_agent (see
-    _do_chat_reply) — and (4) a bare music request ("send me the song
-    hello by adele") or a bare image request ("send me pictures of
-    cats"), routed to music / images by _do_chat_reply. A reply to a
-    media message the bot sent (photo/video/song/sticker) does NOT
-    auto-chat: users reply to those to tag friends or talk among
-    themselves (2026-11-25). Anything else only tracks URLs sent
-    in a private chat, so /gif can reuse the last DM link or video
-    (via _track_dm_media / handle_dm_media_tracker).
+    (quote, then the named sticker library, then chat), (2) an @mention
+    of the bot, (3) a reply to one of the bot's own PLAIN-TEXT messages
+    — all via chat_agent (see _do_chat_reply) — and (4) a bare image
+    request ("send me pictures of cats"), routed to images by
+    _do_chat_reply. Music has no bare trigger: it is only "redster
+    play <title>" (rule 1) or /song (Red, 2026-11-26). A reply to a
+    media message the bot sent
+    (photo/video/song/sticker) does NOT auto-chat: users reply to those
+    to tag friends or talk among themselves (2026-11-25). Anything else
+    only tracks URLs sent in a private chat, so /gif can reuse the last
+    DM link or video (via _track_dm_media / handle_dm_media_tracker).
     """
     user = update.effective_user
     if not user or not update.message or not update.message.text:
@@ -2318,11 +2588,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 1. "redster ..." keyword — quote takes priority over chat.
     #    (Also handles a leading "@R3dSter_Bot ..." mention.)
+    #    Sticker-library intents sit between quote and chat, but only
+    #    claim requests that say the word "sticker" ("redster send
+    #    '<name>' sticker"); a bare "redster send <name>" is never
+    #    claimed and falls through to music / image / chat as before
+    #    (see sticker_library.py). Anything the library doesn't claim
+    #    falls through to music / image / chat as before.
     parsed = redster.parse_redster_message(text)
     if parsed is not None:
         if parsed["intent"] == "quote":
             await handle_redster_quote(update, context, parsed)
-        else:
+        elif not await handle_sticker_library_message(update, context, parsed):
             await _do_chat_reply(update, context, parsed.get("chat_text") or "", msg=update.message, allow_broad_image=True)
         return
 
@@ -2345,12 +2621,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _do_chat_reply(update, context, text, msg=update.message, allow_broad_image=True)
         return
 
-    # 4. Bare music request ("send me the song hello by adele") or
-    #    bare image request ("send me pictures of cats") — triggers in
-    #    themselves, so they chat (and _do_chat_reply routes them to
-    #    music / images). Music is checked first: a song request must
-    #    never fall through to the image parser. Plain text with no
-    #    trigger still does nothing below this.
+    # 4. Bare image request ("send me pictures of cats") — a trigger
+    #    in itself, so it chats (and _do_chat_reply routes it to
+    #    images). Music has NO bare trigger (Red, 2026-11-26: only
+    #    "redster play <title>" or /song), so the music check below
+    #    can never fire on plain text — it stays as a guard. Plain
+    #    text with no trigger still does nothing below this.
     if music_search.parse_music_request(text):
         await _do_chat_reply(update, context, text, msg=update.message)
         return
@@ -2746,6 +3022,8 @@ def main() -> None:
     application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(CommandHandler("pic", pic_command, block=False))
     application.add_handler(CommandHandler("song", song_command, block=False))
+    application.add_handler(CommandHandler("savesticker", savesticker_command, block=False))
+    application.add_handler(CommandHandler("mystickers", mystickers_command, block=False))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message, block=False))
 
     # Register Settings & Media Download Button callback handlers (block=False for non-blocking UI)
@@ -2809,6 +3087,16 @@ def main() -> None:
 
     # Register text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
+
+    # Register sticker-caption save handler: a sticker sent with a
+    # caption like "save as angry cat" saves it to the sender's
+    # library. Group 0, after the text handler — sticker messages
+    # carry no .text, so the two never overlap.
+    application.add_handler(MessageHandler(
+        filters.Sticker & filters.CAPTION & ~filters.COMMAND,
+        handle_sticker_caption,
+        block=False
+    ))
 
     # Register DM media tracker in group 1 (passively tracks media/links in private chats for /gif without interrupting group 0 handlers)
     application.add_handler(

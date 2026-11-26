@@ -24,6 +24,7 @@ import subprocess
 import uuid
 from typing import Optional
 import ipaddress
+import http.cookiejar
 from urllib.parse import urljoin, urlparse
 import card
 
@@ -2812,18 +2813,82 @@ _LINKEDIN_RESOLVE_HEADERS = {
 }
 
 
+def _linkedin_post_kind(url: str) -> str:
+    """Classify a resolved linkedin.com URL: "post", "login", or "other".
+
+    "post": /posts/<anything> or /feed/update/<anything> — ANY shape,
+    not just the strict activity-<10+ digits> form the old gate demanded.
+    Shares (/feed/update/urn:li:share:...), bare slugs and short ids are
+    real post URLs; the download engines sort out whether media exists.
+    "login": LinkedIn's login / checkpoint / auth pages — the link could
+    not be opened as a post at all (datacenter IPs get walled here).
+    "other": profiles, companies, jobs, articles, home feed, etc.
+    """
+    try:
+        path = urlparse(url).path or ""
+    except Exception:
+        return "other"
+    first = path.strip("/").split("/", 1)[0].lower() if path.strip("/") else ""
+    if first in ("checkpoint", "login", "uas", "authwall"):
+        return "login"
+    if path.startswith("/posts/") and len(path) > len("/posts/"):
+        return "post"
+    if path.startswith("/feed/update/") and len(path) > len("/feed/update/"):
+        return "post"
+    return "other"
+
+
+def _linkedin_resolve_cookies():
+    """Load LINKEDIN_COOKIES_FILE as httpx cookies for short-link resolve.
+
+    The resolver previously sent NO cookies, so LinkedIn answered the
+    anonymous request from a datacenter IP with a login/challenge page
+    and the link was rejected as "not a video post" — even though the
+    post has a video and cookies are configured. With cookies attached,
+    the redirect lands on the real post instead. Returns an
+    httpx.Cookies object, or None when no usable cookies file exists.
+    Never logs cookie values (only li_at present/MISSING, like the
+    config loader). Never raises.
+    """
+    path = LINKEDIN_COOKIES_FILE
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        jar = http.cookiejar.MozillaCookieJar(path)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        names = {c.name for c in jar}
+        if not names:
+            return None
+        logger.info(
+            "LinkedIn cookies attached to short-link resolve "
+            f"(li_at={'present' if 'li_at' in names else 'MISSING'})."
+        )
+        return httpx.Cookies(jar)
+    except Exception as e:
+        logger.warning(
+            "Could not load LinkedIn cookies for short-link resolve: "
+            f"{type(e).__name__}"
+        )
+        return None
+
+
 async def resolve_linkedin_short_link(url: str, client=None) -> Optional[str]:
     """Resolve a lnkd.in short link to its final linkedin.com post URL.
 
     HEAD first (follow_redirects=True, max 5 redirects, 10s timeout), GET
-    fallback when HEAD fails. Returns:
-      - the final URL (query/fragment stripped) when it lands on a LinkedIn
-        video post (matches LINKEDIN_URL_PATTERN),
-      - "" when it resolved fine but is NOT a LinkedIn video post (profile,
-        company page, login page, ...),
+    fallback when HEAD fails. The request carries LINKEDIN_COOKIES when
+    configured, so LinkedIn serves the real post instead of a login wall.
+    Returns:
+      - the final URL (query/fragment stripped) when it lands on a
+        LinkedIn post — ANY /posts/... or /feed/update/... shape, not
+        just the strict activity-<id> form,
       - None when resolution itself failed (timeout, HTTP error, redirect
-        loop). Never raises. Only the stripped URL is logged — never query
-        parameters.
+        loop) OR the redirect landed on a LinkedIn login/checkpoint page
+        (the link could not be opened as a post),
+      - "" when it resolved fine but is NOT a LinkedIn post (profile,
+        company page, jobs, article, home feed, non-LinkedIn host, ...).
+    Never raises. Only the stripped URL is logged — never query
+    parameters, never cookie values.
     `client` is an injectable httpx-like client for tests; when omitted a
     real httpx.AsyncClient is created and closed here.
     """
@@ -2833,6 +2898,7 @@ async def resolve_linkedin_short_link(url: str, client=None) -> Optional[str]:
             client = httpx.AsyncClient(
                 timeout=10.0, follow_redirects=True, max_redirects=5,
                 headers=_LINKEDIN_RESOLVE_HEADERS,
+                cookies=_linkedin_resolve_cookies(),
             )
         final_url = None
         try:
@@ -2855,11 +2921,15 @@ async def resolve_linkedin_short_link(url: str, client=None) -> Optional[str]:
         if host not in ("linkedin.com", "www.linkedin.com"):
             logger.info("lnkd.in short link resolved to a non-LinkedIn host; ignoring.")
             return ""
-        if not LINKEDIN_URL_PATTERN.search(clean):
-            logger.info("lnkd.in short link resolved to a LinkedIn page without video; ignoring.")
-            return ""
-        logger.info("Resolved lnkd.in short link to a LinkedIn post.")
-        return clean
+        kind = _linkedin_post_kind(clean)
+        if kind == "post":
+            logger.info("Resolved lnkd.in short link to a LinkedIn post.")
+            return clean
+        if kind == "login":
+            logger.info("lnkd.in short link resolved to a LinkedIn login page; treating as unreachable.")
+            return None
+        logger.info("lnkd.in short link resolved to a LinkedIn page that is not a post; ignoring.")
+        return ""
     except Exception as e:
         logger.warning(f"Failed to resolve lnkd.in short link: {e}")
         return None
@@ -2879,12 +2949,15 @@ async def handle_linkedin_message(update: Update, context: ContextTypes.DEFAULT_
     work — LinkedIn ships a yt-dlp extractor (LinkedInIE), so no
     platform-specific extraction is needed. lnkd.in short links (the form
     LinkedIn's app share hands out) are resolved to the real post URL
-    first; anything that doesn't land on a video post is refused with a
-    friendly message instead of being downloaded. When LINKEDIN_COOKIES is
-    configured (LINKEDIN_COOKIES env var or linkedin_cookies.txt, same
-    format as Instagram's), the cookies are passed to yt-dlp so
-    logged-in-only posts can download; otherwise a 999/login-wall error
-    says cookies may help. Cookie contents are never logged or shown.
+    first — the resolver sends LINKEDIN_COOKIES when configured, so a
+    login wall doesn't masquerade as "not a video post"; any resolved
+    /posts/... or /feed/update/... URL is attempted, and only clearly
+    non-post pages are refused with a friendly message. When
+    LINKEDIN_COOKIES is configured (LINKEDIN_COOKIES env var or
+    linkedin_cookies.txt, same format as Instagram's), the cookies are
+    passed to yt-dlp so logged-in-only posts can download; otherwise a
+    999/login-wall error says cookies may help. Cookie contents are
+    never logged or shown.
     """
     if not update.message or not update.message.text: return
     user = update.effective_user

@@ -1,7 +1,7 @@
 """
 Full-song send for interactive chat (search YouTube, send the MP3)
 ───────────────────────────────────────────────────────────────────
-"redster send me pound the alarm by nicki minaj" -> search YouTube
+"redster play pound the alarm by nicki minaj" -> search YouTube
 for the song -> download audio-only with the existing downloader
 (downloaders.execute_youtube_download, quality="audio": pytubefix
 fast audio engine, yt-dlp FFmpegExtractAudio fallback, Telethon
@@ -62,21 +62,21 @@ YOUTUBE_DATA_API_BASE = "https://www.googleapis.com/youtube/v3"
 YOUTUBE_API_TIMEOUT_SECONDS = 10
 YOUTUBE_API_MAX_TOTAL_SECONDS = 25
 
-# Whole words that mark a request as music. "play" is broad-only (see
-# _parse_broad): in plain chat "play football" must never misfire.
-_MUSIC_WORDS = r"(?:songs?|music|mp3|audio|tracks?|tunes?)"
-_MUSIC_WORD_RE = re.compile(
-    r"\b(?:songs?|music|mp3|audio|tracks?|tunes?|play)\b", re.IGNORECASE
-)
+# Music is claimed ONLY by "play" (broad mode, i.e. after a trigger)
+# or the /song command (Red, 2026-11-26: "for music in general let
+# it just be redster play instead of redster send as well"). There
+# are NO send-based claims left in this module: "redster send
+# <title>" and "redster send me <title>" do not start a song search.
+# "play" is broad-only (see _parse_broad): in plain chat "play
+# football" must never misfire.
 _MEDIA_WORD_RE = re.compile(
     r"\b(?:pictures?|images?|photos?|pics?)\b", re.IGNORECASE
 )
-_VERBS = r"(?:send|show|find|give|get)"
 _LEADING_ARTICLES = ("a ", "an ", "the ", "some ")
 
-# Leading filler words — "please send me the song ..." and "now send
-# me ..." must parse the same as "send me ...". Stripped (repeatedly)
-# before the verb patterns are tried, mirroring the media parser.
+# Leading filler words — "please play ..." must parse the same as
+# "play ...". Stripped (repeatedly) before the play pattern is tried,
+# mirroring the media parser.
 _LEADING_FILLERS = (
     "please ", "now ", "hey ", "ok ", "okay ", "and ", "then ", "so ",
     "btw ", "just ", "can you ", "could you ", "would you ",
@@ -86,8 +86,8 @@ _LEADING_FILLERS = (
 
 def _strip_leading_filler(text: str) -> str:
     """Strip leading filler words/phrases ("please", "now", "can you")
-    so "please send me the song hello" parses like "send me the song
-    hello". Loops until stable (fillers can stack: "now please send")."""
+    so "please play hello" parses like "play hello". Loops until
+    stable (fillers can stack: "now please play")."""
     s = (text or "").strip()
     changed = True
     while changed:
@@ -167,106 +167,50 @@ def _clean_query(query: str) -> str:
     return q
 
 
-def _has_music_word(text: str) -> bool:
-    return bool(_MUSIC_WORD_RE.search(text or ""))
-
-
 def _has_media_word(text: str) -> bool:
     """True when the text asks for a picture — music must never steal
-    an image request ("send me a picture of a dog by the river"
-    contains "by" but is a picture, not a song)."""
+    an image request ("send an image of a dog by the river" contains
+    "by" but is a picture, not a song)."""
     return bool(_MEDIA_WORD_RE.search(text or ""))
 
 
 def _parse_broad(text: str) -> Optional[str]:
-    """Wake-word / mention context: music words (or a "by <artist>"
-    construction) mark a music request.
+    """Wake-word / mention context: only "play <title>" counts as a
+    music request (Red, 2026-11-26 — music is "redster play", never
+    "redster send"). Returns the cleaned song query, or None.
 
-    Used when the message already had a trigger (redster wake,
-    @mention, reply-to-bot, /ask, /song). Returns None when it is not
-    a music request at all ("send me a dog with a red ball").
+    A media word anywhere still vetoes the claim, so "play pictures
+    of cats" is an image request, not a song. "play" itself is kept
+    exactly as broad as before — "play football" still claims in
+    broad mode; narrowing "play" was explicitly out of scope.
     """
     s = _strip_leading_filler(text.strip())
     if _has_media_word(s):
         return None
-    # Verb + "me" + "the song/music" + topic: "send me the song
-    # pound the alarm by nicki minaj", "send me the music hello".
-    m = re.match(
-        r"^" + _VERBS + r"\s+me\s+(?:the\s+)?" + _MUSIC_WORDS + r"\s+(?:of\s+)?(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    # Verb + "me" + "<song> by <artist>": the "by" construction is
-    # itself the music signal, so no music word is needed here.
-    # "send me pound the alarm by nikki minaj" -> the whole phrase.
-    m = re.match(
-        r"^" + _VERBS + r"\s+me\s+(.+?)\s+by\s+(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1) + " by " + m.group(2))
-    # Verb + "me" + "<query> song/music/mp3": "send me blinding
-    # lights song", "send me shape of you mp3".
-    m = re.match(
-        r"^" + _VERBS + r"\s+me\s+(.+?)\s+" + _MUSIC_WORDS + r"\s*$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    # "play <query>" — broad only. "play blinding lights" -> the song.
+    # "play <query>" — the only music trigger besides /song.
+    # "play blinding lights" -> the song.
     m = re.match(r"^play\s+(.+)$", s, re.IGNORECASE)
     if m:
-        return _clean_query(m.group(1))
-    # Bare "send <query>" — broad only: "redster send blinding lights".
-    # No "me" (the "send me <x>" rule above stays stricter: music only
-    # with a music word or "by <artist>", so "send me a dog with a
-    # red ball" is still an image) and no media word (guarded at the
-    # top). TRADEOFF: this claims any bare "send <x>" for music before
-    # images can see it, so a failed music search answers "couldn't
-    # find as a song" instead of sending a picture.
-    m = re.match(r"^send\s+(?!me\s)(.+)$", s, re.IGNORECASE)
-    if m:
-        return _clean_query(m.group(1))
-    # Verb + "me" + anything, but ONLY when a music word is present
-    # somewhere ("send me that new drake song" is caught above; this
-    # covers "send me the music <query>" leftovers and "send me
-    # <query>" with a music word inside). Without a music word this
-    # must stay None — "send me a dog with a red ball" is an image.
-    m = re.match(r"^" + _VERBS + r"\s+me\s+(.+)$", s, re.IGNORECASE)
-    if m and _has_music_word(m.group(1)):
         return _clean_query(m.group(1))
     return None
 
 
+def is_bare_play_request(text: str) -> bool:
+    """True when the (trigger-stripped) text is just "play" with no
+    title — "redster play" with nothing to play. The caller answers
+    with usage instead of searching."""
+    s = _strip_leading_filler((text or "").strip())
+    return s.lower() == "play"
+
+
 def _parse_narrow(text: str) -> Optional[str]:
-    """No wake word: only an explicit song request counts, so plain
-    chat ("send me a message", "play football") never misfires.
-    "play" is NOT a trigger here — only in broad mode."""
-    s = _strip_leading_filler(text.strip())
-    if _has_media_word(s):
-        return None
-    m = re.match(
-        r"^" + _VERBS + r"\s+(?:me\s+)?(?:the\s+)?" + _MUSIC_WORDS + r"\s+(?:of\s+)?(.+)$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    m = re.match(
-        r"^" + _VERBS + r"\s+(?:me\s+)?(.+?)\s+" + _MUSIC_WORDS + r"\s*$",
-        s,
-        re.IGNORECASE,
-    )
-    if m:
-        return _clean_query(m.group(1))
-    # "<song> by <artist>" with a send verb but no music word is NOT
-    # enough in narrow mode — it needs a trigger (redster/@mention/
-    # reply) to count as music. "send me pound the alarm by nicki
-    # minaj" with no wake word stays chat.
+    """No wake word: nothing counts as music (Red, 2026-11-26).
+
+    Music requires a trigger — "redster play <title>" or /song.
+    Plain text never starts a song search, not even "send me the
+    song hello" or "play football": "play" is NOT a trigger here,
+    only in broad mode. Always returns None; kept so callers keep
+    one parse entry point."""
     return None
 
 
@@ -278,14 +222,15 @@ def parse_music_request(text: str, parsed_redster=None, broad: bool = False) -> 
     - parsed_redster with intent "chat" -> broad parse of its chat_text.
     - Otherwise: strip a leading bot @mention / redster wake word if
       present, then broad parse; plain text without any trigger gets
-      the narrow parse (music words required).
+      the narrow parse (which never claims — music needs a trigger).
     - broad=True (used when the caller already knows a trigger fired,
       e.g. a redster wake word, @mention, reply-to-bot or /ask).
-    - A music request is only recognised when the text contains a
-      music word ("song", "music", "mp3", "audio", "track", "play"),
-      a "<song> by <artist>" construction, or came via /song — so
-      "send me a dog with a red ball" stays an image request and
-      "send me a message" stays chat.
+
+    Music is claimed ONLY by /song and "play <title>" (Red,
+    2026-11-26). "redster send <title>" / "redster send me <title>"
+    never claim: they fall through to image/chat as if the music
+    parser never saw them — so "send me a dog by the river" stays
+    an image request and "send me a message" stays chat.
     """
     if not text or not isinstance(text, str):
         return None

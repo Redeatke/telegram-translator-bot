@@ -1494,7 +1494,20 @@ async def download_generic_media(url: str, output_dir: str, platform_name: str =
             timeout=180
         )
     except asyncio.TimeoutError:
-        raise Exception(f"{platform_name} download timed out.")
+        original_error = Exception(f"{platform_name} download timed out.")
+    except Exception as e:
+        original_error = e
+    # yt-dlp failed — try the curl-x mirror before giving up. YouTube is
+    # excluded: curl-x does not cover it, and YouTube downloads work live
+    # via the dedicated path. If the mirror also fails, the ORIGINAL error
+    # is re-raised so the user sees exactly today's failure message.
+    if "youtube.com" not in url and "youtu.be" not in url:
+        try:
+            logger.info(f"yt-dlp failed for {platform_name} ({original_error}); trying curl-x mirror for {url}...")
+            return await download_via_curlx(url, output_dir, platform_name)
+        except Exception as cx_err:
+            logger.warning(f"curl-x mirror fallback failed for {url}: {cx_err}")
+    raise original_error
 
 
 async def download_video_source(url: str, output_dir: str) -> Optional[str]:
@@ -1693,6 +1706,175 @@ async def execute_generic_media_download(target_message, url: str, platform_name
         await send_media_error_dm(context, target_message, url, platform_name, error_msg)
 
 
+# ─── curl-x mirror fallback ──────────────────────────────────────────────────
+# curl-x (curl-x.com) is a free, no-signup, no-API-key mirror: POST a public
+# post URL to /api/extract and it returns JSON with every media item and
+# direct CDN variant URLs. It covers Twitter/X, Instagram, Threads,
+# Facebook, Reddit, TikTok, Bluesky, LinkedIn and Pinterest — notably
+# LinkedIn and Threads, which Cobalt does not cover. It cannot fetch
+# private/suspended posts (NOT_FOUND) and it does NOT cover YouTube.
+# It is a fallback only: yt-dlp (and the per-site extractors) always run
+# first, and if curl-x fails the caller's original error is re-raised, so
+# the user sees exactly today's failure message. One attempt, no retries:
+# on 429 we fail soft rather than hammering a shared rate limit
+# (60 req/min overall, 20 req/min on /api/extract).
+
+CURLX_EXTRACT_URL = "https://www.curl-x.com/api/extract"
+CURLX_TIMEOUT_SECONDS = 10.0
+
+_CURLX_CONTENT_TYPE_EXTS = {
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _curlx_best_variant(item: dict) -> tuple:
+    """Pick the best downloadable variant of one curl-x media item.
+
+    Variants are already ordered best-first by curl-x; we still sort
+    explicitly (highest bitrate, then largest frame) so a reordered
+    response cannot hand us the smallest file. Returns (url, content_type)
+    or (None, None).
+    """
+    variants = item.get("variants") or []
+    best = None
+    best_key = None
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        v_url = (v.get("url") or "").strip()
+        if not v_url or not is_public_url(v_url):
+            continue
+        ctype = (v.get("contentType") or "").split(";")[0].strip().lower()
+        if not ctype.startswith(("video/", "image/")):
+            continue
+        try:
+            bitrate = int(v.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        try:
+            area = int(v.get("width") or 0) * int(v.get("height") or 0)
+        except (TypeError, ValueError):
+            area = 0
+        key = (bitrate, area)
+        if best is None or key > best_key:
+            best, best_key = (v_url, ctype), key
+    if best is None:
+        return None, None
+    return best
+
+
+async def _curlx_extract(url: str, client=None) -> Optional[dict]:
+    """Extract a post's media via the curl-x mirror.
+
+    Returns {'items': [{'url', 'is_video', 'content_type'}], 'title',
+    'uploader', 'platform', 'url'} or None on ANY failure (rate limit,
+    private post, malformed response, timeout, unsupported URL). Never
+    raises — callers treat None as "mirror unavailable" and fall back to
+    their own error. `client` is an injectable httpx client (tests).
+    """
+    try:
+        own_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=CURLX_TIMEOUT_SECONDS,
+                                       follow_redirects=True)
+            own_client = True
+        try:
+            resp = await client.post(
+                CURLX_EXTRACT_URL,
+                json={"url": url},
+                headers={"Content-Type": "application/json"},
+            )
+        finally:
+            if own_client:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass  # a close failure must never kill a good extract
+        if resp.status_code != 200:
+            try:
+                code = (resp.json() or {}).get("code") or resp.status_code
+            except Exception:
+                code = resp.status_code
+            logger.warning(f"curl-x extract failed for {url}: HTTP {resp.status_code} ({code})")
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning(f"curl-x extract returned unparseable JSON for {url}")
+            return None
+        if not isinstance(data, dict) or data.get("error"):
+            code = data.get("code") if isinstance(data, dict) else "non-dict"
+            logger.warning(f"curl-x extract error for {url}: {code}")
+            return None
+        items = []
+        for item in data.get("media") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = (item.get("type") or "").lower()
+            is_video = item_type in ("video", "gif")
+            v_url, ctype = _curlx_best_variant(item)
+            if not v_url:
+                continue
+            items.append({"url": v_url, "is_video": is_video, "content_type": ctype})
+        if not items:
+            logger.info(f"curl-x extract found no media for {url}")
+            return None
+        return {
+            "items": items,
+            "title": (data.get("text") or data.get("author") or "Media"),
+            "uploader": data.get("author") or data.get("platform") or "Media",
+            "platform": data.get("platform") or "",
+            "url": data.get("tweetUrl") or url,
+        }
+    except Exception as e:
+        logger.warning(f"curl-x extract failed for {url}: {type(e).__name__}: {e}")
+        return None
+
+
+async def download_via_curlx(url: str, output_dir: str, platform_name: str = "Media", client=None) -> dict:
+    """Download a post's primary media item via the curl-x mirror.
+
+    Same result shape as download_generic_media
+    ({'filepath', 'title', 'duration', 'uploader'}) so callers can use it
+    interchangeably. Only the first media item is downloaded — the generic
+    path sends a single file. Raises on any failure; callers fall back to
+    their original error.
+    """
+    data = await _curlx_extract(url, client=client)
+    if not data or not data.get("items"):
+        raise Exception(f"curl-x found no media for this {platform_name} link.")
+    item = data["items"][0]
+    ext = _CURLX_CONTENT_TYPE_EXTS.get(
+        item.get("content_type") or "",
+        ".mp4" if item.get("is_video") else ".jpg")
+    out_path = os.path.join(output_dir, f"curlx_{uuid.uuid4().hex[:8]}{ext}")
+    max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if client is None:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl_client:
+            ok = await _fetch_to_file_streaming(
+                dl_client, item["url"], out_path, max_bytes,
+                allowed_content_types=("video/", "image/", "application/octet-stream"),
+            )
+    else:
+        ok = await _fetch_to_file_streaming(
+            client, item["url"], out_path, max_bytes,
+            allowed_content_types=("video/", "image/", "application/octet-stream"),
+        )
+    if not ok or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise Exception(f"curl-x download failed for this {platform_name} link.")
+    return {
+        "filepath": out_path,
+        "title": data.get("title") or f"{platform_name} Media",
+        "duration": 0,
+        "uploader": data.get("uploader") or platform_name,
+    }
+
+
 async def fetch_instagram_via_embed_proxy(url: str) -> Optional[dict]:
     """Fallback extractor for Instagram reels and posts using embed fixers (ddinstagram, instagramez).
     Extracts direct CDN media streams and OpenGraph metadata when direct scraping gets 429'd or blocked.
@@ -1874,6 +2056,16 @@ async def execute_instagram_download(target_message, url: str, context: ContextT
                             break
                     except Exception as fb_err:
                         logger.warning(f"Embed proxy fallback error for {url}: {fb_err}")
+
+                    # Last resort: the curl-x mirror (no login, no cookies).
+                    try:
+                        curlx_data = await _curlx_extract(url)
+                        if curlx_data and curlx_data.get('items'):
+                            logger.info(f"Successfully extracted media via curl-x fallback for {url}")
+                            data = curlx_data
+                            break
+                    except Exception as cx_err:
+                        logger.warning(f"curl-x fallback error for {url}: {cx_err}")
 
                     raise extract_err
 
@@ -2164,7 +2356,24 @@ async def execute_threads_download(target_message, url: str, context: ContextTyp
             pass
 
     try:
-        data = await download_threads_media(url)
+        try:
+            data = await download_threads_media(url)
+        except Exception as th_err:
+            # Threads extractor failed — try the curl-x mirror before
+            # giving up. Its items are in the same shape
+            # ({'url', 'is_video'}) the upload code below expects.
+            logger.info(f"Threads extractor failed ({th_err}); trying curl-x mirror for {url}...")
+            curlx_data = await _curlx_extract(url)
+            if curlx_data and curlx_data.get("items"):
+                logger.info(f"Successfully extracted Threads media via curl-x fallback for {url}")
+                data = {
+                    "items": curlx_data["items"],
+                    "title": curlx_data.get("title") or curlx_data.get("uploader") or "Threads Post",
+                    "uploader": curlx_data.get("uploader") or "Threads",
+                    "url": curlx_data.get("url") or url,
+                }
+            else:
+                raise
         items = data["items"]
         if not items:
             raise Exception("No media found in this post.")

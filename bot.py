@@ -3093,7 +3093,7 @@ def main() -> None:
     # library. Group 0, after the text handler — sticker messages
     # carry no .text, so the two never overlap.
     application.add_handler(MessageHandler(
-        filters.Sticker & filters.CAPTION & ~filters.COMMAND,
+        filters.Sticker.ALL & filters.CAPTION & ~filters.COMMAND,
         handle_sticker_caption,
         block=False
     ))
